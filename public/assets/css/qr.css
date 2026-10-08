@@ -58,6 +58,7 @@
 }
 .qr-link-line__target .icon { width: 16px; height: 16px; }
 .qr-link-line__host { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qr-link-line__edit { flex: none; }
 
 /* ---------- Layout ---------- */
 .qr-studio {
@@ -169,6 +170,11 @@
 .qr-alert--warn { background: var(--yellow); }
 .qr-alert--info { background: var(--paper); }
 .qr-alert--danger { background: var(--red); color: #ffffff; }
+/* Focus ring on the red note (Bring back): --blue is 1.3:1 on red, white is 5:1 */
+.qr-alert--danger :focus-visible { outline-color: #ffffff; }
+/* A stopped link: why scans land on the self-destruct page, with Bring back under the text */
+.qr-status-note { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; }
+.qr-status-note__btn { grid-column: 2; justify-self: start; }
 
 /* ---------- Encoded URL: a yellow caption box under the code ---------- */
 .qr-encodes {
@@ -311,8 +317,14 @@
 .qr-color__text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
 .qr-color__name { font-size: 0.93rem; font-weight: 700; }
 .qr-color__hex { color: var(--muted); font-family: var(--font-mono); font-size: 0.8rem; }
-.qr-color.is-disabled { opacity: 0.5; cursor: not-allowed; }
-.qr-color.is-disabled input { cursor: not-allowed; }
+/* Disabled (the background picker while Transparent is on): a flat paper fill, muted text and a dashed
+   outline, as DESIGN.md section 7 asks. The swatch is flattened too, so the stored colour never shows faded. */
+.qr-color.is-disabled,
+.qr-color.is-disabled:hover { background: var(--paper-2); border-style: dashed; color: var(--muted); cursor: not-allowed; }
+.qr-color.is-disabled .qr-color__name { color: var(--muted); }
+.qr-color.is-disabled input[type="color"] { background: var(--paper-2); border-style: dashed; cursor: not-allowed; }
+.qr-color.is-disabled input[type="color"]::-webkit-color-swatch { border-color: transparent; background: var(--paper-2) !important; }
+.qr-color.is-disabled input[type="color"]::-moz-color-swatch { border-color: transparent; background: var(--paper-2) !important; }
 
 .qr-subpanel { margin-top: 12px; padding: 12px; border: 2px dashed var(--ink); background: var(--paper); }
 .qr-subpanel .hint { margin: 8px 0 0; }
@@ -333,7 +345,14 @@
   letter-spacing: 0;
   text-transform: none;
 }
-.qr-range-field.is-disabled { opacity: 0.5; }
+/* Disabled (the angle of a radial blend): muted label, and a dashed paper track, thumb and readout */
+.qr-range-field.is-disabled .label { color: var(--muted); cursor: not-allowed; }
+.qr-range-field.is-disabled output { background: var(--paper-2); border-style: dashed; color: var(--muted); }
+.qr-range-field.is-disabled .range { cursor: not-allowed; }
+.qr-range-field.is-disabled .range::-webkit-slider-runnable-track { background: var(--paper-2); border-style: dashed; }
+.qr-range-field.is-disabled .range::-moz-range-track { background: var(--paper-2); border-style: dashed; }
+.qr-range-field.is-disabled .range::-webkit-slider-thumb { background: var(--paper-2); border-style: dashed; }
+.qr-range-field.is-disabled .range::-moz-range-thumb { background: var(--paper-2); border-style: dashed; }
 .qr-bg-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
 .qr-bg-row .qr-color { flex: 1 1 200px; }
 .qr-section .field + .field { margin-top: 16px; }
@@ -343,6 +362,7 @@
 .qr-skel-url { width: 230px; height: 34px; }
 .qr-skel-badge { width: 64px; height: 24px; }
 .qr-skel-host { width: 150px; height: 18px; }
+.qr-skel-edit { width: 132px; height: 36px; }
 .qr-skel-square { width: min(100%, 360px); aspect-ratio: 1; }
 .qr-skel-bar { height: 20px; }
 .qr-skel-caption { height: 84px; }

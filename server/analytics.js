@@ -11,7 +11,10 @@ export const STATS_RANGES = Object.freeze(['24h', '7d', '30d', 'all']);
 
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
-const MAX_ALL_BUCKETS = 365;
+const WEEK = 7 * DAY;
+/** Range `all` uses daily buckets for up to this many days, then weekly ones, then monthly ones. */
+const ALL_RANGE_MAX_DAYS = 365;
+const ALL_RANGE_MAX_WEEKS = 520;
 const TOP_N = 8;
 const MAX_POINTS = 300;
 const RECENT_MAX = 25;
@@ -217,24 +220,92 @@ export function parseTzOffset(value) {
   return n;
 }
 
+// The client's time zone arrives as a fixed offset `shift` (ms, UTC − local), so local wall-clock
+// time is `utc − shift`. Every helper below returns UTC epoch ms of a local boundary.
+
+/** Start of the local hour/day (`size`) containing `ts`. */
+const floorLocal = (ts, size, shift) => Math.floor((ts - shift) / size) * size + shift;
+
+/** Start of the local week (Monday 00:00) containing `ts`. */
+function localWeekStart(ts, shift) {
+  const day = floorLocal(ts, DAY, shift);
+  const dayNumber = Math.round((day - shift) / DAY); // local days since 1970-01-01, a Thursday
+  return day - ((((dayNumber + 3) % 7) + 7) % 7) * DAY;
+}
+
+/** Local calendar month containing `ts`, as `year * 12 + monthIndex`. */
+function localMonthNumber(ts, shift) {
+  const local = new Date(ts - shift);
+  return local.getUTCFullYear() * 12 + local.getUTCMonth();
+}
+
+/** Start of the local calendar month numbered `n` (see localMonthNumber). */
+const localMonthStart = (n, shift) => Date.UTC(Math.floor(n / 12), n % 12, 1) + shift;
+
+/** `count` equal buckets of `size` ms, the last one starting at `currentStart`. */
+function uniformWindow(bucket, size, currentStart, count) {
+  const start = currentStart - (count - 1) * size;
+  const starts = Array.from({ length: count }, (_, i) => start + i * size);
+  return { bucket, size, starts, start, end: currentStart + size, count };
+}
+
 /**
- * Bucket layout for a range, aligned to the client's local hours/days.
- * @returns {{ bucket: 'hour'|'day', size: number, start: number, end: number, count: number }}
+ * Bucket layout for a range, aligned to the client's local time.
+ * `24h`: 24 hours; `7d`/`30d`: 7/30 days; `all`: every bucket from the one holding `earliestTs`
+ * to the current one, by day for up to ALL_RANGE_MAX_DAYS days, else by week (starting Monday)
+ * for up to ALL_RANGE_MAX_WEEKS weeks, else by calendar month.
+ * `size` is the bucket length in ms (null for months, which vary); `starts` holds every bucket's start.
+ * @returns {{ bucket: 'hour'|'day'|'week'|'month', size: number|null, starts: number[], start: number, end: number, count: number }}
  */
 export function rangeWindow(range, now, tzOffsetMinutes, earliestTs) {
-  const shift = tzOffsetMinutes * 60_000; // local = utc − shift
-  const size = range === '24h' ? HOUR : DAY;
-  const currentStart = Math.floor((now - shift) / size) * size + shift;
-  let count;
-  if (range === '24h') count = 24;
-  else if (range === '7d') count = 7;
-  else if (range === '30d') count = 30;
-  else {
-    const firstStart = Math.floor(((earliestTs ?? now) - shift) / size) * size + shift;
-    count = Math.min(MAX_ALL_BUCKETS, Math.max(1, Math.round((currentStart - firstStart) / size) + 1));
+  const shift = tzOffsetMinutes * 60_000;
+  if (range === '24h') return uniformWindow('hour', HOUR, floorLocal(now, HOUR, shift), 24);
+  if (range === '7d' || range === '30d') return uniformWindow('day', DAY, floorLocal(now, DAY, shift), range === '7d' ? 7 : 30);
+
+  const first = Math.min(earliestTs ?? now, now);
+  const today = floorLocal(now, DAY, shift);
+  const days = Math.round((today - floorLocal(first, DAY, shift)) / DAY) + 1;
+  if (days <= ALL_RANGE_MAX_DAYS) return uniformWindow('day', DAY, today, days);
+
+  const thisWeek = localWeekStart(now, shift);
+  const weeks = Math.round((thisWeek - localWeekStart(first, shift)) / WEEK) + 1;
+  if (weeks <= ALL_RANGE_MAX_WEEKS) return uniformWindow('week', WEEK, thisWeek, weeks);
+
+  const firstMonth = localMonthNumber(first, shift);
+  const count = localMonthNumber(now, shift) - firstMonth + 1;
+  const starts = Array.from({ length: count }, (_, i) => localMonthStart(firstMonth + i, shift));
+  return { bucket: 'month', size: null, starts, start: starts[0], end: localMonthStart(firstMonth + count, shift), count };
+}
+
+/** Index of the bucket in `starts` (ascending) that holds `ts`, which must be >= starts[0]. */
+function bucketIndex(starts, ts) {
+  let lo = 0;
+  let hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid] <= ts) lo = mid;
+    else hi = mid - 1;
   }
-  const start = currentStart - (count - 1) * size;
-  return { bucket: range === '24h' ? 'hour' : 'day', size, start, end: currentStart + size, count };
+  return lo;
+}
+
+/**
+ * Counted clicks per bucket. SQL groups by hour (range 24h) or local day, the finest unit any
+ * bucket is made of; weeks and months start at local midnight, so each day folds into exactly one.
+ */
+function timeseriesCounts(db, linkId, win) {
+  const unit = win.bucket === 'hour' ? HOUR : DAY;
+  const rows = statement(db, `
+    SELECT CAST((ts - :start) / :unit AS INTEGER) AS idx, COUNT(*) AS clicks
+    FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end
+    GROUP BY idx
+  `).all({ linkId, start: win.start, end: win.end, unit });
+  const counts = new Array(win.count).fill(0);
+  for (const r of rows) {
+    const i = win.size === unit ? r.idx : bucketIndex(win.starts, win.start + r.idx * unit);
+    if (i >= 0 && i < win.count) counts[i] += r.clicks;
+  }
+  return counts;
 }
 
 function topWithOther(rows, n = TOP_N) {
@@ -247,14 +318,17 @@ function topWithOther(rows, n = TOP_N) {
   return head;
 }
 
-function breakdown(db, linkId, column, win, fallback) {
+function breakdown(db, linkId, column, scope, fallback) {
   const rows = statement(db, `
     SELECT COALESCE(${column}, :fallback) AS name, COUNT(*) AS count
     FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end
     GROUP BY 1 ORDER BY count DESC, name ASC
-  `).all({ linkId, start: win.start, end: win.end, fallback });
+  `).all({ linkId, start: scope.start, end: scope.end, fallback });
   return rows.map((r) => ({ name: r.name, count: r.count }));
 }
+
+/** Every click a link has ever had: range `all` counts with this, never with its (bucketed) window. */
+const ALL_TIME = Object.freeze({ start: 0, end: Number.MAX_SAFE_INTEGER });
 
 /**
  * Build the StatsDTO for one link.
@@ -265,27 +339,24 @@ function breakdown(db, linkId, column, win, fallback) {
 export function buildStats(db, link, { range = '7d', tz = 0, now }) {
   let earliest = link.created_at;
   if (range === 'all') {
+    // Simulated clicks can predate the link (they are spread over the past week), so the chart
+    // starts at whichever came first.
     const first = statement(db, 'SELECT MIN(ts) AS ts FROM clicks WHERE link_id = ?').get(link.id).ts;
     if (first !== null && first < earliest) earliest = first;
   }
   const win = rangeWindow(range, now, tz, earliest);
-  const params = { linkId: link.id, start: win.start, end: win.end };
+  const scope = range === 'all' ? ALL_TIME : { start: win.start, end: win.end };
+  const params = { linkId: link.id, start: scope.start, end: scope.end };
 
-  const totals = computeTotals(db, link.id, { start: win.start, end: win.end, now });
+  const totals = computeTotals(db, link.id, { ...scope, now });
 
-  const bucketRows = statement(db, `
-    SELECT CAST((ts - :start) / :size AS INTEGER) AS idx, COUNT(*) AS clicks
-    FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end
-    GROUP BY idx
-  `).all({ ...params, size: win.size });
-  const counts = new Array(win.count).fill(0);
-  for (const r of bucketRows) if (r.idx >= 0 && r.idx < win.count) counts[r.idx] += r.clicks;
-  const points = counts.map((clicks, i) => ({ t: new Date(win.start + i * win.size).toISOString(), clicks }));
+  const counts = timeseriesCounts(db, link.id, win);
+  const points = counts.map((clicks, i) => ({ t: new Date(win.starts[i]).toISOString(), clicks }));
 
-  const devices = breakdown(db, link.id, 'device', win, 'other');
-  const browsers = topWithOther(breakdown(db, link.id, 'browser', win, 'Unknown'));
-  const os = topWithOther(breakdown(db, link.id, 'os', win, 'Unknown'));
-  const referrers = topWithOther(breakdown(db, link.id, 'referrer_host', win, 'direct'));
+  const devices = breakdown(db, link.id, 'device', scope, 'other');
+  const browsers = topWithOther(breakdown(db, link.id, 'browser', scope, 'Unknown'));
+  const os = topWithOther(breakdown(db, link.id, 'os', scope, 'Unknown'));
+  const referrers = topWithOther(breakdown(db, link.id, 'referrer_host', scope, 'direct'));
 
   const countryRows = statement(db, `
     SELECT country, COUNT(*) AS count FROM clicks
@@ -327,5 +398,5 @@ export function buildStats(db, link, { range = '7d', tz = 0, now }) {
 
 /** Totals for range `all`, as carried by the SSE `hello` event. */
 export function allTimeTotals(db, link, now) {
-  return computeTotals(db, link.id, { start: 0, end: Number.MAX_SAFE_INTEGER, now });
+  return computeTotals(db, link.id, { ...ALL_TIME, now });
 }

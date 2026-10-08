@@ -189,3 +189,16 @@ describe('toLinkDto with a legacy stored domain', () => {
     assert.equal(toLinkDto({ ...row, qr_style: '{"logo":"cat"}' }, config, START_TIME).qrStyle.preset, undefined, 'a style without a preset stays without one');
   });
 });
+
+describe('shutdown', () => {
+  it('close() closes the database, and tolerates one that is already closed', async () => {
+    const s = await startServer();
+    await s.stop();
+    assert.throws(() => s.db.prepare('SELECT 1'), /not open/i, 'the database is closed');
+    assert.doesNotThrow(() => s.close(), 'a second close() is a no-op');
+
+    const closedElsewhere = await startServer();
+    closedElsewhere.db.close();
+    await assert.doesNotReject(closedElsewhere.stop());
+  });
+});

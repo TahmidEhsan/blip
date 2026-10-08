@@ -541,3 +541,109 @@ describe('time range edge cases', () => {
     assert.equal(week.totals.last24h, 1);
   });
 });
+
+describe('range all on long-lived links', () => {
+  const WEEK = 7 * DAY;
+
+  /** Create a link at `created`, visit it then and again at `later`, and return a stats reader. */
+  async function twoVisits(created, later, slug) {
+    const s = await startServer({ startTime: created });
+    const { manageToken: token } = await s.createLink({ targetUrl: `https://example.com/${slug}`, slug });
+    await s.visit(slug, { ua: UA.windowsChrome, headers: { ...US, Referer: 'https://news.ycombinator.com/item?id=2' } });
+    s.clock.t = later;
+    await s.visit(slug, { ua: UA.iphone, headers: GB });
+    const stats = async (query) => (await s.request('GET', `/api/links/${slug}/stats${query}`, { token })).json;
+    return { s, stats };
+  }
+
+  const sum = (points) => points.reduce((total, p) => total + p.clicks, 0);
+
+  it('counts every click since creation and buckets two years by week', async () => {
+    // Created on a Wednesday; the second visit lands on a Sunday at 23:30 UTC, two years later.
+    const { s, stats } = await twoVisits(Date.parse('2024-10-09T12:00:00.000Z'), Date.parse('2026-10-11T23:30:00.000Z'), 'two-years');
+    try {
+      const all = await stats('?range=all');
+      assert.equal(all.totals.clicks, 2, 'the visit from two years ago still counts');
+      assert.equal(all.totals.uniqueVisitors, 2);
+      assert.deepEqual(all.devices, [{ name: 'desktop', count: 1 }, { name: 'mobile', count: 1 }]);
+      assert.deepEqual(all.browsers, [{ name: 'Chrome', count: 1 }, { name: 'Safari', count: 1 }]);
+      assert.deepEqual(all.referrers, [{ name: 'direct', count: 1 }, { name: 'news.ycombinator.com', count: 1 }]);
+      assert.deepEqual(all.countries.map((c) => [c.code, c.count]), [['GB', 1], ['US', 1]]);
+      assert.deepEqual(all.points.map((p) => p.city).sort(), ['London', 'New York']);
+
+      const ts = all.timeseries;
+      assert.equal(ts.bucket, 'week');
+      assert.equal(ts.points.length, 105);
+      assert.equal(ts.points[0].t, '2024-10-07T00:00:00.000Z', 'the Monday of the creation week');
+      assert.equal(ts.points.at(-1).t, '2026-10-05T00:00:00.000Z', 'the Monday of this week');
+      assert.equal(ts.points[0].clicks, 1);
+      assert.equal(ts.points.at(-1).clicks, 1);
+      assert.equal(sum(ts.points), 2);
+      for (let i = 1; i < ts.points.length; i += 1) {
+        assert.equal(Date.parse(ts.points[i].t) - Date.parse(ts.points[i - 1].t), WEEK);
+      }
+
+      const week = await stats('?range=7d');
+      assert.equal(week.totals.clicks, 1, 'shorter ranges still cover only their window');
+      assert.equal(week.timeseries.bucket, 'day');
+
+      // UTC+1: Monday Oct 12 has already begun, so the latest visit opens a new week.
+      const east = (await stats('?range=all&tz=-60')).timeseries;
+      assert.equal(east.bucket, 'week');
+      assert.equal(east.points.length, 106);
+      assert.equal(east.points[0].t, '2024-10-06T23:00:00.000Z');
+      assert.equal(east.points.at(-1).t, '2026-10-11T23:00:00.000Z');
+      assert.equal(east.points.at(-1).clicks, 1);
+      assert.equal(east.points.at(-2).clicks, 0);
+      assert.equal(sum(east.points), 2);
+
+      // UTC-5: still Sunday evening, in the week of Oct 5.
+      const west = (await stats('?range=all&tz=300')).timeseries;
+      assert.equal(west.points.length, 105);
+      assert.equal(west.points[0].t, '2024-10-07T05:00:00.000Z');
+      assert.equal(west.points.at(-1).t, '2026-10-05T05:00:00.000Z');
+      assert.equal(west.points.at(-1).clicks, 1);
+      assert.equal(sum(west.points), 2);
+    } finally {
+      await s.stop();
+    }
+  });
+
+  it('switches to calendar months for a twelve-year span, aligned to the client time zone', async () => {
+    // First visit at 02:00 UTC on Oct 1 (still Sep 30 in UTC-5); the latest at 22:30 UTC on Sep 30 (already Oct 1 in UTC+2).
+    const { s, stats } = await twoVisits(Date.parse('2014-10-01T02:00:00.000Z'), Date.parse('2026-09-30T22:30:00.000Z'), 'twelve-years');
+    try {
+      const all = await stats('?range=all');
+      assert.equal(all.totals.clicks, 2);
+      assert.equal(all.totals.uniqueVisitors, 2);
+      assert.equal(all.countries.length, 2);
+      assert.equal(all.timeseries.bucket, 'month');
+      const utc = all.timeseries.points;
+      assert.equal(utc.length, 144, 'Oct 2014 to Sep 2026');
+      assert.equal(utc[0].t, '2014-10-01T00:00:00.000Z');
+      assert.equal(utc[1].t, '2014-11-01T00:00:00.000Z');
+      assert.equal(utc.at(-1).t, '2026-09-01T00:00:00.000Z');
+      assert.equal(utc[0].clicks, 1);
+      assert.equal(utc.at(-1).clicks, 1);
+      assert.equal(sum(utc), 2);
+
+      const east = (await stats('?range=all&tz=-120')).timeseries;
+      assert.equal(east.bucket, 'month');
+      assert.equal(east.points.length, 145);
+      assert.equal(east.points[0].t, '2014-09-30T22:00:00.000Z');
+      assert.equal(east.points.at(-1).t, '2026-09-30T22:00:00.000Z', 'October 1 at local midnight');
+      assert.equal(east.points.at(-1).clicks, 1);
+      assert.equal(east.points.at(-2).clicks, 0);
+
+      const west = (await stats('?range=all&tz=300')).timeseries;
+      assert.equal(west.points.length, 145);
+      assert.equal(west.points[0].t, '2014-09-01T05:00:00.000Z');
+      assert.equal(west.points[0].clicks, 1, 'the first visit was on Sep 30 local time');
+      assert.equal(west.points[1].clicks, 0);
+      assert.equal(west.points.at(-1).t, '2026-09-01T05:00:00.000Z');
+      assert.equal(sum(west.points), 2);
+    } finally {
+      await s.stop();
+    }
+  });
+});

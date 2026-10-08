@@ -120,7 +120,10 @@ Phosphor glyph behind each are listed in that script). Lucide is gone: delete ev
 - `.btn` (Bangers label, 3px border). `.btn--primary` (red) is the ONE important action per view and the only button that
   animates on hover. Others: default (panel), `--blue`, `--yellow`, `--danger` (ink, turns red on hover), `--ghost`, `--sm`, `--lg`, `--icon`, `--block`, `.is-loading`.
   A disabled button is a flat `--paper-2` fill with `--muted` text and a dashed outline, never faded with opacity (a faded red
-  or blue is a pastel). A busy `.is-loading` button keeps its colours and shows the spinner.
+  or blue is a pastel). A busy `.is-loading` button keeps its colours and shows the spinner. The same goes for inactive,
+  off and unselected controls (`.is-inactive`, `.is-off`, `[inert]`, `:not(.is-active)`, `:not([aria-checked="true"])`):
+  they read through fill and text colour, never opacity. The audit flags any opacity strictly between 0 and 1 on those
+  states; `opacity: 0` hides (the visually hidden `.switch input`), so it passes.
 - `.feature-btn` (home): grid tile with icon box, Bangers label, description and a state tag (`.feature-btn__state`).
   `.feature-grid` is 1 column on phones and 2 from 640px. Never 3.
 - Forms: `.field`, `.label`, `.hint`, `.input`, `.textarea`, `.select`, `.input-group` (+ `__prefix`/`__suffix`), `.switch`,

@@ -3,35 +3,90 @@
 // Drawn instantly: no transitions between ranges (the section shows a skeleton while it loads).
 import { el, formatNumber } from '../api.js';
 import { createTooltip } from './tooltip.js';
-import { readPalette } from './constants.js';
+import { readPalette, bucketOf } from './constants.js';
 
-const HOUR = 3_600_000;
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 const MARKER = 9; // square marker size (px)
 const MARKER_SPACING = 16; // draw per-bucket markers only when buckets are at least this far apart
+/** Minimum room per x-axis label, by bucket (week labels can carry a year). */
+const TICK_SPACING = { hour: 64, day: 74, week: 96, month: 84 };
+const TICK_SPACING_WITH_YEAR = 96;
 let uid = 0;
 
-const fmtHourTick = new Intl.DateTimeFormat(undefined, { hour: 'numeric' });
-const fmtDayTick = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
-const fmtTime = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
-const fmtDayLong = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+// Bucket starts are local times in the fixed UTC offset the stats were requested with (SPEC 5.4: `tz`).
+// Labels read them in that same offset: wallClock() shifts the instant by it, and every formatter below
+// prints in UTC. So a month that began under a different daylight-saving offset still reads as its own
+// month, and a week still starts on its Monday.
+const inUtc = (options) => new Intl.DateTimeFormat(undefined, { ...options, timeZone: 'UTC' });
+const fmtHour = inUtc({ hour: 'numeric' });
+const fmtDay = inUtc({ month: 'short', day: 'numeric' });
+const fmtDayYear = inUtc({ month: 'short', day: 'numeric', year: 'numeric' });
+const fmtTime = inUtc({ hour: 'numeric', minute: '2-digit' });
+const fmtDayLong = inUtc({ weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+const fmtMonth = inUtc({ month: 'short', year: 'numeric' });
 
-/** Human label for a bucket ("Tue, Oct 7, 2026" or "Oct 7, 3:00 PM to 4:00 PM"). */
-export function bucketLabel(date, bucket) {
-  if (bucket === 'hour') {
-    const end = new Date(date.getTime() + HOUR);
-    return `${fmtDayTick.format(date)}, ${fmtTime.format(date)} to ${fmtTime.format(end)}`;
-  }
-  return fmtDayLong.format(date);
+/**
+ * A bucket start (ISO string or epoch ms) as a Date whose UTC fields hold its local wall-clock time.
+ * @param {string|number} t
+ * @param {number} tz the `tz` the stats were requested with (Date#getTimezoneOffset() minutes)
+ */
+export function wallClock(t, tz) {
+  const ms = typeof t === 'number' ? t : Date.parse(t);
+  return new Date(ms - (Number(tz) || 0) * MINUTE);
 }
 
-function tickLabel(date, bucket) {
-  if (bucket === 'hour') return date.getHours() === 0 ? fmtDayTick.format(date) : fmtHourTick.format(date);
-  return fmtDayTick.format(date);
+/**
+ * Human label for a bucket, from wallClock(): "Oct 7, 3:00 PM to 4:00 PM", "Tue, Oct 7, 2026",
+ * "Week of Oct 6, 2025" or "Oct 2027".
+ */
+export function bucketLabel(wall, bucket) {
+  switch (bucketOf(bucket)) {
+    case 'hour':
+      return `${fmtDay.format(wall)}, ${fmtTime.format(wall)} to ${fmtTime.format(new Date(wall.getTime() + HOUR))}`;
+    case 'week':
+      return `Week of ${fmtDayYear.format(wall)}`;
+    case 'month':
+      return fmtMonth.format(wall);
+    default:
+      return fmtDayLong.format(wall);
+  }
+}
+
+/** The same bucket inside a sentence ("the busiest week was the week of Oct 6, 2025"). */
+function bucketPhrase(wall, bucket) {
+  return bucket === 'week' ? `the week of ${fmtDayYear.format(wall)}` : bucketLabel(wall, bucket);
+}
+
+/** Whether a series runs across more than one calendar year (then day and week ticks name the year). */
+function spansYears(points) {
+  return points.length > 1 && points[0].wall.getUTCFullYear() !== points[points.length - 1].wall.getUTCFullYear();
+}
+
+/**
+ * Axis labels for the chosen tick indexes. Hours show the date at midnight; months read "Oct 2027".
+ * Days and weeks read "Oct 6", plus the year on the first tick and wherever a new year starts when
+ * the series covers more than one year.
+ */
+function tickLabels(points, indexes, bucket) {
+  const labels = new Map();
+  const withYear = spansYears(points);
+  let year = null;
+  for (const i of indexes) {
+    const wall = points[i].wall;
+    let label;
+    if (bucket === 'hour') label = wall.getUTCHours() === 0 ? fmtDay.format(wall) : fmtHour.format(wall);
+    else if (bucket === 'month') label = fmtMonth.format(wall);
+    else label = withYear && wall.getUTCFullYear() !== year ? fmtDayYear.format(wall) : fmtDay.format(wall);
+    year = wall.getUTCFullYear();
+    labels.set(i, label);
+  }
+  return labels;
 }
 
 /**
  * @param {HTMLElement} container positioned element with a CSS height (the SVG fills it)
- * @returns {{ update(points: {t: string, clicks: number}[], bucket: 'hour'|'day', opts?: {rangeLabel?: string}): void, render(): void, destroy(): void }}
+ * @returns {{ update(points: {t: string, clicks: number}[], bucket: 'hour'|'day'|'week'|'month', opts?: {rangeLabel?: string, tz?: number}): void, render(): void, destroy(): void }}
  */
 export function createTimeseriesChart(container) {
   const d3 = window.d3;
@@ -96,7 +151,7 @@ export function createTimeseriesChart(container) {
     crosshair.attr('x1', cx).attr('x2', cx).attr('y1', 0).attr('y2', geometry.ih).attr('visibility', 'visible');
     focusMark.attr('x', cx - 6.5).attr('y', cy - 6.5).attr('visibility', 'visible');
     tip.show(geometry.margin.left + cx, geometry.margin.top + cy, {
-      label: bucketLabel(p.date, bucket),
+      label: bucketLabel(p.wall, bucket),
       value: `${formatNumber(p.clicks)} ${p.clicks === 1 ? 'click' : 'clicks'}`,
     });
   }
@@ -139,10 +194,9 @@ export function createTimeseriesChart(container) {
     const total = d3.sum(points, (d) => d.clicks);
     const peakIdx = d3.maxIndex(points, (d) => d.clicks);
     const peak = points[peakIdx];
-    const unit = bucket === 'hour' ? 'hour' : 'day';
-    const base = `Line chart of clicks per ${unit}${rangeLabel ? `, ${rangeLabel}` : ''}. ${formatNumber(total)} ${total === 1 ? 'click' : 'clicks'} in total`;
+    const base = `Line chart of clicks per ${bucket}${rangeLabel ? `, ${rangeLabel}` : ''}. ${formatNumber(total)} ${total === 1 ? 'click' : 'clicks'} in total`;
     if (!peak || peak.clicks === 0) return `${base}. Use the Table button for exact values.`;
-    return `${base}; the busiest ${unit} was ${bucketLabel(peak.date, bucket)} with ${formatNumber(peak.clicks)}. Use the arrow keys to step through values.`;
+    return `${base}; the busiest ${bucket} was ${bucketPhrase(peak.wall, bucket)} with ${formatNumber(peak.clicks)}. Use the arrow keys to step through values.`;
   }
 
   function drawPeak(maxVal, margin, iw) {
@@ -208,11 +262,13 @@ export function createTimeseriesChart(container) {
       .attr('y2', (d) => Math.round(y(d)) + 0.5);
 
     // X axis: ticks on real buckets, anchored on the most recent one.
-    const maxTicks = Math.max(2, Math.floor(iw / (bucket === 'hour' ? 64 : 74)));
+    const spacing = bucket === 'day' && spansYears(points) ? TICK_SPACING_WITH_YEAR : TICK_SPACING[bucket];
+    const maxTicks = Math.max(2, Math.floor(iw / spacing));
     const step = Math.max(1, Math.ceil(n / maxTicks));
     const tickIdx = n <= 1 ? (n ? [0] : []) : d3.range(n).filter((i) => (n - 1 - i) % step === 0);
+    const labels = tickLabels(points, tickIdx, bucket);
     gX.attr('transform', `translate(0,${ih})`)
-      .call(d3.axisBottom(x).tickValues(tickIdx).tickFormat((i) => tickLabel(points[i].date, bucket)).tickSize(6).tickSizeOuter(0).tickPadding(7));
+      .call(d3.axisBottom(x).tickValues(tickIdx).tickFormat((i) => labels.get(i) ?? '').tickSize(6).tickSizeOuter(0).tickPadding(7));
     gY.call(d3.axisLeft(y).tickValues(yTicks).tickFormat(yFmt).tickSize(6).tickSizeOuter(0).tickPadding(6));
 
     // Area + line. A single bucket is drawn as a short flat run so it still reads as a shape.
@@ -256,12 +312,12 @@ export function createTimeseriesChart(container) {
   });
 
   return {
-    update(rawPoints, nextBucket, { rangeLabel: label = '' } = {}) {
-      bucket = nextBucket === 'hour' ? 'hour' : 'day';
+    update(rawPoints, nextBucket, { rangeLabel: label = '', tz = new Date().getTimezoneOffset() } = {}) {
+      bucket = bucketOf(nextBucket);
       rangeLabel = label;
       points = (Array.isArray(rawPoints) ? rawPoints : [])
-        .map((p) => ({ date: new Date(p.t), clicks: Math.max(0, Number(p.clicks) || 0) }))
-        .filter((p) => Number.isFinite(p.date.getTime()));
+        .map((p) => ({ wall: wallClock(p.t, tz), clicks: Math.max(0, Number(p.clicks) || 0) }))
+        .filter((p) => Number.isFinite(p.wall.getTime()));
       if (focusIndex >= points.length) focusIndex = -1;
       render();
     },

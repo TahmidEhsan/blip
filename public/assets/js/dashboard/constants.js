@@ -43,6 +43,15 @@ export const RANGE_SHORT = {
   all: 'all time',
 };
 
+/**
+ * Timeseries bucket sizes (StatsDTO.timeseries.bucket). Range `all` picks day, week or month from the
+ * link's age (SPEC 5.4), so a bucket is only known once its stats arrive.
+ */
+export const BUCKETS = ['hour', 'day', 'week', 'month'];
+export const BUCKET_ADVERBS = { hour: 'Hourly', day: 'Daily', week: 'Weekly', month: 'Monthly' };
+/** A bucket id from the API, or 'day' for anything unexpected. */
+export const bucketOf = (value) => (BUCKETS.includes(value) ? value : 'day');
+
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
 /** Outcome of a ClickEvent for the feed and the map: a counted click, a bot, or blocked after self-destruct. */

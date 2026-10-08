@@ -127,7 +127,81 @@ describe('analytics helpers', () => {
     assert.equal(new Date(india.end - india.size).toISOString(), '2026-10-07T23:30:00.000Z');
     const all = rangeWindow('all', now, 0, now - 3 * 86_400_000);
     assert.equal(all.count, 4);
-    assert.equal(rangeWindow('all', now, 0, now - 1000 * 86_400_000).count, 365);
+    assert.equal(all.starts.length, 4);
+    assert.equal(all.starts[3], all.end - all.size);
+  });
+
+  it('range all switches from days to weeks to months as a link gets older', () => {
+    const DAY_MS = 86_400_000;
+    const now = Date.parse('2026-10-07T23:30:00.000Z'); // a Wednesday
+    const yearOfDays = rangeWindow('all', now, 0, now - 364 * DAY_MS);
+    assert.equal(yearOfDays.bucket, 'day');
+    assert.equal(yearOfDays.count, 365);
+
+    const overAYear = rangeWindow('all', now, 0, now - 365 * DAY_MS);
+    assert.equal(overAYear.bucket, 'week');
+    assert.equal(overAYear.size, 7 * DAY_MS);
+    assert.equal(new Date(overAYear.starts.at(-1)).toISOString(), '2026-10-05T00:00:00.000Z', 'weeks start on Monday');
+    assert.equal(overAYear.end, Date.parse('2026-10-12T00:00:00.000Z'));
+    assert.equal(overAYear.starts[0], overAYear.start);
+    assert.ok(overAYear.start <= now - 365 * DAY_MS);
+
+    const thisMonday = Date.parse('2026-10-05T00:00:00.000Z');
+    const maxWeeks = rangeWindow('all', now, 0, thisMonday - 519 * 7 * DAY_MS);
+    assert.equal(maxWeeks.bucket, 'week');
+    assert.equal(maxWeeks.count, 520);
+    const months = rangeWindow('all', now, 0, thisMonday - 519 * 7 * DAY_MS - 1);
+    assert.equal(months.bucket, 'month');
+    assert.equal(months.size, null);
+    assert.equal(new Date(months.start).toISOString(), '2016-10-01T00:00:00.000Z', 'calendar months: Oct 2016 to Oct 2026');
+    assert.equal(new Date(months.starts.at(-1)).toISOString(), '2026-10-01T00:00:00.000Z');
+    assert.equal(new Date(months.end).toISOString(), '2026-11-01T00:00:00.000Z');
+    assert.equal(months.count, 121);
+  });
+
+  it('weekly and monthly buckets follow the client time zone on both sides of UTC', () => {
+    const DAY_MS = 86_400_000;
+    // Sunday 23:30 UTC: already Monday east of UTC, still Sunday to the west.
+    const sunday = Date.parse('2026-10-11T23:30:00.000Z');
+    const created = Date.parse('2024-10-09T12:00:00.000Z');
+    const weekStarts = (tz) => rangeWindow('all', sunday, tz, created).starts.map((t) => new Date(t).toISOString());
+    assert.equal(weekStarts(0).at(-1), '2026-10-05T00:00:00.000Z');
+    assert.equal(weekStarts(-60).at(-1), '2026-10-11T23:00:00.000Z', 'UTC+1: Monday Oct 12 has begun');
+    assert.equal(weekStarts(300).at(-1), '2026-10-05T05:00:00.000Z', 'UTC-5: still the week of Oct 5');
+    assert.equal(weekStarts(-330).at(-1), '2026-10-11T18:30:00.000Z');
+    for (const tz of [0, -60, 300, -330, -840, 840]) {
+      const win = rangeWindow('all', sunday, tz, created);
+      assert.equal(win.bucket, 'week', `tz=${tz}`);
+      for (const t of win.starts) {
+        const local = new Date(t - tz * 60_000);
+        assert.equal(local.getUTCDay(), 1, `tz=${tz}: ${new Date(t).toISOString()} is a local Monday`);
+        assert.equal(local.getUTCHours() + local.getUTCMinutes(), 0, `tz=${tz}: weeks start at local midnight`);
+      }
+      assert.ok(win.start <= created && sunday < win.end, `tz=${tz}: the window covers both ends`);
+      assert.equal(win.end - win.start, win.count * 7 * DAY_MS);
+    }
+
+    // Sep 30 22:30 UTC: October has begun in UTC+2 but not in UTC-5.
+    const lastDay = Date.parse('2026-09-30T22:30:00.000Z');
+    const decadeOld = Date.parse('2014-10-01T02:00:00.000Z');
+    const utc = rangeWindow('all', lastDay, 0, decadeOld);
+    assert.equal(utc.bucket, 'month');
+    assert.equal(utc.count, 144);
+    assert.equal(new Date(utc.start).toISOString(), '2014-10-01T00:00:00.000Z');
+    const east = rangeWindow('all', lastDay, -120, decadeOld);
+    assert.equal(east.count, 145);
+    assert.equal(new Date(east.starts.at(-1)).toISOString(), '2026-09-30T22:00:00.000Z', 'UTC+2: October 1 local');
+    const west = rangeWindow('all', lastDay, 300, decadeOld);
+    assert.equal(west.count, 145);
+    assert.equal(new Date(west.start).toISOString(), '2014-09-01T05:00:00.000Z', 'UTC-5: the first visit was still in September');
+    assert.equal(new Date(west.starts.at(-1)).toISOString(), '2026-09-01T05:00:00.000Z');
+    for (const [tz, win] of [[0, utc], [-120, east], [300, west]]) {
+      for (const t of [...win.starts, win.end]) {
+        const local = new Date(t - tz * 60_000);
+        assert.equal(local.getUTCDate(), 1, `tz=${tz}: months start on the 1st`);
+        assert.equal(local.getUTCHours() + local.getUTCMinutes(), 0, `tz=${tz}: at local midnight`);
+      }
+    }
   });
 });
 

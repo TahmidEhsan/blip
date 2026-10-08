@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
   <link rel="stylesheet" href="/assets/css/theme.css">
   <link rel="stylesheet" href="/assets/css/app.css">
+  <link rel="stylesheet" href="/assets/css/edit-settings.css">
   <script src="/vendor/qr-code-styling.js" defer></script>
   <script type="module" src="/assets/js/app.js"></script>
 </head>
@@ -450,11 +451,12 @@
           <div class="result__actions">
             <button type="button" class="btn btn--blue" id="resultCopy"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg><span data-label>Copy</span></button>
             <button type="button" class="btn" id="resultOpen"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg>Open</button>
+            <button type="button" class="btn" id="resultEdit" data-action="settings"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#sliders-horizontal"></use></svg>Edit settings</button>
             <a class="btn" id="resultQrLink" href="/qr.html"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg>QR studio</a>
             <a class="btn" id="resultDashLink" href="/dashboard.html"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg>Live dashboard</a>
             <button type="button" class="btn" id="resultShare" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#share-2"></use></svg>Share</button>
-            <button type="button" class="btn btn--danger" id="resultDestroy"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>Destroy now</button>
-            <button type="button" class="btn btn--blue" id="resultRevive" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg>Revive</button>
+            <button type="button" class="btn btn--danger" id="resultDestroy" data-action="life"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>Destroy now</button>
+            <button type="button" class="btn btn--blue" id="resultBringBack" data-action="life" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg>Bring back</button>
           </div>
 
           <ul class="result__summary" id="resultSummary" aria-label="Link options"></ul>

@@ -15,6 +15,7 @@ import { createQrFeature } from './home/qr-panel.js';
 import { createResult } from './home/result.js';
 import { createLinks } from './home/links.js';
 import { confirmDialog, initConfirmDialog } from './home/confirm.js';
+import { openEditSettings, announceSaved } from './edit-settings.js';
 import { initSlashShortcut } from './home/effects.js';
 import { startCountdownTicker, usableUrl, displayUrl } from './home/format.js';
 
@@ -295,7 +296,7 @@ const actions = {
     const ok = await confirmDialog({
       title: `Self-destruct /${slug}?`,
       slug,
-      message: 'Anyone who opens it will see the “this link has self-destructed” page instead of your destination. You can revive it later.',
+      message: 'Anyone who opens it will see the “this link has self-destructed” page instead of your destination. You can bring it back later.',
       confirmLabel: 'Destroy now',
       tone: 'danger',
       iconName: 'bomb',
@@ -309,23 +310,6 @@ const actions = {
       toast(`Boom! /${slug} has self-destructed.`, { type: 'success' });
     } catch (err) {
       handleManageError(err, slug, "Couldn't destroy that link.");
-    }
-  },
-
-  async revive(slug) {
-    const token = tokenOrWarn(slug);
-    if (!token) return;
-    try {
-      const { link } = await api.reviveLink(slug, token);
-      actions.applyLink(link);
-      if (link.status === 'active') {
-        toast(`/${slug} is back from the dead!`, { type: 'success' });
-      } else {
-        const why = link.expiredReason === 'clicks' ? 'its click limit is already used up' : 'its timer has already run out';
-        toast(`/${slug} is revived, but ${why}, so visitors still see the self-destructed page.`, { timeout: 5000 });
-      }
-    } catch (err) {
-      handleManageError(err, slug, "Couldn't revive that link.");
     }
   },
 
@@ -353,12 +337,31 @@ const actions = {
     }
   },
 
-  /** PATCH the target URL; throws so the inline editor can show the message. */
-  async editTarget(slug, targetUrl) {
-    const token = linkStore.tokenFor(slug);
-    if (!token) throw new Error("This browser doesn't have the key for this link any more.");
-    const { link } = await api.updateLink(slug, token, { targetUrl });
-    return link;
+  /**
+   * Open the shared Edit settings dialog (focus: 'general' | 'domain' | 'teaser' | 'destruct').
+   * Each save re-renders the row and the result panel in place; the dialog itself reports field errors.
+   */
+  async editSettings(slug, { focus = 'general' } = {}) {
+    const link = links.get(slug) || (state.currentLink?.slug === slug ? state.currentLink : null);
+    if (!link) return;
+    const token = tokenOrWarn(slug);
+    if (!token) return;
+    const opener = document.activeElement;
+    const fromRow = Boolean(opener?.closest?.('.link-row'));
+    const saved = await openEditSettings(link, token, {
+      // Until /api/config answers, let the dialog fetch it itself rather than offer the fallback domain only.
+      config: state.config.offline ? undefined : state.config,
+      focus,
+      onSaved: (updated) => {
+        expiryChecks.delete(updated.slug);
+        actions.applyLink(updated);
+      },
+    });
+    if (saved) announceSaved(link, saved);
+    // Bring back gives way to Destroy now once the link works again: land on the Edit settings button then.
+    if (opener && opener.isConnected && opener.getClientRects().length) return;
+    const fallback = fromRow ? links.settingsButton(slug) : result.settingsButton();
+    fallback?.focus({ preventScroll: true });
   },
 
   /** Open the working link in a new tab, warning first when a visit uses up a limited click. */
@@ -399,6 +402,7 @@ links = createLinks({
     navCount.textContent = String(n);
     navCount.hidden = n === 0;
   },
+  onLinkLoaded: (link) => result.update(link),
 });
 
 // ---------------------------------------------------------------------------

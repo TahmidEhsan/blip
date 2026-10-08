@@ -18,7 +18,7 @@ Blip is drawn like a page from a comic book. Every screen sits on newsprint pape
 - **Loading:** every view that fetches data shows halftone skeleton placeholders shaped like the final layout, then either the data, an empty state with one line of guidance, or an error with a Retry button.
 - **Motion:** only the background drift, skeletons, live indicators, the teaser countdown and the sound-effect bursts move. The main action button is the only control with a hover animation, and everything stops when your system asks for reduced motion.
 
-The full rule set (colour tokens, components, layout, motion and copy) lives in [DESIGN.md](DESIGN.md). It rules out gradients, shadows, translucent "glass" panels, rounded widgets, emoji, em dashes, coloured accent stripes, three-across card grids and decorative fake content. `npm run audit:design` checks the shipped UI against those rules and must report 0 findings.
+The full rule set (colour tokens, components, layout, motion and copy) lives in [DESIGN.md](DESIGN.md). It rules out gradients, shadows, translucent "glass" panels, rounded widgets, emoji, em dashes, coloured accent stripes, three-across card grids, disabled or unselected controls faded with opacity and decorative fake content. `npm run audit:design` checks the shipped UI against those rules and must report 0 findings, and `npm test` runs the same check.
 
 ---
 
@@ -54,7 +54,7 @@ Without JavaScript, a `<noscript>` meta refresh still forwards the visitor.
 Every link gets a live dashboard (`/dashboard.html#<slug>`). It shows:
 
 - one strip of key numbers: clicks, unique visitors, the last 24 hours and the link's remaining lifetime, plus bots and blocked attempts
-- clicks over time, bucketed by hour or day in *your* time zone
+- clicks over time, bucketed by hour, day, week or month in *your* time zone. **All time** covers every click since the link was made: by day for its first year, then by week (starting Monday), and by calendar month once it is past 520 weeks (about ten years)
 - a world map shaded by clicks, with city markers and a "hit" marker for each live click
 - horizontal bar breakdowns of devices, browsers, operating systems, referrers and countries
 - a live feed of visits
@@ -64,7 +64,9 @@ Updates are pushed over Server-Sent Events: a new click shows up on the dashboar
 Bots are detected and counted separately. If you want to see the dashboard in action, **Simulate traffic** inserts realistic demo clicks from about 47 real cities. Simulated clicks are clearly labelled as demo data and can be cleared with one click.
 
 ### 5. Self-destructing links
-A link can expire after a number of clicks, at a set time, or both, whichever comes first. Presets include "burn after reading" (1 click), 10 clicks, 1 hour, 24 hours and 7 days. You can also hit Destroy now to end a link immediately, and revive it later.
+A link can expire after a number of clicks, at a set time, or both, whichever comes first. Presets include "burn after reading" (1 click), 10 clicks, 1 hour, 24 hours and 7 days. You can also hit **Destroy now** to end a link immediately.
+
+A stopped link can always come back. **Bring back** opens its self-destruct settings and says why it stopped: set a new time (or Never) for a link whose timer ran out, raise or remove the click limit for one that used up its clicks, or undo a Destroy now (that switch is already on when Bring back opens, so saving is all it takes).
 
 A dead link answers **410** with a "KA-BOOM!" self-destructed page whose wording matches the reason: clicks, time or manual.
 
@@ -80,11 +82,22 @@ Each link has a QR studio (`/qr.html#<slug>`). It offers:
 
 You can download a 1024 px PNG or an SVG, copy the image, save the style to the link, or hit **Surprise me** for a random style. A contrast check warns you when a style might not scan.
 
+### Change any setting later
+
+Everything you picked when creating a link stays editable. **Edit settings** opens one dialog with four sections:
+
+- **General:** the title and the destination URL.
+- **Domain:** the base host or any of the vanity domains. The slug stays the same.
+- **Teaser:** on or off, the style, the countdown seconds, the brand message and the theme.
+- **Self-destruct:** the time limit (a preset, a custom date and time, or Never) and the click limit, shown next to the clicks already used. For a destroyed link it also has an **Undo Destroy now** switch.
+
+The dialog is on the result panel, on every row of My links, on the live dashboard and in the QR studio. Only the fields you change are saved, so editing a title never restarts a self-destruct timer. Problems are explained right next to the field that caused them. Open dashboards pick up a status change (stopped or brought back) at once.
+
 ---
 
 ## Quick start
 
-Requires **Node.js 22.13 or newer** (for the built-in `node:sqlite`).
+Requires **Node.js 22.13 or newer**, the first release with the built-in `node:sqlite` available without a flag (`engines` in `package.json` says the same). The repo's `.nvmrc` asks for Node 22, so `nvm use` picks a suitable version.
 
 ```bash
 npm install
@@ -97,7 +110,7 @@ npm run dev        # → http://localhost:3030 (restarts on file changes)
 |---|---|
 | `npm start` | Run the server |
 | `npm run dev` | Run the server and restart it when files change |
-| `npm test` | Run every test suite |
+| `npm test` | Run every test suite, including the design audit (it fails on any finding) |
 | `npm run audit:design` | Check the UI, server copy and this README against the rules in [DESIGN.md](DESIGN.md). Prints each finding with its file and line, and exits with an error until there are 0 findings |
 | `npm run icons` | Rebuild `public/assets/icons.svg` from `@phosphor-icons/core`. Icon ids and the Phosphor glyph behind each one are listed in `scripts/build-icons.mjs` |
 
@@ -105,9 +118,11 @@ npm run dev        # → http://localhost:3030 (restarts on file changes)
 
 1. Open **http://localhost:3030** and paste a long URL (the `https://` is added for you).
 2. Tap any of the six feature buttons under the box to open its options: **Custom slug**, **Playful domain**, **Teaser page**, **Self-destruct**, **Live analytics** and **QR studio**. Every feature you switch on shows up as a chip under the URL box; click a chip to reopen its panel.
-3. Press **Shorten** (or Enter). The result panel shows the branded short link, a "works right now" link for vanity domains, a styled QR code (click it to download a PNG) and buttons for copy, open, share, the QR studio, the live dashboard and **Destroy now**.
+3. Press **Shorten** (or Enter). The result panel shows the branded short link, a "works right now" link for vanity domains, a styled QR code (click it to download a PNG) and buttons for copy, open, share, the QR studio, the live dashboard, **Edit settings** and **Destroy now**.
 4. Open the **Live dashboard** and press **Simulate traffic** to watch clicks land on the world map in real time.
-5. Every link you create is listed under **My links** on the home page, with status, clicks, an expiry countdown and actions to edit the destination, destroy, revive or delete it.
+5. Every link you create is listed under **My links** on the home page, with status, clicks, an expiry countdown and actions to open its dashboard or QR studio, edit its settings, destroy it or delete it.
+6. Changed your mind? Press **Edit settings** to switch on a teaser, swap the domain, point the link somewhere else or change its self-destruct limits.
+7. Try a "burn after reading" link: open it once and it self-destructs. Press **Bring back**, raise or remove the click limit, and save: the link works again.
 
 | Page | URL |
 |---|---|
@@ -192,6 +207,7 @@ server/
   views/*.html      teaser, expired, not-found and preview pages
   data/trivia.js    fun facts for trivia teasers
 public/             index.html (home), dashboard.html, qr.html + assets (vanilla ES modules)
+  assets/js/edit-settings.js  shared Edit settings dialog and Bring back flow (styles in assets/css/edit-settings.css)
   assets/css/theme.css  shared design system: tokens, panels, captions, buttons, forms, skeletons, bursts
   assets/icons.svg      Phosphor icon sprite (generated by scripts/build-icons.mjs)
 scripts/
@@ -258,10 +274,13 @@ The suites use the built-in `node:test` runner and `assert/strict`, with no extr
 - expiry by time and by clicks, 30 concurrent visitors racing for 3 clicks, destroy/revive, and limits changed by `PATCH` (with the matching live `status` events)
 - analytics failures (a throwing geo provider, a link deleted mid-visit) never breaking the redirect
 - stats totals (including the bot and blocked overlap behind the "Bots & blocked" count), buckets (including time zones) and top-8 + "Other" breakdowns, simulated traffic, the SSE stream, its running totals and its per-link/per-client connection caps
+- **All time** stats over long spans: clicks years apart all count, and the chart switches to weeks (starting Monday) after a year and to calendar months after 520 weeks, aligned to time zones east and west of UTC
 - redirect-loop protection (base host, vanity domains, loopback and listen addresses on Blip's port)
 - reopening a file database, and links surviving a `PORT`/`BASE_URL` change
 - rate limiting (per-route budgets, `TRUST_PROXY` hop counts, IPv6 /64 grouping, the client cap) and security headers
 - the Bangers and Comic Neue font routes, and that the first release's icon library and font routes now answer 404
 - copy rules: API error messages, trivia facts, domain idea notes and every rendered view are free of em dashes and emoji, and the views only load assets that exist
+- the design audit: `test/design-audit.test.js` runs `scripts/audit-design.mjs` and requires 0 findings, and unit-tests its CSS rules (such as disabled or unselected controls faded with opacity)
+- shutdown: closing the app closes the database, even if it was already closed
 
 `npm test` runs `node --test "test/*.test.js"`, so each suite gets its own process (`test/helpers.js` is shared setup, not a suite). Run a single suite with, for example, `node --test test/redirect.test.js`.

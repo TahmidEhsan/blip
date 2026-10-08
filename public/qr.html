@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
   <link rel="stylesheet" href="/assets/css/theme.css">
   <link rel="stylesheet" href="/assets/css/qr.css">
+  <link rel="stylesheet" href="/assets/css/edit-settings.css">
 </head>
 <body class="page-qr">
   <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
@@ -37,12 +38,14 @@
         <span class="skeleton qr-skel-url"></span>
         <span class="skeleton qr-skel-badge"></span>
         <span class="skeleton qr-skel-host"></span>
+        <span class="skeleton qr-skel-edit"></span>
       </div>
-      <p class="qr-link-line" id="qr-link-line" hidden>
+      <div class="qr-link-line" id="qr-link-line" hidden>
         <span class="qr-link-line__short" id="qr-short-url"></span>
         <span class="badge" id="qr-status-badge"></span>
-        <span class="qr-link-line__target"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-right"></use></svg><span class="qr-link-line__host" id="qr-target"></span></span>
-      </p>
+        <span class="qr-link-line__target"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-right"></use></svg><span class="visually-hidden">Destination:</span><span class="qr-link-line__host" id="qr-target"></span></span>
+        <button type="button" class="btn btn--sm qr-link-line__edit" id="qr-edit-settings" data-action="settings" title="Change the domain, destination, teaser or self-destruct limits"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#sliders-horizontal"></use></svg><span>Edit settings</span></button>
+      </div>
     </section>
 
     <!-- Loading: skeletons shaped like the studio -->
@@ -119,9 +122,10 @@
         <section class="panel qr-preview" aria-labelledby="qr-preview-title">
           <h2 class="caption caption--corner qr-panel-title" id="qr-preview-title">Preview</h2>
 
-          <div class="qr-alert qr-alert--danger" id="qr-status-note" hidden>
+          <div class="qr-alert qr-alert--danger qr-status-note" id="qr-status-note" hidden>
             <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>
             <p id="qr-status-note-text"></p>
+            <button type="button" class="btn btn--sm qr-status-note__btn" id="qr-bring-back" data-action="bring-back" aria-describedby="qr-status-note-text"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span>Bring back</span></button>
           </div>
 
           <div class="qr-stage halftone">

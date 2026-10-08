@@ -67,7 +67,10 @@ export function startCountdownTicker() {
 export function expiryWords(link) {
   if (link.status === 'destroyed') return 'Destroyed by its owner';
   if (link.status === 'expired') {
-    if (link.expiredReason === 'clicks') return `Used up all ${plural(link.maxClicks ?? link.clickCount, 'click')}`;
+    if (link.expiredReason === 'clicks') {
+      const max = link.maxClicks ?? link.clickCount;
+      return max === 1 ? 'Used up its only click' : `Used up all ${plural(max, 'click')}`;
+    }
     return link.expiresAt ? `Expired ${formatDateTime(link.expiresAt)}` : 'Expired';
   }
   return null;

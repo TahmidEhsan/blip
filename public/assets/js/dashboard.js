@@ -15,12 +15,13 @@ import {
   formatDateTime,
   syncNavCount,
 } from './api.js';
-import { createTimeseriesChart, bucketLabel } from './dashboard/timeseries.js';
+import { openEditSettings, announceSaved, syncEditSettingsLink } from './edit-settings.js';
+import { createTimeseriesChart, bucketLabel, wallClock } from './dashboard/timeseries.js';
 import { createWorldMap } from './dashboard/worldmap.js';
 import { renderBars, renderDevices, renderCountries, referrerLead, referrerLabel } from './dashboard/lists.js';
 import { createFeed } from './dashboard/feed.js';
 import { radioGroup, tabs, setLoading, createDebounce } from './dashboard/ui.js';
-import { RANGES, RANGE_LABELS, RANGE_SHORT, SLUG_RE, isCountedClick, d3Ready } from './dashboard/constants.js';
+import { RANGES, RANGE_LABELS, RANGE_SHORT, BUCKET_ADVERBS, bucketOf, SLUG_RE, isCountedClick, d3Ready } from './dashboard/constants.js';
 import { loadLib } from './dashboard/vendor.js';
 
 const $ = (id) => document.getElementById(id);
@@ -61,6 +62,8 @@ const state = {
   token: null,
   link: null,
   stats: null,
+  statsTz: 0, // the `tz` the stats on screen were requested with: their bucket starts are local times in it
+  editing: false, // the Edit settings dialog is open (live status toasts wait for it)
   allTime: null, // { clicks, uniqueVisitors, syntheticClicks }: all-time, from the stream
   // All-time counted-click total already reflected in `stats`. Live click events carry a running
   // all-time total; events at or below this mark are already in the snapshot and must not be counted
@@ -495,10 +498,19 @@ function renderLink() {
   gone.hidden = link.status === 'active';
   if (link.status !== 'active') {
     let text;
-    if (link.status === 'destroyed' || link.expiredReason === 'manual') text = 'Self-destructed by its owner. Visitors now see the self-destruct page, and blocked attempts still show up here.';
-    else if (link.expiredReason === 'clicks') text = `It used up all ${plural(link.maxClicks ?? 0, 'click', 'clicks')}. Visitors now see the self-destruct page.`;
-    else text = `Its timer ran out on ${formatDateTime(link.expiresAt)}. Visitors now see the self-destruct page.`;
+    let how;
+    if (link.status === 'destroyed' || link.expiredReason === 'manual') {
+      text = 'Self-destructed by its owner. Visitors now see the self-destruct page, and blocked attempts still show up here.';
+      how = 'Undo Destroy now, and change its time or click limit if you like';
+    } else if (link.expiredReason === 'clicks') {
+      text = `It used up ${link.maxClicks === 1 ? 'its only click' : `all ${plural(link.maxClicks ?? 0, 'click', 'clicks')}`}. Visitors now see the self-destruct page.`;
+      how = 'Raise or remove its click limit so it works again';
+    } else {
+      text = `Its timer ran out on ${formatDateTime(link.expiresAt)}. Visitors now see the self-destruct page.`;
+      how = 'Give it a new self-destruct time, or none, so it works again';
+    }
     $('link-gone-text').textContent = text;
+    $('btn-bring-back').title = how;
   }
 
   setSafeHref($('btn-open'), workingUrl(link));
@@ -568,6 +580,53 @@ function renderLifeKpi() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Edit settings and Bring back (the shared dialog, SPEC 10.1 and 10.2)
+// ---------------------------------------------------------------------------
+/** A save in the dialog: the header, Lifetime cell and open hint follow the new link, and the stats refresh. */
+function applySavedLink(link) {
+  state.link = link;
+  state.expiryCheck = null;
+  renderLink();
+  scheduleRefresh.cancel();
+  loadStats();
+}
+
+/** Usable focus target: still in the page and rendered (a hidden Bring back button is not). */
+const isFocusable = (node) => Boolean(node && node !== document.body && node.isConnected && node.getClientRects().length > 0);
+
+/**
+ * Open Edit settings for the link on screen. focus: 'general' | 'domain' | 'teaser' | 'destruct'
+ * (Bring back opens at 'destruct'). Live status toasts wait while the dialog is open, because its own
+ * confirmation (announceSaved) reports the outcome of a save.
+ */
+async function editSettings(focus = 'general') {
+  const link = state.link;
+  const token = state.token;
+  if (!link || !token || state.editing) return;
+  const gen = state.gen;
+  // The dialog keeps its own copy: live clicks update state.link while it is open.
+  const before = structuredClone(link);
+  state.editing = true;
+  let saved = null;
+  try {
+    saved = await openEditSettings(before, token, {
+      config: state.config || undefined,
+      focus,
+      onSaved: (updated) => {
+        if (gen === state.gen) applySavedLink(updated);
+      },
+    });
+  } finally {
+    state.editing = false;
+  }
+  if (gen !== state.gen) return;
+  if (saved) announceSaved(before, saved);
+  else if (state.link && state.link.status !== before.status) announceStatus(state.link.status);
+  // Bring back hides once the link works again: hand focus to Edit settings rather than lose it.
+  if (!isFocusable(document.activeElement) && !$('view-app').hidden) $('btn-edit').focus();
+}
+
 /** Re-check delays once the local clock says a timed link has run out (then every 30 s). */
 const EXPIRY_RECHECK_MS = [3000, 6000, 12000, 24000, 30000];
 
@@ -619,10 +678,12 @@ async function loadStats({ skeleton = false, throwOnError = false } = {}) {
   }
   // Everything that already exists server-side when we ask is part of the snapshot we get back.
   const issuedWatermark = Math.max(state.allTime?.clicks || 0, state.simCeiling || 0);
+  const tz = new Date().getTimezoneOffset();
   try {
-    const stats = await api.stats(state.slug, state.token, { range, signal: ctrl.signal });
+    const stats = await api.stats(state.slug, state.token, { range, tz, signal: ctrl.signal });
     if (gen !== state.gen || ctrl.signal.aborted) return;
     state.stats = stats;
+    state.statsTz = tz;
     state.watermark = issuedWatermark;
     state.failedRange = null;
     $('stats-error').hidden = true;
@@ -702,8 +763,15 @@ function rangeStart() {
  */
 function renderRangeText(range = state.stats?.range || state.range) {
   const shown = state.stats?.range === range ? state.stats.timeseries?.bucket : null;
-  const bucket = shown || (range === '24h' ? 'hour' : 'day');
-  $('ts-sub').textContent = `${bucket === 'hour' ? 'Hourly' : 'Daily'}, ${RANGE_LABELS[range] || range}`;
+  let sub;
+  if (range === 'all') {
+    // All time has no cap: the server buckets by day, week or month depending on the link's age, so
+    // the bucket is only named once those stats are on screen.
+    sub = shown ? `${BUCKET_ADVERBS[bucketOf(shown)]}, every click since the link was made` : 'Every click since the link was made';
+  } else {
+    sub = `${BUCKET_ADVERBS[shown ? bucketOf(shown) : range === '24h' ? 'hour' : 'day']}, ${RANGE_LABELS[range] || range}`;
+  }
+  $('ts-sub').textContent = sub;
   $('kpi-clicks-label').textContent = `Clicks, ${RANGE_SHORT[range] || range}`;
   $('kpi-unique-label').textContent = `Unique visitors, ${RANGE_SHORT[range] || range}`;
   $('bd-sub').textContent = `Who clicked, on what, and from where (${RANGE_LABELS[range] || range})`;
@@ -738,14 +806,14 @@ function renderKpis() {
 
 function renderTsTable() {
   const s = state.stats;
-  const bucket = s.timeseries?.bucket === 'hour' ? 'hour' : 'day';
+  const bucket = bucketOf(s.timeseries?.bucket);
   const points = Array.isArray(s.timeseries?.points) ? s.timeseries.points : [];
   $('ts-caption').textContent = `Clicks per ${bucket}, ${RANGE_LABELS[s.range] || s.range}, newest first`;
   $('ts-table-body').replaceChildren(
     ...points.slice().reverse().map((p) => el(
       'tr',
       {},
-      el('th', { scope: 'row' }, bucketLabel(new Date(p.t), bucket)),
+      el('th', { scope: 'row' }, bucketLabel(wallClock(p.t, state.statsTz), bucket)),
       el('td', { class: 'num' }, formatNumber(p.clicks)),
     )),
   );
@@ -757,7 +825,7 @@ function renderStats() {
   renderRangeText();
   renderKpis();
 
-  charts.ts.update(s.timeseries?.points || [], s.timeseries?.bucket, { rangeLabel: RANGE_LABELS[s.range] || '' });
+  charts.ts.update(s.timeseries?.points || [], s.timeseries?.bucket, { rangeLabel: RANGE_LABELS[s.range] || '', tz: state.statsTz });
   renderTsTable();
 
   charts.map.update(s.countries, s.points);
@@ -1039,6 +1107,8 @@ function handleLiveClick(evt) {
       renderLifeKpi();
       renderOpenHint();
     }
+    // An open Edit settings dialog counts "N more clicks" and its After saving line from these.
+    if (state.editing) syncEditSettingsLink(link);
   }
 
   charts?.feed.push(evt);
@@ -1055,12 +1125,16 @@ function handleLiveStatus(data) {
   if (Number.isFinite(Number(data.clickCount))) link.clickCount = Number(data.clickCount);
   if ('clicksRemaining' in data) link.clicksRemaining = data.clicksRemaining;
   renderLink();
-  if (prev !== link.status) {
-    if (link.status === 'expired') toast('This link just self-destructed. New visitors will see the expired page.', { timeout: 4200 });
-    else if (link.status === 'destroyed') toast('Self-destruct triggered. The link is gone.', { timeout: 4200 });
-    else if (link.status === 'active') toast('The link is back from the dead.', { type: 'success' });
-  }
+  if (state.editing) syncEditSettingsLink(link);
+  // While Edit settings is open, its save confirmation (or editSettings() on close) speaks for it.
+  if (prev !== link.status && !state.editing) announceStatus(link.status);
   scheduleRefresh();
+}
+
+function announceStatus(status) {
+  if (status === 'expired') toast('This link just self-destructed. New visitors will see the expired page.', { timeout: 4200 });
+  else if (status === 'destroyed') toast('Self-destruct triggered. The link is gone.', { timeout: 4200 });
+  else if (status === 'active') toast('The link is back from the dead.', { type: 'success' });
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1192,8 @@ function init() {
     $(id).addEventListener('auxclick', guardedOpen);
   }
   $('btn-copy').addEventListener('click', copyLink);
+  $('btn-edit').addEventListener('click', () => editSettings('general'));
+  $('btn-bring-back').addEventListener('click', () => editSettings('destruct'));
   $('empty-copy').addEventListener('click', copyLink);
   $('btn-simulate').addEventListener('click', (e) => simulate(e.currentTarget));
   $('empty-simulate').addEventListener('click', (e) => simulate(e.currentTarget));

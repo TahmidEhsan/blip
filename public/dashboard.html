@@ -14,6 +14,7 @@
   <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
   <link rel="stylesheet" href="/assets/css/theme.css">
   <link rel="stylesheet" href="/assets/css/dashboard.css">
+  <link rel="stylesheet" href="/assets/css/edit-settings.css">
   <!-- The page module comes first so it can show the gate (or the dashboard skeleton) without waiting
        for the d3 download. It waits for the deferred chart libraries itself before drawing, and loads
        them again if they failed (dashboard/vendor.js). -->
@@ -136,6 +137,7 @@
             <div class="skeleton sk-caption"></div>
             <div class="sk-row">
               <div class="skeleton sk-btn sk-btn--wide"></div>
+              <div class="skeleton sk-btn sk-btn--edit"></div>
               <div class="skeleton sk-btn"></div>
               <div class="skeleton sk-btn"></div>
               <div class="skeleton sk-btn"></div>
@@ -165,10 +167,14 @@
               <span class="badge badge--vanity">Vanity preview</span>
               <span>Works right now: <a id="link-working-url" href="/" target="_blank" rel="noopener noreferrer"></a></span>
             </p>
-            <p id="link-gone" class="notice notice--red link-panel__gone" hidden>
+            <div id="link-gone" class="notice notice--red link-panel__gone" hidden>
               <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>
-              <span id="link-gone-text"></span>
-            </p>
+              <p id="link-gone-text" class="link-panel__gone-text"></p>
+              <button id="btn-bring-back" type="button" class="btn btn--sm link-panel__bring-back" data-action="bring-back" aria-describedby="link-gone-text">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg>
+                <span>Bring back</span>
+              </button>
+            </div>
           </div>
 
           <div class="link-panel__side">
@@ -180,6 +186,10 @@
               <button id="btn-copy" type="button" class="btn btn--primary">
                 <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg>
                 <span>Copy link</span>
+              </button>
+              <button id="btn-edit" type="button" class="btn btn--sm" data-action="settings">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#sliders-horizontal"></use></svg>
+                <span>Edit settings</span>
               </button>
               <a id="btn-open" class="btn btn--sm" href="/" target="_blank" rel="noopener noreferrer">
                 <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg>

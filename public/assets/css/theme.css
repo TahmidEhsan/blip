@@ -478,6 +478,8 @@ input[type="range"].range:disabled::-moz-range-thumb { background: var(--paper-2
 .segmented > button:hover { background: var(--paper-2); }
 .segmented > button[aria-checked="true"], .segmented > button[aria-pressed="true"] { background: var(--ink); color: var(--yellow); }
 .segmented > button:focus-visible { outline: 3px solid var(--blue); outline-offset: -3px; }
+/* A selected option is ink-filled, where the blue ring is under 3:1; yellow on ink is about 10:1. */
+.segmented > button[aria-checked="true"]:focus-visible, .segmented > button[aria-pressed="true"]:focus-visible { outline-color: var(--yellow); }
 
 /* Chips */
 .chip-group { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -488,7 +490,9 @@ input[type="range"].range:disabled::-moz-range-thumb { background: var(--paper-2
   color: var(--ink); font-size: 0.9rem; font-weight: 700; cursor: pointer;
 }
 button.chip:hover, a.chip:hover { background: var(--paper-2); }
-.chip[aria-pressed="true"], .chip[aria-checked="true"], .chip.is-selected { background: var(--yellow); }
+/* Element-qualified too, so a selected chip stays yellow under the pointer (button.chip:hover is as specific). */
+.chip[aria-pressed="true"], .chip[aria-checked="true"], .chip.is-selected,
+button.chip[aria-pressed="true"], button.chip[aria-checked="true"], button.chip.is-selected, a.chip.is-selected { background: var(--yellow); }
 .chip .icon { width: 15px; height: 15px; }
 span.chip, div.chip { cursor: default; }
 

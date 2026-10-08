@@ -30,8 +30,11 @@ export function createResult({ actions, onAnother }) {
   const qrLink = byId('resultQrLink');
   const dashLink = byId('resultDashLink');
   const shareBtn = byId('resultShare');
+  const editBtn = byId('resultEdit');
   const destroyBtn = byId('resultDestroy');
-  const reviveBtn = byId('resultRevive');
+  const bringBackBtn = byId('resultBringBack');
+  /** Destroy now and Bring back share one slot: Destroy now while the link works, Bring back once it stopped. */
+  const lifeButtons = [destroyBtn, bringBackBtn];
   const summary = byId('resultSummary');
   const qrButton = byId('resultQr');
   const qrBox = byId('resultQrCode');
@@ -152,24 +155,23 @@ export function createResult({ actions, onAnother }) {
     workingRow.hidden = link.domainLive || !active;
     workingUrl.textContent = displayUrl(link.workingUrl);
 
-    // Destroy and Revive swap places; keep keyboard focus on whichever life button is now shown.
-    const lifeHadFocus = document.activeElement === destroyBtn || document.activeElement === reviveBtn;
+    // Destroy now and Bring back swap places; keep keyboard focus on whichever one is now shown.
+    const lifeHadFocus = lifeButtons.includes(document.activeElement);
     destroyBtn.hidden = !active;
-    reviveBtn.hidden = link.status !== 'destroyed';
-    if (lifeHadFocus) {
-      if (!reviveBtn.hidden) reviveBtn.focus({ preventScroll: true });
-      else if (!destroyBtn.hidden) destroyBtn.focus({ preventScroll: true });
-      else title.focus({ preventScroll: true });
-    }
+    bringBackBtn.hidden = active;
+    bringBackBtn.title = link.status === 'destroyed'
+      ? 'Undo Destroy now so it works again'
+      : link.expiredReason === 'clicks' ? 'Give it more clicks so it works again' : 'Give it more time so it works again';
+    if (lifeHadFocus) (lifeButtons.find((btn) => !btn.hidden) || title).focus({ preventScroll: true });
     if (active) {
       statusNote.hidden = true;
     } else {
       statusNote.hidden = false;
       statusNote.textContent = link.status === 'destroyed'
-        ? 'Visitors now see the “this link has self-destructed” page. Revive it to bring it back.'
+        ? 'Visitors now see the “this link has self-destructed” page. Press Bring back to undo Destroy now.'
         : link.expiredReason === 'clicks'
-          ? 'Its clicks are all used up, so visitors now see the self-destructed page.'
-          : 'Its timer ran out, so visitors now see the self-destructed page.';
+          ? 'Its clicks are all used up, so visitors now see the self-destructed page. Press Bring back to give it more clicks.'
+          : 'Its timer ran out, so visitors now see the self-destructed page. Press Bring back to give it more time.';
     }
 
     const slugHash = `#${encodeURIComponent(link.slug)}`;
@@ -237,11 +239,14 @@ export function createResult({ actions, onAnother }) {
     }
   });
 
+  editBtn.addEventListener('click', () => {
+    if (state.currentLink) actions.editSettings(state.currentLink.slug, { focus: 'general' });
+  });
   destroyBtn.addEventListener('click', () => {
     if (state.currentLink) actions.destroy(state.currentLink.slug);
   });
-  reviveBtn.addEventListener('click', () => {
-    if (state.currentLink) actions.revive(state.currentLink.slug);
+  bringBackBtn.addEventListener('click', () => {
+    if (state.currentLink) actions.editSettings(state.currentLink.slug, { focus: 'destruct' });
   });
 
   qrButton.addEventListener('click', async () => {
@@ -299,7 +304,7 @@ export function createResult({ actions, onAnother }) {
         title.focus({ preventScroll: true });
       });
     },
-    /** Refresh after the link changed (destroy / revive / edit / poll). */
+    /** Refresh after the link changed (Destroy now / Edit settings / Bring back / poll). */
     update(link) {
       if (!state.currentLink || state.currentLink.slug !== link.slug) return;
       const qrChanged = JSON.stringify(state.currentLink.qrStyle) !== JSON.stringify(link.qrStyle) || state.currentLink.qrUrl !== link.qrUrl;
@@ -325,5 +330,7 @@ export function createResult({ actions, onAnother }) {
       if (hadFocus) document.getElementById('targetUrl')?.focus({ preventScroll: true });
     },
     currentSlug: () => state.currentLink?.slug ?? null,
+    /** Where focus lands when the Edit settings dialog closes and the button that opened it is gone. */
+    settingsButton: () => (section.hidden ? null : editBtn),
   };
 }

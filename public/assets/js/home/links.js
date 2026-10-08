@@ -1,14 +1,13 @@
-// Blip home page: "My links" list (batch fetch, status, countdowns, inline edit, destroy/revive/delete).
+// Blip home page: "My links" list (batch fetch, status, countdowns, Edit settings, Destroy now/Bring back, delete).
 
-import { api, linkStore, el, icon, toast, copyText, formatRelative, hostOf } from '../api.js';
-import { friendlyMessage, ownHosts, state } from './state.js';
-import { byId, setFieldError, flashButton, setBusy, skeleton } from './dom.js';
+import { api, linkStore, el, icon, toast, copyText, formatRelative } from '../api.js';
+import { friendlyMessage } from './state.js';
+import { byId, flashButton, setBusy, skeleton } from './dom.js';
 import { displayUrl, statusBadge, countdownEl, expiryWords, clicksWords, usableUrl, tickCountdowns } from './format.js';
-import { validateTargetUrl } from './url.js';
 
 const BATCH_SIZE = 100;
 
-export function createLinks({ actions, onCountChange }) {
+export function createLinks({ actions, onCountChange, onLinkLoaded }) {
   const list = byId('linksList');
   const empty = byId('linksEmpty');
   const errorBox = byId('linksError');
@@ -18,7 +17,7 @@ export function createLinks({ actions, onCountChange }) {
   const countEl = byId('linksCount');
   const liveStatus = byId('linksStatus');
 
-  /** slug to { slug, token, link, error, editing, draft, editError, rev } in store order */
+  /** slug to { slug, token, link, error, rev } in store order */
   let entries = new Map();
   let loading = false;
   let loadedOnce = false;
@@ -85,93 +84,6 @@ export function createLinks({ actions, onCountChange }) {
         }, icon('x'), 'Forget')));
   }
 
-  function buildEditForm(entry) {
-    const inputId = `edit-target-${entry.slug}`;
-    const errorId = `edit-error-${entry.slug}`;
-    const input = el('input', {
-      class: 'input link-edit__input',
-      id: inputId,
-      type: 'text',
-      inputmode: 'url',
-      autocomplete: 'url',
-      spellcheck: 'false',
-      maxlength: String(state.config.limits.urlMax),
-      'aria-describedby': errorId,
-    });
-    input.value = entry.draft ?? entry.link.targetUrl;
-    const errorEl = el('p', { class: 'error-text link-edit__error', id: errorId, hidden: !entry.editError }, entry.editError || '');
-    if (entry.editError) input.setAttribute('aria-invalid', 'true');
-    const saveBtn = el('button', { type: 'submit', class: 'btn btn--blue btn--sm', dataset: { action: 'edit-save' } }, icon('save'), 'Save');
-
-    const cancel = () => {
-      entry.editing = false;
-      entry.draft = null;
-      entry.editError = null;
-      replaceRow(entry.slug);
-      document.getElementById(rowId(entry.slug))?.querySelector('[data-action="edit"]')?.focus();
-    };
-
-    input.addEventListener('input', () => {
-      entry.draft = input.value;
-      entry.editError = null;
-      setFieldError(input, errorEl, '');
-    });
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        cancel();
-      }
-    });
-    input.addEventListener('blur', () => {
-      const v = input.value.trim();
-      if (v && !/^[a-z][a-z0-9+.-]*:\/\//i.test(v) && validateTargetUrl(v).ok) input.value = validateTargetUrl(v).display;
-    });
-
-    const form = el('form', {
-      class: 'link-edit',
-      novalidate: true,
-      on: {
-        submit: async (event) => {
-          event.preventDefault();
-          if (saveBtn.classList.contains('is-loading')) return;
-          const check = validateTargetUrl(input.value, { ownHosts: ownHosts(), maxLength: state.config.limits.urlMax });
-          if (!check.ok) {
-            entry.editError = check.message;
-            setFieldError(input, errorEl, check.message);
-            input.focus();
-            return;
-          }
-          if (check.url === entry.link.targetUrl) {
-            cancel();
-            return;
-          }
-          setBusy(saveBtn, true);
-          try {
-            const link = await actions.editTarget(entry.slug, check.url);
-            entry.editing = false;
-            entry.draft = null;
-            entry.editError = null;
-            actions.applyLink(link);
-            toast(`/${link.slug} now points to ${hostOf(link.targetUrl)}`, { type: 'success' });
-            document.getElementById(rowId(entry.slug))?.querySelector('[data-action="edit"]')?.focus();
-          } catch (err) {
-            setBusy(saveBtn, false);
-            const message = friendlyMessage(err, "Couldn't save the new destination.");
-            entry.editError = message;
-            setFieldError(input, errorEl, message);
-            input.focus();
-          }
-        },
-      },
-    },
-    el('label', { class: 'visually-hidden', for: inputId }, `New destination for /${entry.slug}`),
-    input,
-    saveBtn,
-    el('button', { type: 'button', class: 'btn btn--ghost btn--sm', dataset: { action: 'edit-cancel' }, on: { click: cancel } }, 'Cancel'),
-    errorEl);
-    return form;
-  }
-
   function buildRow(entry) {
     if (!entry.link) return buildMissingRow(entry);
     const link = entry.link;
@@ -213,44 +125,45 @@ export function createLinks({ actions, onCountChange }) {
       }
     }, { action: 'key' });
 
-    const editBtn = iconButton('pencil', `Edit destination of /${link.slug}`, () => {
-      entry.editing = true;
-      entry.draft = link.targetUrl;
-      replaceRow(link.slug);
-      const input = document.getElementById(`edit-target-${link.slug}`);
-      input?.focus();
-      input?.select();
-    }, { action: 'edit' });
+    // Destination, title, domain, teaser and self-destruct all live in the shared Edit settings dialog.
+    const settingsBtn = iconButton('sliders-horizontal', `Edit settings for /${link.slug}`,
+      () => actions.editSettings(link.slug, { focus: 'general' }), { action: 'settings' });
 
-    const lifeBtn = status === 'destroyed'
-      ? iconButton('rotate-ccw', `Revive /${link.slug}`, () => actions.revive(link.slug), { class: 'link-row__revive', action: 'life' })
-      : iconButton('bomb', `Destroy /${link.slug} now`, () => actions.destroy(link.slug), { class: 'link-row__destroy', action: 'life' });
-    if (status === 'expired') {
-      lifeBtn.disabled = true;
-      lifeBtn.title = 'Already expired';
-      lifeBtn.setAttribute('aria-label', `/${link.slug} has already expired`);
+    // One slot for the link's life: Destroy now while active, and Bring back (Edit settings at its
+    // Self-destruct section) once it stopped, whether destroyed by hand or out of time or clicks.
+    let lifeBtn;
+    if (status !== 'active') {
+      let why = 'Give it more time so it works again';
+      if (status === 'destroyed') why = 'Undo Destroy now so it works again';
+      else if (link.expiredReason === 'clicks') why = 'Give it more clicks so it works again';
+      lifeBtn = el('button', {
+        type: 'button',
+        class: 'btn btn--blue btn--sm link-row__bring-back',
+        'aria-label': `Bring back /${link.slug}`,
+        title: why,
+        dataset: { action: 'life' },
+        on: { click: () => actions.editSettings(link.slug, { focus: 'destruct' }) },
+      }, icon('rotate-ccw'), el('span', {}, 'Bring back'));
+    } else {
+      lifeBtn = iconButton('bomb', `Destroy /${link.slug} now`, () => actions.destroy(link.slug), { class: 'link-row__destroy', action: 'life' });
     }
 
-    const targetLine = entry.editing
-      ? buildEditForm(entry)
-      : el('p', { class: 'link-row__target' },
-        icon('corner-down-right'),
-        el('span', { class: 'link-row__target-url truncate', title: link.targetUrl }, displayUrl(link.targetUrl)),
-        link.title ? el('span', { class: 'link-row__title truncate' }, `· ${link.title}`) : null);
-
-    return el('li', { class: `link-row${entry.editing ? ' is-editing' : ''}`, id: rowId(link.slug), dataset: { slug: link.slug, status } },
+    return el('li', { class: 'link-row', id: rowId(link.slug), dataset: { slug: link.slug, status } },
       el('div', { class: 'link-row__main' },
         el('div', { class: 'link-row__top' },
           el('span', { class: 'link-row__url', title: link.shortUrl }, displayUrl(link.shortUrl)),
           ...badges),
-        targetLine,
+        el('p', { class: 'link-row__target' },
+          icon('corner-down-right'),
+          el('span', { class: 'link-row__target-url truncate', title: link.targetUrl }, displayUrl(link.targetUrl)),
+          link.title ? el('span', { class: 'link-row__title truncate' }, `· ${link.title}`) : null),
         el('div', { class: 'link-row__meta' }, ...meta)),
       el('div', { class: 'link-row__actions' },
         copyBtn,
         iconLink('activity', `Live dashboard for /${link.slug}`, `/dashboard.html${slugHash}`, 'dashboard'),
         iconLink('qr-code', `QR studio for /${link.slug}`, `/qr.html${slugHash}`, 'qr'),
         keyBtn,
-        editBtn,
+        settingsBtn,
         lifeBtn,
         iconButton('trash', `Delete /${link.slug}`, () => actions.remove(link.slug), { class: 'link-row__delete', action: 'delete' })));
   }
@@ -278,13 +191,11 @@ export function createLinks({ actions, onCountChange }) {
       render();
       return;
     }
-    // Remember where keyboard focus was so it survives the swap (e.g. Destroy to Revive). Only when the
-    // row itself had focus, so a slow API reply never pulls focus away from somewhere else.
+    // Remember which action had keyboard focus so it survives the swap (e.g. Destroy now to Bring back). Only
+    // when the row itself had focus, so a slow API reply never pulls focus away from somewhere else.
     const active = document.activeElement;
     const hadFocus = Boolean(active && old.contains(active));
-    const focusId = hadFocus && active.id ? active.id : '';
     const action = hadFocus ? active.closest('[data-action]')?.dataset.action ?? null : null;
-    const selection = hadFocus && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : null;
 
     const next = buildRow(entry);
     if (old.classList.contains('is-new')) next.classList.add('is-new');
@@ -292,14 +203,8 @@ export function createLinks({ actions, onCountChange }) {
     tickCountdowns();
 
     if (!hadFocus) return;
-    const target = (focusId && next.querySelector(`#${CSS.escape(focusId)}`))
-      || (action && next.querySelector(`[data-action="${action}"]:not([disabled])`))
-      || firstAction(next);
-    if (!target) return;
-    target.focus({ preventScroll: true });
-    if (selection && typeof target.setSelectionRange === 'function') {
-      try { target.setSelectionRange(selection[0], selection[1]); } catch { /* not a text control */ }
-    }
+    const target = (action && next.querySelector(`[data-action="${action}"]:not([disabled])`)) || firstAction(next);
+    target?.focus({ preventScroll: true });
   }
 
   /** Drop a row, moving keyboard focus to a neighbour if the row had it. */
@@ -371,15 +276,14 @@ export function createLinks({ actions, onCountChange }) {
           token: item.token,
           link: r.link || null,
           error: r.error || null,
-          editing: Boolean(prev?.editing && r.link),
-          draft: prev?.draft ?? null,
-          editError: prev?.editError ?? null,
           rev: 0,
         });
       }
       entries = next;
       loadedOnce = true;
       render();
+      // Let the result panel catch up with what the server just said (e.g. its link burned meanwhile).
+      for (const entry of next.values()) if (entry.link && entry.rev === 0) onLinkLoaded?.(entry.link);
       if (removed) toast(`${removed === 1 ? 'One link' : `${removed} links`} no longer exist${removed === 1 ? 's' : ''} and ${removed === 1 ? 'was' : 'were'} tidied away.`);
       if (announce) liveStatus.textContent = `Links refreshed. ${next.size} saved.`;
     } catch (err) {
@@ -423,7 +327,7 @@ export function createLinks({ actions, onCountChange }) {
     refresh,
     /** Put a just-created link at the top of the list. */
     add(link, token) {
-      const next = new Map([[link.slug, { slug: link.slug, token, link, error: null, editing: false, draft: null, editError: null, rev: ++rev }]]);
+      const next = new Map([[link.slug, { slug: link.slug, token, link, error: null, rev: ++rev }]]);
       for (const [slug, entry] of entries) if (slug !== link.slug) next.set(slug, entry);
       entries = next;
       loadedOnce = true;
@@ -441,5 +345,9 @@ export function createLinks({ actions, onCountChange }) {
     },
     remove: removeEntry,
     has: (slug) => entries.has(slug),
+    /** The latest LinkDTO this list holds for a slug, or null. */
+    get: (slug) => entries.get(slug)?.link ?? null,
+    /** A row's Edit settings button: where focus lands when the dialog closes and the button that opened it is gone. */
+    settingsButton: (slug) => document.getElementById(rowId(slug))?.querySelector('[data-action="settings"]') ?? null,
   };
 }

@@ -1,0 +1,204 @@
+/* ==========================================================================
+   Blip: the shared "Edit settings" dialog (built by /assets/js/edit-settings.js)
+   Loaded after a page's own css. Builds on theme.css (.modal, .btn, .field, .input,
+   .segmented, .chip, .switch, .badge, .range, .skeleton); everything else the
+   dialog needs is here, prefixed .edit-. Comic panel rules: ink outlines, flat
+   fills, sharp corners, no shadows, no hover motion.
+   ========================================================================== */
+
+/* The dialog is a column: header, a body that scrolls inside the viewport, and a footer that stays put
+   (on short screens the header scrolls away with the form instead, see the end of this file). */
+dialog.modal.edit-dialog {
+  width: min(calc(100vw - 24px), 720px);
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+}
+.edit-dialog[open] { display: flex; flex-direction: column; }
+.edit-dialog p { margin: 0; }
+.edit-form { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; margin: 0; }
+
+/* ---------- Header: a yellow narration band (it never scrolls, except on short screens, so the notice below the title stays in view) ---------- */
+.edit-head {
+  display: grid; gap: 10px;
+  padding: 14px 16px 12px 18px;
+  background: var(--yellow);
+  border-bottom: var(--line);
+}
+.edit-head__row { display: flex; align-items: flex-start; gap: 12px; }
+.edit-head__text { display: grid; justify-items: start; gap: 8px; flex: 1 1 auto; min-width: 0; }
+.edit-head__title { margin: 0; font-size: clamp(1.7rem, 5vw, 2.1rem); line-height: 1.05; overflow-wrap: anywhere; }
+/* Bangers only has capitals, so the slug is set in the URL face. */
+.edit-slug {
+  display: inline-block; max-width: 100%; /* drops to its own line whole, and only breaks when longer than a line */
+  font-family: var(--font-mono); font-size: 0.6em; font-weight: 700; letter-spacing: 0; text-transform: none;
+  overflow-wrap: anywhere;
+}
+.edit-head__badge { display: inline-flex; }
+.edit-head__close { flex: none; margin: -2px -4px 0 0; }
+.edit-head__close:hover { background: var(--panel); }
+
+/* ---------- Body ---------- */
+.edit-body {
+  position: relative;
+  flex: 1 1 auto; min-height: 0;
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: 0 18px;
+}
+
+/* Save problems that belong to no single field */
+.edit-alert {
+  display: flex; align-items: flex-start; gap: 10px;
+  margin-top: 16px; padding: 10px 12px;
+  background: var(--yellow); color: var(--ink);
+  border: var(--line-thin);
+  font-weight: 700;
+}
+.edit-alert__icon { display: grid; place-items: center; flex: none; width: 30px; height: 30px; background: var(--red); color: #fff; border: var(--line-thin); }
+.edit-alert__icon .icon { width: 18px; height: 18px; }
+.edit-alert__text { align-self: center; }
+
+/* Why an expired or destroyed link is down, and what brings it back (a red caption in the header) */
+.edit-notice {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 9px 12px;
+  background: var(--red); color: #fff;
+  border: var(--line-thin);
+}
+.edit-notice__text { flex: 1 1 300px; min-width: 0; font-size: 0.95rem; font-weight: 700; line-height: 1.4; }
+.edit-notice__kicker {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-right: 4px; padding: 1px 7px;
+  background: var(--ink); color: var(--yellow);
+  font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; vertical-align: 1px;
+}
+.edit-notice__icon { display: inline-grid; }
+.edit-notice__icon .icon { width: 14px; height: 14px; }
+.edit-notice__btn { flex: none; }
+/* The focus ring sits on the red notice, where --blue is 1.3:1; white is 5:1 */
+.edit-notice :focus-visible { outline-color: #fff; }
+
+/* ---------- Sections ---------- */
+.edit-section { display: grid; gap: 16px; padding: 18px 0 20px; }
+.edit-section + .edit-section { border-top: var(--line-thin); }
+.edit-section__head { display: flex; align-items: center; gap: 10px; }
+.edit-section__icon { display: grid; place-items: center; flex: none; width: 36px; height: 36px; background: var(--yellow); border: var(--line-thin); color: var(--ink); }
+.edit-section__icon .icon { width: 20px; height: 20px; }
+.edit-section__title { margin: 0; font-size: 1.6rem; }
+.edit-section__title:focus-visible { outline-offset: 4px; }
+
+.edit-field-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.edit-optional { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
+.edit-req { margin-left: 6px; padding: 1px 6px; background: var(--red); color: #fff; font-size: 0.68rem; letter-spacing: 0.06em; vertical-align: 1px; }
+.edit-counter { font-family: var(--font-mono); font-size: 0.85rem; color: var(--muted); }
+.edit-counter[data-level="near"] { color: var(--ink); font-weight: 700; }
+.edit-counter[data-level="full"] { color: var(--red-dark); font-weight: 700; }
+.edit-input--mono { font-family: var(--font-mono); font-size: 0.95rem; }
+.edit-number { max-width: 220px; font-family: var(--font-mono); }
+.edit-date { max-width: 300px; }
+.edit-switch { align-self: flex-start; }
+
+/* Single-choice groups span the dialog; a wrapped one reads as a ruled grid (theme.css). */
+.edit-dialog .segmented { display: flex; width: 100%; }
+/* A radio group with an error gets the same red outline as an invalid input. */
+.edit-dialog [role="radiogroup"][aria-invalid="true"] { outline: 3px solid var(--red); outline-offset: 3px; }
+.edit-dialog input[type="checkbox"][aria-invalid="true"] + .switch__track { outline: 3px solid var(--red); outline-offset: 2px; }
+
+/* ---------- Domain chips ---------- */
+.edit-chips { min-height: 40px; }
+.edit-domain-chip { min-height: 40px; padding: 0 8px 0 12px; gap: 8px; font-family: var(--font-mono); font-size: 0.9rem; }
+.edit-domain-chip__name { overflow-wrap: anywhere; text-align: left; }
+.edit-domain-chip .badge { font-family: var(--font-body); font-size: 0.66rem; padding: 1px 6px; }
+.edit-chip-skeleton { display: inline-block; width: 120px; height: 40px; margin: 0; }
+.edit-chip-skeleton:nth-child(2) { width: 96px; }
+.edit-chip-skeleton:nth-child(3) { width: 138px; }
+
+.edit-problem {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+  padding: 10px 12px;
+  border: var(--line-thin); background: var(--paper);
+}
+.edit-problem p { flex: 1 1 200px; font-weight: 700; }
+.edit-problem__icon { display: grid; place-items: center; flex: none; width: 32px; height: 32px; background: var(--red); color: #fff; border: var(--line-thin); }
+.edit-problem__icon .icon { width: 18px; height: 18px; }
+
+/* ---------- Teaser: seconds readout and theme swatches ---------- */
+.edit-range-out { padding: 1px 8px; background: var(--yellow); border: var(--line-thin); font-family: var(--font-mono); font-size: 0.9rem; font-weight: 700; }
+.edit-swatches { display: flex; flex-wrap: wrap; gap: 10px; }
+.edit-swatch {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 4px; border: 0; background: transparent; color: var(--ink); cursor: pointer;
+}
+.edit-swatch__chip {
+  display: grid; place-items: center; width: 48px; height: 48px;
+  border: var(--line);
+  font-family: var(--font-display); font-size: 1.35rem; letter-spacing: 0.04em; line-height: 1;
+}
+.edit-swatch__label { padding: 1px 6px; border: 2px solid transparent; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.edit-swatch:hover .edit-swatch__label { border-color: var(--ink); }
+.edit-swatch[aria-checked="true"] .edit-swatch__chip { outline: 3px solid var(--ink); outline-offset: 3px; }
+.edit-swatch[aria-checked="true"] .edit-swatch__label { background: var(--ink); color: var(--yellow); border-color: var(--ink); }
+.edit-swatch[data-value="hero"] .edit-swatch__chip { background: var(--theme-hero-bg); color: var(--theme-hero-fg); }
+.edit-swatch[data-value="caption"] .edit-swatch__chip { background: var(--theme-caption-bg); color: var(--theme-caption-fg); }
+.edit-swatch[data-value="noir"] .edit-swatch__chip { background: var(--theme-noir-bg); color: var(--theme-noir-fg); }
+.edit-swatch[data-value="sky"] .edit-swatch__chip { background: var(--theme-sky-bg); color: var(--theme-sky-fg); }
+.edit-swatch[data-value="paper"] .edit-swatch__chip { background: var(--theme-paper-bg); color: var(--theme-paper-fg); }
+
+/* ---------- Self-destruct ---------- */
+.edit-rule {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
+  border: var(--line-thin); background: var(--paper);
+}
+.edit-rule__icon { display: grid; place-items: center; flex: none; width: 36px; height: 36px; background: var(--ink); color: var(--yellow); border: var(--line-thin); }
+.edit-rule__body { display: grid; gap: 1px; min-width: 0; }
+.edit-rule__label { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.edit-rule__text { font-weight: 700; }
+
+/* Follow-up inputs (custom date, extra clicks) sit in a dashed box under their group. */
+.edit-sub {
+  display: grid; gap: 6px;
+  margin-top: 6px; padding: 12px;
+  border: 2px dashed var(--ink); background: var(--paper);
+}
+.edit-revive {
+  display: grid; gap: 6px;
+  padding: 12px;
+  border: var(--line); background: var(--paper);
+}
+
+/* ---------- Footer: live "After saving" line and the actions ---------- */
+.edit-foot {
+  display: grid; gap: 10px;
+  padding: 12px 18px 14px;
+  background: var(--paper);
+  border-top: var(--line);
+}
+.edit-after { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 0.92rem; font-weight: 700; line-height: 1.35; }
+.edit-after__label { font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.edit-after__badge { display: inline-flex; }
+.edit-after__text { min-width: 0; }
+.edit-foot__actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+
+/* ---------- Phones ---------- */
+@media (max-width: 519px) {
+  dialog.modal.edit-dialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+  .edit-head { padding: 12px 10px 10px 14px; gap: 8px; }
+  .edit-notice { padding: 8px 10px; }
+  .edit-notice__text { font-size: 0.9rem; }
+  .edit-body { padding: 0 14px; }
+  .edit-foot { padding: 10px 14px 12px; }
+  .edit-section__title { font-size: 1.45rem; }
+  .edit-foot__actions .btn { flex: 1 1 0; min-width: 0; }
+  .edit-swatches { gap: 6px; }
+  .edit-swatch__chip { width: 44px; height: 44px; }
+}
+
+/* ---------- Short screens (a phone held sideways, a zoomed-in window): the header scrolls away with the form,
+   the footer (Save) stays. Otherwise the fixed header and footer leave the form a sliver to scroll in. ---------- */
+@media (max-height: 560px) {
+  .edit-form { overflow-y: auto; overscroll-behavior: contain; }
+  .edit-body { flex: none; min-height: auto; overflow: visible; }
+  .edit-foot { position: sticky; bottom: 0; z-index: 2; }
+}

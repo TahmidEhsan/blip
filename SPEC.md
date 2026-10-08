@@ -4,7 +4,7 @@ Blip is a playful URL shortener. **Tagline:** "Tiny links with big personality."
 This document is the functional contract every part of the codebase is built against. If code and spec disagree, the spec wins unless the spec is clearly wrong (then fix both).
 **[DESIGN.md](DESIGN.md) is binding for everything visual and for all copy** (the comic panel theme, tokens, components, layout, motion, loading states and wording). Where this spec and DESIGN.md disagree on look or wording, DESIGN.md wins.
 
-Runtime: **Node 22.17 (ESM, `"type": "module"`)**, Express 5, `node:sqlite` (`DatabaseSync`, built in, so no native modules), vanilla HTML/CSS/JS frontend (ES modules, no build step). Tests use the built-in `node:test` runner + global `fetch` against `app.listen(0)`.
+Runtime: **Node 22.13 or newer** (`engines` in package.json; `.nvmrc` says `22`; developed and tested on 22.17), ESM (`"type": "module"`), Express 5, `node:sqlite` (`DatabaseSync`, built in and usable without a flag since 22.13, so no native modules), vanilla HTML/CSS/JS frontend (ES modules, no build step). Use only `node:sqlite` APIs that 22.13 has: for example `DatabaseSync#isOpen` arrived in 22.15, so `close()` wraps `db.close()` in try/catch instead of checking it. Tests use the built-in `node:test` runner + global `fetch` against `app.listen(0)`.
 
 Dependencies already installed (do **not** add others without a strong reason):
 `express@5`, `ua-parser-js@1` (CJS, `const { UAParser } = require(...)` or `import uaParser from 'ua-parser-js'`), `i18n-iso-countries` (alpha2 → numeric/name), `qr-code-styling` (browser UMD → global `QRCodeStyling`), `d3@7`, `topojson-client@3`, `world-atlas@2`, `@fontsource/bangers` and `@fontsource/comic-neue` (self-hosted fonts, §7.2), `@phosphor-icons/core` (source of the icon sprite; only `npm run icons` reads it), optional `fast-geoip` (async `lookup(ip)` → `{country, region, city, ll:[lat,lon], ...}` or `null`).
@@ -15,7 +15,7 @@ Dependencies already installed (do **not** add others without a strong reason):
 
 ```
 blip/
-  package.json, SPEC.md, DESIGN.md, README.md, .gitignore
+  package.json, .nvmrc, SPEC.md, DESIGN.md, README.md, .gitignore
   server/
     index.js            entry: loadConfig() → createApp() → listen; graceful shutdown
     app.js              export function createApp(options) → { app, db, close }
@@ -47,11 +47,13 @@ blip/
     assets/icons.svg       SHARED Phosphor icon sprite (generated, see §9)
     assets/css/theme.css   SHARED design system (tokens + components from DESIGN.md; extend only in page css)
     assets/css/app.css, dashboard.css, qr.css, pages.css
+    assets/css/edit-settings.css  SHARED styles of the Edit settings dialog (classes prefixed .edit-, §10.1)
     assets/js/api.js       SHARED API client + linkStore + toast + icon helpers (already written)
     assets/js/qr-shared.js SHARED QR presets/builder (already written)
+    assets/js/edit-settings.js    SHARED Edit settings dialog + Bring back flow: openEditSettings() (§10.1, §10.2)
     assets/js/app.js (+ home/), dashboard.js (+ dashboard/), qr.js (+ qr/), teaser.js, expired.js, not-found.js
   scripts/
-    audit-design.mjs    design-rule checker (`npm run audit:design`, must report 0 findings)
+    audit-design.mjs    design-rule checker (`npm run audit:design`, must report 0 findings; `npm test` runs it too)
     build-icons.mjs     icon sprite builder (`npm run icons`)
   test/*.test.js
   data/                 runtime SQLite DB (gitignored)
@@ -225,7 +227,12 @@ Mounted **after** static files and `/api`. Flow:
 If `slug` is provided it is normalized; invalid → 400 `slug_invalid`, reserved → 400 `slug_reserved`, taken → 409 `slug_taken` (field `slug`). `teaser.message` is required (non-empty) when `style='brand'` → else 400 `validation` field `teaser.message`. Unknown enum values → 400 `validation` with the field name.
 `teaser.theme` also accepts the legacy ids from the first release (`aurora`, `sunset`, `ocean`, `neon`, `candy`) and stores their replacements (§6); `qrStyle.preset` does the same for legacy preset ids (§8). Error messages list only the current ids.
 
-**UpdateBody**: any of `targetUrl, title, domain, redirectMode, teaser (partial merge), expiresAt (null clears), expiresInSeconds, maxClicks (null clears), qrStyle (null clears)`. Slug is immutable. Same validation (and the same legacy id mapping) as create, except `expiresAt` may not be in the past.
+**UpdateBody**: any of `targetUrl, title, domain, redirectMode, teaser (partial merge: only the keys sent change), expiresAt (null clears), expiresInSeconds (counted from now; null clears), maxClicks (null clears), qrStyle (null clears)`. Slug is immutable. Same validation (and the same legacy id mapping) as create, except `expiresAt` may not be in the past.
+- Send only what changed: re-sending `expiresInSeconds` restarts the timer from now.
+- A `maxClicks` at or below the current `clickCount` expires the link at once (reason `clicks`); raising it above `clickCount`, clearing it, or moving `expiresAt` into the future brings a time- or click-expired link back to `active`. A destroyed link stays destroyed until `/revive`.
+- Whenever a PATCH changes `status` or `expiredReason`, the server publishes a `status` event (§7.4).
+- The brand-message rule is checked against the merged result, so switching `teaser.style` to `brand` needs a stored message or one in the same request.
+- Validation errors carry `field`: `targetUrl`, `title`, `domain`, `redirectMode`, `teaser`, `teaser.seconds`, `teaser.style`, `teaser.message`, `teaser.theme`, `expiresAt` (also used when both expiry fields are sent), `expiresInSeconds`, `maxClicks`, `qrStyle.<key>` or `slug`. The client's `ApiError` exposes it as `.field`.
 
 ### 5.3 Domain ideas (`server/domains.js`)
 Pure function, no network. Use only real short TLDs: `ly to me io co gg sh is it at be so im es us in al am fm tv cc ai ws la vc st nu ink link`.
@@ -239,7 +246,7 @@ Dedupe, cap 12, each with a short human `note` ("Domain hack: the TLD finishes t
 {
   "slug": "...", "range": "7d", "generatedAt": "ISO",
   "totals": { "clicks": 0, "uniqueVisitors": 0, "botClicks": 0, "blockedAfterExpiry": 0, "expiredBotClicks": 0, "last24h": 0, "syntheticClicks": 0 },
-  "timeseries": { "bucket": "hour"|"day", "points": [{ "t": "ISO bucket start (in the client's tz)", "clicks": 0 }] },
+  "timeseries": { "bucket": "hour"|"day"|"week"|"month", "points": [{ "t": "ISO bucket start (in the client's tz)", "clicks": 0 }] },
   "devices":   [{ "name": "mobile", "count": 3 }],
   "browsers":  [{ "name": "Chrome", "count": 3 }],
   "os":        [{ "name": "Windows", "count": 3 }],
@@ -250,7 +257,13 @@ Dedupe, cap 12, each with a short human `note` ("Domain hack: the TLD finishes t
 }
 ```
 - "clicks" = rows with `outcome IN ('redirect','teaser') AND is_bot = 0` (synthetic included; `syntheticClicks` shows how many of them are synthetic). `botClicks` = rows with `is_bot=1`. `blockedAfterExpiry` = `outcome='expired'`. These two overlap (a bot on an expired link is both); `expiredBotClicks` = `is_bot=1 AND outcome='expired'` is that overlap, so the dashboard's "Bots & blocked" = `botClicks + blockedAfterExpiry − expiredBotClicks`.
-- `24h` → 24 hourly buckets ending at the current hour; `7d`/`30d` → 7/30 daily buckets ending today; `all` → daily from creation day to today (max 365 buckets). Buckets are aligned in the client's tz using `tz` (minutes, JS sign convention: UTC − local). Empty buckets present with `clicks: 0`.
+- `24h` → 24 hourly buckets ending at the current hour; `7d`/`30d` → 7/30 daily buckets ending today.
+- `all` → one bucket for every step from the link's first moment (its creation, or an earlier click, since simulated clicks are spread over the past week) to now, sized by that span:
+  - `day` while it covers at most **365** local days;
+  - else `week` while it covers at most **520** weeks; weeks start on **Monday 00:00** local time;
+  - else `month`: calendar months starting on the **1st at 00:00** local time (buckets differ in length).
+- Buckets are aligned in the client's tz using `tz` (minutes, JS sign convention: UTC − local, so local time = UTC − `tz` minutes; east of UTC is negative). `tz` is a fixed offset, so `t` is the UTC instant of the local bucket start (e.g. `tz=-60`: Monday Oct 12 00:00 local is `2026-10-11T23:00:00.000Z`). Empty buckets present with `clicks: 0`.
+- Totals, `uniqueVisitors`, breakdowns, `countries` and `points` cover the range's window: the last 24 hours, 7 or 30 local days, or, for `all`, **every click the link has ever had** (the same totals as the SSE `hello` event). `last24h` is always the rolling last 24 hours.
 - Breakdown lists sorted desc, top 8 + `"Other"` aggregate for browsers/os/referrers; countries all (sorted desc); points grouped by rounded lat/lon (max 300).
 - `uniqueVisitors` = distinct `visitor_hash` among counted clicks in range.
 
@@ -367,15 +380,45 @@ DESIGN.md is the source of truth for the look; this section only lists the wirin
    4. **Self-destruct** (`timer` / `bomb`): preset buttons: "After 1 click (burn after reading)", "After 10 clicks", "1 hour", "24 hours", "7 days", "Custom..." (datetime-local input + clicks number). Combined summary ("Vanishes after 10 clicks or on Oct 9, 14:00, whichever comes first"). "Never" resets.
    5. **Live analytics** (`activity`): explains the dashboard; after a link exists, button **Open live dashboard** → `/dashboard.html#<slug>`; before, a note "Every link gets a live dashboard. Create one first." and a "See my links" scroll button. (Analytics is always on.)
    6. **QR studio** (`qr-code`): preset swatches (from `QR_PRESETS`) + logo picker (from `LOGOS`) chosen before creation (sent as `qrStyle`); the preview encodes what `qrUrl` will be (branded URL only for a live domain, else the working URL); after creation the result panel shows the styled QR and **Open QR studio** → `/qr.html#<slug>`.
-3. Result panel (a one-shot "BLIP!" burst when it appears; announced through a dedicated `role="status"` polite live region outside the panel. The panel itself is not a live region, and countdowns use `role="timer"` + `aria-live="off"` so ticking is never read aloud): branded short URL big, "live"/"vanity preview" badge; if vanity and not live, a second row "Works right now: <workingUrl>" with its own copy button. A **Manage key** row (masked by default, Show/Hide + Copy key) so the token can be backed up and pasted into the dashboard on another device. Buttons: **Copy**, **Open**, **QR studio**, **Live dashboard**, **Share** (Web Share API when available), **Destroy now** (confirm), mini styled QR (click → download PNG), summary of options (teaser, expiry, clicks remaining).
-4. **My links** section: from `linkStore` via `api.batch` (row skeletons while loading); each row: short URL, target host, status badge (active/expired/destroyed), clicks (and remaining), expiry countdown, actions (copy, dashboard, QR, copy manage key, destroy/revive, delete with confirm, edit target URL inline). Keyboard focus follows the row's action across re-renders (Destroy → Revive) and moves to a neighbour after delete. Removes entries from `linkStore` if the server says `not_found`. Empty state (an icon in a yellow square, never an emoji). Refresh button.
+3. Result panel (a one-shot "BLIP!" burst when it appears; announced through a dedicated `role="status"` polite live region outside the panel. The panel itself is not a live region, and countdowns use `role="timer"` + `aria-live="off"` so ticking is never read aloud): branded short URL big, "live"/"vanity preview" badge; if vanity and not live, a second row "Works right now: <workingUrl>" with its own copy button. A **Manage key** row (masked by default, Show/Hide + Copy key) so the token can be backed up and pasted into the dashboard on another device. Buttons: **Copy**, **Open**, **QR studio**, **Live dashboard**, **Share** (Web Share API when available), **Edit settings** (§10.1), **Destroy now** (confirm) on an active link or **Bring back** (§10.2) once it has stopped, mini styled QR (click → download PNG), summary of options (teaser, expiry, clicks remaining). A save in the dialog re-renders the panel (URLs, badges, QR, summary) from the returned LinkDTO.
+4. **My links** section: from `linkStore` via `api.batch` (row skeletons while loading); each row: short URL, target host, status badge (active/expired/destroyed), clicks (and remaining), expiry countdown, actions (copy, dashboard, QR, copy manage key, **Edit settings** (§10.1), **Destroy now** on an active link or **Bring back** (§10.2) on an expired or destroyed one, delete with confirm). Keyboard focus follows the row's action across re-renders (Destroy now → Bring back, and back to the row's Edit settings button when the dialog closes) and moves to a neighbour after delete. Removes entries from `linkStore` if the server says `not_found`. Empty state (an icon in a yellow square, never an emoji). Refresh button.
 5. Supports `/?slug=<x>` (from the 404 page) → pre-opens the Custom slug panel with that value.
 6. Footer: small "Made with Blip" + privacy note ("we never store IP addresses").
 
+### 10.1 Edit settings dialog (shared by §10 to §12)
+Every setting picked at creation stays editable afterwards. One module builds the dialog for every page:
+```js
+// public/assets/js/edit-settings.js
+export async function openEditSettings(link, token, { config, focus = 'general', onSaved } = {})
+```
+- `link` is the current LinkDTO and `token` its manage key. `config` is the `/api/config` payload; when it is omitted the module fetches it once with `api.config()` and caches it.
+- `focus` is `'general' | 'domain' | 'teaser' | 'destruct'`: the section scrolled into view, with its first control focused.
+- Resolves to the updated LinkDTO after a successful save (or revive), or `null` when the user cancels or closes the dialog without saving. `onSaved(link)` is also called after each successful save, so the page can re-render at once.
+- The module builds its own `<dialog class="modal edit-dialog">` with `el()` / `icon()` from `api.js` (one instance, reused), so pages need no extra markup. All of its styles live in `public/assets/css/edit-settings.css` (classes prefixed `.edit-`); a page that uses it adds `<link rel="stylesheet" href="/assets/css/edit-settings.css">` after its own page css.
+
+Sections, saved together through `PATCH /api/links/:slug` with only the fields that changed (§5.2):
+1. **General** (`general`): title (up to 120 characters, empty clears it) and destination URL (normalised and loop-checked like on create).
+2. **Domain** (`domain`): the domains from `/api/config` (the base host labelled live, the others vanity, as in the Playful domain panel above); the slug itself never changes.
+3. **Teaser** (`teaser`): the "Show a teaser before redirecting" switch (`redirectMode`), style (Countdown / Trivia / Brand message), seconds 3 to 15, brand message (counter /280, required for Brand) and theme swatches, sent as a partial `teaser` object.
+4. **Self-destruct** (`destruct`): a "Right now" line with the current rule and the clicks already used, then two choices that start at **Keep current** (which sends nothing):
+   - **Time**: No time limit (`expiresAt: null`), 1 hour / 24 hours / 7 days (`expiresInSeconds`, counted from the save) or Custom date (a future `datetime-local`, sent as `expiresAt`).
+   - **Clicks**: No click limit (`maxClicks: null`) or Allow more clicks ("How many more clicks?", sent as `maxClicks = clickCount + N`). A limit at or below the clicks already used would stop the link at once (§5.2), so the dialog only frames a new limit relative to them.
+   - The footer previews the outcome ("After saving": status badge, expiry, clicks left) as the user edits.
+
+Errors: an `ApiError` from the save carries `.field` (`title`, `targetUrl`, `domain`, `teaser.message`, `teaser.seconds`, `expiresAt`, `expiresInSeconds`, `maxClicks`, ...); the dialog shows the message next to that control, scrolls its section into view and focuses it, and stays open. Other failures show an error notice with the message and keep the user's edits. The dialog has one `.btn--primary` (save, `.is-loading` while saving); cancel and close are secondary. It follows DESIGN.md (comic panel, radius 0, no shadows, sprite icons, copy rules) and works from 360 px wide.
+
+### 10.2 Bring back
+A link that stopped (expired by time, expired by clicks, or destroyed by hand) is recoverable by its owner. Wherever its owner sees it stopped (the result panel and My links, where **Bring back** takes the place of **Destroy now**, the dashboard header's notice and the QR studio's red status note under the preview), it offers **Bring back**, which opens Edit settings at the Self-destruct section (`focus: 'destruct'`) with a line saying why the link stopped:
+- **Destroyed** (`expiredReason: 'manual'`): the section shows an **Undo Destroy now** switch, already on when the dialog opens at `destruct` (Bring back), so Bring back then Save is enough; saving with it on sends any changed limits first (`PATCH`), then `POST /api/links/:slug/revive`, which clears only the manual destroy. A timer or click limit that has also run out is changed in the same save.
+- **Expired by time** (`'time'`): pick a new time in the future, or Never.
+- **Expired by clicks** (`'clicks'`): raise the click limit above the clicks already used, or remove it.
+
+`openEditSettings` resolves with the revived or saved LinkDTO; the caller re-renders from it (status badge `active`, countdown, clicks remaining) and confirms with a toast. The server publishes the matching `status` event, so open dashboards update too.
+
 ## 11. Dashboard (`dashboard.html` + `dashboard.js` + `dashboard.css`)
-Header panel with link info (short URL, target, status badge, created, copy button, back home, QR studio link), **Live** status caption: a yellow caption with the blinking red live dot while the stream is connected, a paper caption with a yellow dot while connecting or reconnecting, and a grey dot when offline, range segmented control (24h/7d/30d/all).
+Header panel with link info (short URL, target, status badge, created, copy button, back home, QR studio link, **Edit settings** (§10.1) and, while the link is expired or destroyed, **Bring back** (§10.2) next to the notice that says why it stopped; a save re-renders the header and the Lifetime cell from the returned LinkDTO), **Live** status caption: a yellow caption with the blinking red live dot while the stream is connected, a paper caption with a yellow dot while connecting or reconnecting, and a grey dot when offline, range segmented control (24h/7d/30d/all).
 - One KPI strip panel (cells separated by 2 px ink rules; 4 across on desktop, 2 on phones): Clicks, Unique visitors, Last 24 hours, Lifetime (clicks remaining or time left, or "Never self-destructs"), with "Bots & blocked" in the strip's footer. Numbers are shown as they are (no count-up animation).
-- Clicks over time: SVG chart drawn with d3 in one flat colour (axes, hover tooltip with value + bucket label).
+- Clicks over time: SVG chart drawn with d3 in one flat colour (axes, hover tooltip with value + bucket label). Labels follow `timeseries.bucket`: hourly, daily, weekly ("Week of Oct 5", weeks start Monday) or monthly ("Oct 2026"). "All time" picks the bucket from the link's age (§5.4).
 - **World map**: d3 `geoNaturalEarth1` (or `geoEqualEarth`) + `topojson.feature(countries-110m, objects.countries)`; choropleth by click count on the `--heat-0..4` ramp (zero = `--heat-0`), city markers sized by count, a one-shot "hit" marker at the coordinates of each incoming live click, tooltip on hover (country name + clicks), legend. Responsive (re-render on resize via `ResizeObserver`).
 - Breakdowns as horizontal bars (flat fill, ink outline, square ends; no donut or pie charts): devices, browsers, operating systems, referrers, and countries (2-letter code badge + name + count + share bar).
 - **Live feed**: newest-first list of ClickEvents (country code, city/country, device icon, browser, referrer, relative time "just now"), new rows slide in; blocked/expired/bot attempts are labelled with a badge.
@@ -389,9 +432,10 @@ Two columns (stacks on mobile): left = big live preview in a bordered panel (no 
 - Preset swatch buttons (`QR_PRESETS`), dot style buttons (visual thumbnails), corner square/dot styles, colour pickers (dots, optional two-tone fill + linear/radial + rotation, background, transparent toggle, corner colours), logo picker (presets + **Upload logo...** (PNG/JPG/SVG ≤ 512 kB, FileReader → data URL, client-only, remembered in `localStorage` per slug), margin slider, caption input.
 - Buttons: **Download PNG** (1024 px, with the caption composed on a canvas; any frame has square corners), **Download SVG**, **Copy image** (Clipboard API when available), **Save style** (PATCH `qrStyle`, toast), **Reset**, **Surprise me** (random flat style).
 - Loading: a square skeleton for the preview and line skeletons for the controls until the link loads.
-- Shows which URL is encoded (`qrUrl`) and explains vanity domains encode the working URL until the domain is live. Its **Open** control (like the home **Open** and the dashboard's open links) asks "Use up a click?" first on an active click-limited link, because opening it is a counted visit.
+- Shows which URL is encoded (`qrUrl`) and explains vanity domains encode the working URL until the domain is live. The link line offers **Edit settings** (§10.1, opened at the Domain section, since the domain decides the encoded URL); while the link is stopped, the red note in the Preview panel that says where scans land offers **Bring back** (§10.2) instead of pointing the owner at the home page; after a save the preview re-encodes the new `qrUrl`, and a style saved with **Save style** is unaffected. Its **Open** control (like the home **Open** and the dashboard's open links) asks "Use up a click?" first on an active click-limited link, because opening it is a counted visit.
 - Scannability warning when contrast between dot colour and background is too low (< 3:1) or the two-tone fill is too light.
 
 ## 13. Tests (`test/*.test.js`, `npm test`)
-Use `node:test` + `node:assert/strict`; spin up `createApp({ config: { dbPath: ':memory:', baseUrl: 'http://localhost:3030', allowDemoTraffic: true }, now: () => clock })` with a mutable `clock`, `server = app.listen(0)`, `fetch` with `redirect: 'manual'`. Cover at least: slug normalization & validation & reserved; word/random slugs; suggestions available; URL normalization (scheme prefix, javascript:/data: rejected, loop rejected, credentials rejected); create (custom slug, word slug default, 409 taken, domain validation, brand message required, expiry validation); auth (401/403/404); PATCH/DELETE; instant 302 + `Cache-Control: no-store`; teaser 200 with escaped data (XSS attempt in title/message must not appear unescaped); expiry by time (advance clock) → 410 + expired page; maxClicks=1 → first 302, second 410; bot UA doesn't consume a limited link (200 preview, target not in body); HEAD doesn't consume; destroy/revive; stats shape, counts and buckets (incl. tz); synthetic traffic + clear; simulate disabled → 404; SSE receives `hello` and `click`; domain ideas (`delicious` → `delicio.us` present); rate limiting returns 429; CSP header present; unknown slug → 404; reserved slug creation rejected; batch endpoint.
+Use `node:test` + `node:assert/strict`; spin up `createApp({ config: { dbPath: ':memory:', baseUrl: 'http://localhost:3030', allowDemoTraffic: true }, now: () => clock })` with a mutable `clock`, `server = app.listen(0)`, `fetch` with `redirect: 'manual'`. Cover at least: slug normalization & validation & reserved; word/random slugs; suggestions available; URL normalization (scheme prefix, javascript:/data: rejected, loop rejected, credentials rejected); create (custom slug, word slug default, 409 taken, domain validation, brand message required, expiry validation); auth (401/403/404); PATCH/DELETE; instant 302 + `Cache-Control: no-store`; teaser 200 with escaped data (XSS attempt in title/message must not appear unescaped); expiry by time (advance clock) → 410 + expired page; maxClicks=1 → first 302, second 410; bot UA doesn't consume a limited link (200 preview, target not in body); HEAD doesn't consume; destroy/revive; stats shape, counts and buckets (incl. tz, and range `all` over long spans: every click since creation counted, `week` buckets past 365 days, `month` buckets past 520 weeks, aligned on both sides of UTC); synthetic traffic + clear; simulate disabled → 404; SSE receives `hello` and `click`; domain ideas (`delicious` → `delicio.us` present); rate limiting returns 429; CSP header present; unknown slug → 404; reserved slug creation rejected; batch endpoint; `close()` closes the database and tolerates one that is already closed.
+Design audit: `test/design-audit.test.js` runs `node scripts/audit-design.mjs --json` and requires 0 findings, so `npm test` fails on any DESIGN.md violation the audit can see; it also unit-tests the audit's CSS block rules (`cssBlockFindings()`, exported by the script), including `opacity-fade` (a selector naming a disabled or inactive state whose block sets `opacity` below 1).
 Redesign contract: the current teaser theme and QR preset ids; legacy ids accepted on create and PATCH and stored under the new names; legacy values in storage served under the new ids (API and teaser view); the version-2 migration (rewrites, leaves `updated_at` alone, idempotent); `/vendor/fonts/bangers/` and `/vendor/fonts/comic-neue/` serve their CSS and font files while the lucide, Inter and Space Grotesk routes answer 404; API error messages, trivia facts, domain idea notes and every rendered view are free of em dashes and emoji; rendered views only reference local assets that exist.

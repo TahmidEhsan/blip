@@ -1,6 +1,7 @@
 // Blip: QR studio (qr.html#<slug>). Live-styled QR codes with presets, shapes, colours,
 // logos, captions, PNG/SVG export, clipboard copy and saving qrStyle back to the link.
 import { api, ApiError, linkStore, toast, el, icon, setIcon, copyText, hostOf, syncNavCount } from './api.js';
+import { openEditSettings, announceSaved } from './edit-settings.js';
 import {
   QR_PRESETS,
   LOGOS,
@@ -66,6 +67,7 @@ const dom = {
   shortUrl: $('qr-short-url'),
   statusBadge: $('qr-status-badge'),
   target: $('qr-target'),
+  editSettings: $('qr-edit-settings'),
   loading: $('qr-loading'),
   empty: $('qr-empty'),
   emptyKicker: $('qr-empty-kicker'),
@@ -90,6 +92,7 @@ const dom = {
   transparentNote: $('qr-transparent-note'),
   statusNote: $('qr-status-note'),
   statusNoteText: $('qr-status-note-text'),
+  bringBack: $('qr-bring-back'),
   downloadPng: $('qr-download-png'),
   downloadSvg: $('qr-download-svg'),
   copyImage: $('qr-copy-image'),
@@ -148,6 +151,7 @@ const state = {
   lastDotColor2: null,
   qr: null,
   saving: false,
+  editing: false,
   controlsBuilt: false,
   dirtyShown: null,
   renderFrame: 0,
@@ -245,16 +249,26 @@ function showEmpty({ kind = 'pick', kicker, title, text, retry = false }) {
 // ---------------------------------------------------------------------------
 // Link info
 // ---------------------------------------------------------------------------
+/** Why scans of a stopped link land on the self-destruct page, and what Bring back offers ({ text, how }). */
 function statusCopy(link) {
-  if (link.status === 'destroyed') {
-    return 'This link has self-destructed. Scanning the code shows the self-destruct page until you revive it from the home page.';
+  if (link.status === 'destroyed' || (link.status === 'expired' && link.expiredReason === 'manual')) {
+    return {
+      text: 'This link was destroyed, so scans land on the self-destruct page until you bring it back.',
+      how: 'Undo Destroy now, and change its time or click limit if you like',
+    };
   }
   if (link.status === 'expired') {
     return link.expiredReason === 'clicks'
-      ? 'This link has used up all its clicks, so scans land on the self-destruct page.'
-      : "This link's timer ran out, so scans land on the self-destruct page.";
+      ? {
+        text: 'This link has used up all its clicks, so scans land on the self-destruct page. Give it more clicks to bring it back.',
+        how: 'Raise or remove its click limit so it works again',
+      }
+      : {
+        text: "This link's timer ran out, so scans land on the self-destruct page. Give it more time to bring it back.",
+        how: 'Give it a new self-destruct time, or none, so it works again',
+      };
   }
-  return '';
+  return null;
 }
 
 function renderLinkInfo() {
@@ -299,7 +313,8 @@ function renderLinkInfo() {
   }
 
   const note = statusCopy(link);
-  dom.statusNoteText.textContent = note;
+  dom.statusNoteText.textContent = note?.text ?? '';
+  dom.bringBack.title = note?.how ?? '';
   dom.statusNote.hidden = !note;
 
   document.title = `QR studio · /${slug} · Blip`;
@@ -381,6 +396,45 @@ async function guardedOpen(event) {
   const slug = state.slug;
   window.open(url, '_blank', 'noopener,noreferrer');
   setTimeout(() => refreshLink(slug), 2500);
+}
+
+// ---------------------------------------------------------------------------
+// Edit settings and Bring back (the shared dialog, SPEC 10.1 and 10.2)
+// ---------------------------------------------------------------------------
+/**
+ * A save in the dialog: the link line, status note and encoded URL follow the new link, and the preview
+ * re-encodes its qrUrl. The QR style is left alone, whether it was saved with Save style or not.
+ */
+function applySavedLink(link) {
+  state.link = link;
+  renderLinkInfo();
+  scheduleRender();
+}
+
+/** focus: 'domain' for Edit settings (the domain decides the encoded URL), 'destruct' for Bring back. */
+async function editSettings(focus) {
+  const link = state.link;
+  if (!link || !state.token || state.editing) return;
+  const slug = state.slug;
+  const before = structuredClone(link);
+  state.editing = true;
+  let saved = null;
+  try {
+    saved = await openEditSettings(before, state.token, {
+      focus,
+      onSaved: (updated) => {
+        if (slug === state.slug && state.link) applySavedLink(updated);
+      },
+    });
+  } finally {
+    state.editing = false;
+  }
+  if (slug !== state.slug) return;
+  if (saved) announceSaved(before, saved);
+  // Bring back hides once the link works again: hand focus to Edit settings rather than lose it.
+  const active = document.activeElement;
+  const usable = active && active !== document.body && active.isConnected && active.getClientRects().length > 0;
+  if (!usable && !dom.linkLine.hidden) dom.editSettings.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +950,8 @@ function boot() {
   watchPreviewPin();
 
   dom.retry.addEventListener('click', load);
+  dom.editSettings.addEventListener('click', () => editSettings('domain'));
+  dom.bringBack.addEventListener('click', () => editSettings('destruct'));
   window.addEventListener('hashchange', () => {
     if (slugFromHash() !== state.slug) location.reload();
   });
@@ -908,7 +964,8 @@ function boot() {
   document.addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 's' && state.link) {
       event.preventDefault();
-      save();
+      // Ctrl+S saves the QR style, never while a dialog (Edit settings, Use up a click?) is open over it.
+      if (!document.querySelector('dialog[open]')) save();
     }
   });
 

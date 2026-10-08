@@ -167,7 +167,8 @@ export function createApp(options = {}) {
     ctx.timers.clear();
     endStreams();
     bus.removeAllListeners();
-    if (db.isOpen) db.close();
+    // DatabaseSync#isOpen needs Node 22.15; close() throws when the database is already closed.
+    try { db.close(); } catch { /* already closed */ }
   }
 
   return { app, db, close, endStreams, config, bus, liveTotals: ctx.liveTotals };

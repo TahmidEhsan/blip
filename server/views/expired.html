@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{text:TITLE}}</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/pages.css">
+  <noscript><style>.js-only { display: none !important; }</style></noscript>
+</head>
+<body class="page page--expired">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main"><a href="/"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg><span>Make your own</span></a></nav>
+  </header>
+
+  <main class="page-main container" id="main">
+    <section class="panel visit-panel expired-panel" aria-labelledby="expired-heading">
+      <p class="caption caption--red caption--corner"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>Secret message destroyed</p>
+
+      <div class="splash splash--boom" aria-hidden="true">
+        <div class="rays"></div>
+        <div class="burst burst--red boom-burst is-popping" id="boom-burst"><span class="burst__inner">Ka-boom!</span></div>
+      </div>
+
+      <h1 class="visit-heading" id="expired-heading">This link has <span class="nowrap">self-destructed</span></h1>
+      <p class="visit-copy" id="expired-reason">This Blip has vanished and can't take you anywhere anymore.</p>
+
+      <dl class="fact-list js-only" id="expired-facts" hidden>
+        <div class="fact-list__row">
+          <dt>Link</dt>
+          <dd class="mono" id="fact-slug"></dd>
+        </div>
+        <div class="fact-list__row">
+          <dt>Trigger</dt>
+          <dd id="fact-trigger"></dd>
+        </div>
+        <div class="fact-list__row" id="fact-clicks-row" hidden>
+          <dt>Visits used</dt>
+          <dd id="fact-clicks"></dd>
+        </div>
+        <div class="fact-list__row" id="fact-when-row" hidden>
+          <dt>Went boom</dt>
+          <dd id="fact-when"></dd>
+        </div>
+      </dl>
+
+      <div class="visit-actions">
+        <a class="btn btn--primary btn--lg" href="/">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg>
+          <span>Make your own Blip</span>
+        </a>
+        <button type="button" class="btn btn--lg js-only" id="replay">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg>
+          <span>Replay the boom</span>
+        </button>
+      </div>
+
+      <p class="visit-tip">Blip links can vanish after a set number of clicks or on a date you choose. Handy for one-time secrets, flash sales and surprise invites.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer container page-footer">
+    <p class="footer-made">Made with <a href="/">Blip</a>. Tiny links with big personality.</p>
+  </footer>
+
+  <script type="application/json" id="blip-data">{{json:DATA}}</script>
+  <script type="module" src="/assets/js/expired.js"></script>
+</body>
+</html>

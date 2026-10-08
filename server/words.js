@@ -1,0 +1,47 @@
+// Blip: word lists for memorable `adjective-noun` slugs (e.g. `brave-otter`).
+// Family-friendly, lowercase a-z only, short enough to read aloud.
+
+export const ADJECTIVES = Object.freeze([
+  'agile', 'amber', 'ample', 'amused', 'azure', 'balmy', 'bold', 'bouncy', 'brave', 'breezy',
+  'bright', 'brisk', 'bubbly', 'bumpy', 'calm', 'candid', 'caring', 'cheeky', 'cheery', 'chill',
+  'chipper', 'chirpy', 'chunky', 'classy', 'clever', 'cloudy', 'cobalt', 'comfy', 'cool', 'coral',
+  'cosmic', 'cozy', 'crafty', 'crimson', 'crisp', 'crunchy', 'curious', 'curly', 'cushy', 'cyan',
+  'dandy', 'dapper', 'daring', 'dazzling', 'deft', 'dewy', 'dizzy', 'dotty', 'dreamy', 'eager',
+  'earthy', 'easy', 'elated', 'electric', 'epic', 'fabled', 'fair', 'fancy', 'fearless', 'feisty',
+  'festive', 'fiery', 'fizzy', 'flashy', 'fluffy', 'flying', 'fond', 'frank', 'fresh', 'friendly',
+  'frosty', 'funky', 'fuzzy', 'gentle', 'giant', 'giddy', 'gifted', 'glad', 'gleaming', 'glossy',
+  'glowing', 'golden', 'goofy', 'graceful', 'grand', 'groovy', 'gusty', 'happy', 'hardy', 'hazel',
+  'hearty', 'helpful', 'heroic', 'honest', 'hopeful', 'humble', 'icy', 'indigo', 'ivory', 'jade',
+  'jazzy', 'jolly', 'jovial', 'joyful', 'jumpy', 'keen', 'kind', 'lemony', 'lilac', 'limber',
+  'lively', 'loyal', 'lucky', 'lunar', 'lush', 'magic', 'majestic', 'mellow', 'merry', 'mighty',
+  'minty', 'misty', 'modern', 'mossy', 'neat', 'nifty', 'nimble', 'noble', 'nutty', 'peachy',
+  'pearly', 'peppy', 'perky', 'plucky', 'plush', 'polished', 'polite', 'proud', 'quick', 'quiet',
+  'quirky', 'radiant', 'rapid', 'rosy', 'royal', 'ruby', 'rustic', 'sandy', 'sassy', 'savvy',
+  'scarlet', 'shiny', 'silky', 'silly', 'silver', 'sleek', 'smart', 'smooth', 'snappy', 'snazzy',
+  'snug', 'solar', 'sonic', 'sparkly', 'speedy', 'spicy', 'spry', 'starry', 'steady', 'stellar',
+  'sturdy', 'sunlit', 'sunny', 'super', 'sweet', 'swift', 'teal', 'tidy', 'tiny', 'toasty',
+  'tranquil', 'trusty', 'upbeat', 'velvet', 'violet', 'vivid', 'warm', 'wavy', 'whimsical', 'windy',
+  'wise', 'witty', 'wobbly', 'zany', 'zesty', 'zippy',
+]);
+
+export const NOUNS = Object.freeze([
+  'acorn', 'alpaca', 'anchor', 'apple', 'arrow', 'aurora', 'axolotl', 'badger', 'bagel', 'balloon',
+  'banana', 'banjo', 'beacon', 'beaver', 'berry', 'biscuit', 'bison', 'blossom', 'breeze', 'bunny',
+  'button', 'cactus', 'camel', 'canary', 'canyon', 'cheetah', 'cherry', 'cloud', 'comet', 'compass',
+  'condor', 'cookie', 'coral', 'corgi', 'cosmos', 'crane', 'crayon', 'cricket', 'crystal', 'cupcake',
+  'daisy', 'dingo', 'dolphin', 'donut', 'dragon', 'drum', 'dumpling', 'eagle', 'egret', 'ember',
+  'falcon', 'feather', 'fern', 'ferret', 'finch', 'flamingo', 'forest', 'fox', 'gadget', 'galaxy',
+  'gecko', 'gibbon', 'giraffe', 'glacier', 'goose', 'gopher', 'guitar', 'hamster', 'harbor', 'hedgehog',
+  'heron', 'hippo', 'honey', 'husky', 'ibis', 'iguana', 'island', 'jaguar', 'jellybean', 'kayak',
+  'kitten', 'kite', 'kiwi', 'koala', 'lagoon', 'lantern', 'lemon', 'lemur', 'leopard', 'llama',
+  'lobster', 'lynx', 'macaw', 'magpie', 'manatee', 'mango', 'maple', 'marble', 'marmot', 'meadow',
+  'meerkat', 'melon', 'meteor', 'moose', 'muffin', 'narwhal', 'nebula', 'newt', 'noodle', 'nugget',
+  'oasis', 'ocean', 'ocelot', 'octopus', 'orbit', 'orca', 'osprey', 'otter', 'owl', 'paddle',
+  'pancake', 'panda', 'panther', 'papaya', 'parrot', 'peach', 'pebble', 'pelican', 'penguin', 'pepper',
+  'piano', 'pickle', 'pixel', 'planet', 'plum', 'pony', 'pretzel', 'puffin', 'puma', 'puzzle',
+  'quail', 'quill', 'quokka', 'rabbit', 'raccoon', 'radish', 'rainbow', 'raven', 'reef', 'river',
+  'robin', 'rocket', 'saffron', 'salmon', 'seal', 'sequoia', 'shark', 'sloth', 'sparrow', 'sprocket',
+  'squid', 'starling', 'stork', 'summit', 'swan', 'taco', 'tapir', 'teapot', 'thunder', 'ticket',
+  'tiger', 'toast', 'toucan', 'trumpet', 'tulip', 'turtle', 'ukulele', 'umbrella', 'valley', 'violin',
+  'volcano', 'waffle', 'walrus', 'whistle', 'willow', 'wombat', 'yak', 'yeti', 'zebra', 'zeppelin',
+]);

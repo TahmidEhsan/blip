@@ -1,0 +1,413 @@
+/* ==========================================================================
+   Blip: server-rendered visitor pages (comic panel theme)
+   teaser.html, expired.html, not-found.html, preview.html
+   Builds on theme.css: tokens, newsprint background, panels, caption boxes,
+   buttons, bursts and skeletons. Flat colour, ink outlines, sharp corners.
+   ========================================================================== */
+
+/* ---------- Page shell ---------- */
+.page {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+.page-main {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-block: clamp(8px, 2vh, 24px) clamp(32px, 6vh, 64px);
+}
+.page-footer { flex: none; padding-top: 12px; }
+
+/* ---------- The one comic panel on each visitor page ---------- */
+.visit-panel {
+  width: min(100%, 620px);
+  margin-inline: auto;
+  text-align: center;
+}
+.visit-heading {
+  font-size: clamp(2.1rem, 7.4vw, 3.2rem);
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+}
+.visit-heading--sm { font-size: clamp(1.9rem, 6vw, 2.6rem); }
+.nowrap { white-space: nowrap; }
+.visit-copy {
+  max-width: 46ch;
+  margin: 0 auto 20px;
+  color: var(--ink-2);
+  font-size: 1.08rem;
+}
+.visit-tip {
+  max-width: 50ch;
+  margin: 22px auto 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+.visit-tip--flush { margin-top: 0; }
+.visit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+}
+.visit-actions .btn { flex: 1 1 210px; max-width: 290px; }
+
+/* Icon in a yellow square (link preview page) */
+.visit-icon {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  margin: 4px auto 18px;
+  background: var(--yellow);
+  border: var(--line);
+  color: var(--ink);
+}
+.visit-icon .icon { width: 32px; height: 32px; }
+
+/* Splash: a bordered sub-panel with the yellow rays and one sound-effect burst */
+.splash {
+  --burst-size: clamp(150px, 44vw, 196px);
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  min-height: calc(var(--burst-size) + 44px);
+  margin: 0 0 20px;
+  border: var(--line);
+  background: var(--panel);
+}
+.splash > .burst { z-index: 1; }
+.splash--boom, .splash--lost { --burst-size: clamp(180px, 56vw, 236px); }
+.splash__tag {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: 0;
+  border-top: 0;
+  border-right: 0;
+}
+
+/* Inline slug / path chip */
+.slug-pill {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0 7px;
+  border: var(--line-thin);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+/* ==========================================================================
+   Teaser page
+   Themes are flat page colours (theme.css --theme-<id>-bg / -fg). Legacy ids
+   from older links map onto the new ones: aurora > hero, sunset > caption,
+   ocean > sky, neon > noir, candy > paper. teaser.js also rewrites them.
+   ========================================================================== */
+.page--teaser {
+  --teaser-bg: var(--theme-hero-bg);
+  --teaser-fg: var(--theme-hero-fg);
+  --teaser-accent: var(--red);
+  --teaser-burst-bg: var(--red);
+  --teaser-burst-fg: #fff;
+  --teaser-host: var(--red);
+  --dot-ink: rgba(17, 17, 17, 0.16);
+  background: var(--teaser-bg);
+}
+.page--teaser:is([data-theme="caption"], [data-theme="sunset"]) {
+  --teaser-bg: var(--theme-caption-bg);
+  --teaser-fg: var(--theme-caption-fg);
+  --teaser-accent: var(--red);
+  --teaser-burst-bg: var(--yellow);
+  --teaser-burst-fg: var(--ink);
+  --teaser-host: var(--red);
+  --dot-ink: rgba(17, 17, 17, 0.14);
+}
+.page--teaser:is([data-theme="noir"], [data-theme="neon"]) {
+  --teaser-bg: var(--theme-noir-bg);
+  --teaser-fg: var(--theme-noir-fg);
+  --teaser-accent: var(--ink);
+  --teaser-burst-bg: var(--ink);
+  --teaser-burst-fg: var(--yellow);
+  --teaser-host: var(--red);
+  --dot-ink: var(--dot-paper);
+}
+.page--teaser:is([data-theme="sky"], [data-theme="ocean"]) {
+  --teaser-bg: var(--theme-sky-bg);
+  --teaser-fg: var(--theme-sky-fg);
+  --teaser-accent: var(--blue);
+  --teaser-burst-bg: var(--blue);
+  --teaser-burst-fg: #fff;
+  --teaser-host: var(--blue);
+  --dot-ink: var(--dot-paper);
+}
+.page--teaser:is([data-theme="paper"], [data-theme="candy"]) {
+  --teaser-bg: var(--theme-paper-bg);
+  --teaser-fg: var(--theme-paper-fg);
+  --teaser-accent: var(--red);
+  --teaser-burst-bg: var(--yellow);
+  --teaser-burst-fg: var(--ink);
+  --teaser-host: var(--red);
+  --dot-ink: rgba(17, 17, 17, 0.12);
+}
+
+/* Flat themed page with a single halftone layer (the red and blue corners stay on paper only) */
+.page--teaser .bg { background: var(--teaser-bg); }
+.page--teaser .bg-dots--red,
+.page--teaser .bg-dots--blue { display: none; }
+.page--teaser:is([data-theme="paper"], [data-theme="candy"]) .bg-dots--red,
+.page--teaser:is([data-theme="paper"], [data-theme="candy"]) .bg-dots--blue { display: block; }
+
+/* Header and footer sit on the theme colour */
+.page--teaser .brand,
+.page--teaser .brand:hover,
+.page--teaser .site-nav a,
+.page--teaser .site-nav a:hover,
+.page--teaser .site-footer,
+.page--teaser .footer-made,
+.page--teaser .site-footer a,
+.page--teaser .site-footer a:hover { color: var(--teaser-fg); }
+.page--teaser .site-nav a:hover { border-color: var(--teaser-fg); }
+.page--teaser .site-header :focus-visible,
+.page--teaser .site-footer :focus-visible { outline-color: var(--teaser-fg); }
+
+/* Countdown burst */
+.teaser-burst { transform: rotate(-3deg); }
+.page--teaser .teaser-burst { --burst-bg: var(--teaser-burst-bg); --burst-fg: var(--teaser-burst-fg); }
+.page--teaser .teaser-burst.is-paused { --burst-bg: var(--paper-2); --burst-fg: var(--ink); }
+.teaser-burst .burst__inner { align-content: center; gap: 4px; padding: 18%; }
+.teaser-count {
+  font-family: var(--font-display);
+  font-size: calc(var(--burst-size) * 0.36);
+  line-height: 0.85;
+  letter-spacing: 0.02em;
+  min-height: 0.85em;
+}
+.teaser-count__unit {
+  font-family: var(--font-body);
+  font-weight: 700;
+  font-size: 0.74rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  line-height: 1;
+}
+.teaser-burst.is-tick { animation: count-pop 380ms var(--ease-out); }
+@keyframes count-pop {
+  from { transform: rotate(-8deg) scale(1.14); }
+  to { transform: rotate(-3deg) scale(1); }
+}
+
+/* Segmented progress bar: one flat segment per second, filling towards "go" */
+.countdown-bar {
+  display: flex;
+  gap: 5px;
+  height: 18px;
+  margin: 0 0 22px;
+}
+.countdown-bar__seg {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  border: var(--line-thin);
+  background: var(--panel);
+}
+.countdown-bar__fill {
+  display: block;
+  height: 100%;
+  background: var(--teaser-accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+/* Destination */
+.teaser-heading {
+  font-size: clamp(1.9rem, 6.4vw, 2.8rem);
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+.teaser-host { font-weight: 400; color: var(--teaser-host); }
+/* Hostnames keep their real case: Bangers only has capitals, so the URL face is used. */
+.teaser-host--url { font-family: var(--font-mono); font-size: 0.74em; font-weight: 700; letter-spacing: 0; text-transform: none; }
+.teaser-linktitle {
+  margin: 0 0 4px;
+  color: var(--ink-2);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.teaser-linktitle::before { content: "\201C"; }
+.teaser-linktitle::after { content: "\201D"; }
+.teaser-url {
+  max-width: 100%;
+  margin: 0 auto;
+  color: var(--muted);
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Narration box: trivia fact, brand message or a countdown quip */
+.narration {
+  position: relative;
+  margin: 24px 0 0;
+  padding: 44px 18px 16px;
+  background: var(--yellow);
+  border: var(--line);
+  color: var(--ink);
+  text-align: left;
+}
+.narration__label {
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  margin: 0;
+}
+.narration__text {
+  margin: 0;
+  font-weight: 700;
+  font-size: 1.06rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.narration__text--message { font-size: 1.15rem; white-space: pre-line; }
+
+/* Actions and status */
+.teaser-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+  margin: 24px 0 0;
+}
+.teaser-actions .btn { flex: 1 1 170px; max-width: 250px; }
+.teaser-cancel[data-paused="true"] { --btn-bg: var(--yellow); --btn-hover: var(--yellow-dark); }
+.teaser-status {
+  min-height: 1.5em;
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+.teaser-status.is-error { color: var(--red-dark); font-weight: 700; }
+.teaser-noscript { margin: 18px 0 0; color: var(--ink-2); }
+
+/* ==========================================================================
+   Expired (self-destructed) page
+   ========================================================================== */
+.boom-burst .burst__inner { font-size: calc(var(--burst-size) * 0.17); }
+.boom-burst.is-popping { animation-delay: 140ms; }
+
+/* Details as a ruled definition list (label | value rows, stacked on phones) */
+.fact-list {
+  margin: 0 0 24px;
+  border: var(--line);
+  background: var(--panel);
+  text-align: left;
+}
+.fact-list__row { display: grid; grid-template-columns: minmax(0, 1fr); }
+.fact-list__row + .fact-list__row { border-top: var(--line-thin); }
+.fact-list dt {
+  padding: 9px 14px 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fact-list dd {
+  margin: 0;
+  padding: 2px 14px 10px;
+  color: var(--ink);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+@media (min-width: 520px) {
+  .fact-list__row { grid-template-columns: 10.5rem 1fr; }
+  .fact-list dt {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    background: var(--paper-2);
+    border-right: var(--line-thin);
+    color: var(--ink);
+  }
+  .fact-list dd { padding: 10px 14px; }
+}
+
+/* ==========================================================================
+   Not-found (404) page
+   ========================================================================== */
+.lost-burst .burst__inner { font-size: calc(var(--burst-size) * 0.18); }
+.lost-burst.is-popping { animation-delay: 100ms; }
+
+/* Slug availability: a skeleton while checking, then a status caption */
+.slug-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 0 0 22px;
+}
+.slug-status__skeleton { width: min(100%, 300px); height: 36px; margin: 0; }
+.slug-check { margin: 0; }
+.slug-check:not([data-state]) { display: none; }
+.slug-check[data-state] {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 6px 12px;
+  border: var(--line-thin);
+  background: var(--yellow);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 0.95rem;
+  line-height: 1.3;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.slug-check .icon { width: 18px; height: 18px; }
+.slug-check[data-state="available"] { background: var(--green); color: #fff; }
+.slug-check[data-state="suggest"] { background: var(--blue); color: #fff; }
+.slug-check[data-state="unavailable"] { background: var(--yellow); }
+.slug-check[data-state="tidy"],
+.slug-check[data-state="error"] { background: var(--panel); }
+
+/* The primary action either claims the slug (plus) or opens an existing Blip; long slugs ellipsize. */
+.visit-actions .claim-btn { flex: 1 1 auto; max-width: 100%; min-width: 0; }
+.claim-btn__label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.claim-btn__slug {
+  font-family: var(--font-mono);
+  font-size: 0.72em;
+  letter-spacing: 0;
+}
+.claim-btn:not([data-intent="go"]) .claim-icon--go,
+.claim-btn[data-intent="go"] .claim-icon--claim { display: none; }
+
+/* ==========================================================================
+   Narrow phones: keep big buttons inside the panel
+   ========================================================================== */
+@media (max-width: 479px) {
+  .visit-actions .btn--lg,
+  .teaser-actions .btn--lg { padding-inline: 16px; font-size: 1.35rem; }
+  .visit-actions .btn,
+  .teaser-actions .btn { max-width: none; }
+  .narration { padding-inline: 14px; }
+}
+
+/* ==========================================================================
+   Reduced motion: no countdown pop, bursts rest at their end state
+   (theme.css already stops the rays and halftone drift)
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .teaser-burst.is-tick { animation: none; }
+  #replay { display: none; }
+}

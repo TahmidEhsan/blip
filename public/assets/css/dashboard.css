@@ -1,0 +1,515 @@
+/* ==========================================================================
+   Blip: live analytics dashboard (dashboard.html)
+   Comic panel theme (DESIGN.md): ink outlines, flat print colours, sharp corners.
+   Every section stacks full width in one column. Builds on theme.css tokens.
+   ========================================================================== */
+
+.dash-page { --ts-h: 280px; }
+@media (max-width: 599.98px) {
+  .dash-page { --ts-h: 220px; }
+}
+
+.dash { display: flex; flex-direction: column; gap: var(--gap); padding-bottom: 12px; outline: none; }
+.dash-app { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; }
+
+
+/* ==========================================================================
+   Loading states
+   A section with .is-loading shows its [data-skeleton] (shaped like the final
+   layout) and hides its [data-content]; otherwise the reverse.
+   ========================================================================== */
+:not(.is-loading) > [data-skeleton] { display: none; }
+.is-loading > [data-content] { display: none !important; }
+
+.sk-w-20 { width: 20%; }
+.sk-w-25 { width: 25%; }
+.sk-w-30 { width: 30%; }
+.sk-w-35 { width: 35%; }
+.sk-w-40 { width: 40%; }
+.sk-w-45 { width: 45%; }
+.sk-w-50 { width: 50%; }
+.sk-w-55 { width: 55%; }
+.sk-w-60 { width: 60%; }
+.sk-w-65 { width: 65%; }
+.sk-w-90 { width: 90%; }
+.sk-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+/* One line of the short URL heading (.link-panel__url: font size times its 1.15 line height) */
+.sk-url { width: min(460px, 82%); height: calc(clamp(1.5rem, 4.6vw, 2.5rem) * 1.15); margin-bottom: 12px; }
+.sk-badge { width: 72px; height: 24px; min-height: 0; flex: none; }
+.sk-caption { width: 116px; height: 32px; }
+.sk-btn { width: 96px; height: 36px; }
+.sk-btn--wide { width: 140px; height: 46px; }
+
+/* Boot placeholder: shown until the script picks the gate or the dashboard. It has the shape both
+   views start with (a captioned panel, a heading and a line of text). */
+.boot__caption { width: 150px; height: 32px; min-height: 0; }
+
+/* ==========================================================================
+   Shared bits: notices, mini empty states, section heads
+   ========================================================================== */
+.notice {
+  display: flex; align-items: flex-start; gap: 10px;
+  margin: 0; padding: 10px 14px;
+  border: var(--line-thin);
+  background: var(--panel); color: var(--ink);
+  font-weight: 700; font-size: 0.95rem; line-height: 1.4;
+}
+.notice > .icon { margin-top: 1px; }
+.notice--red { background: var(--red); color: #fff; }
+.notice--yellow { background: var(--yellow); }
+
+.mini-empty {
+  margin: 0; padding: 14px 16px;
+  border: 2px dashed var(--ink);
+  background: var(--paper);
+  color: var(--ink-2); font-weight: 700; font-size: 0.92rem;
+}
+
+.dash-section { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.section-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.section-head__icon {
+  flex: none; display: grid; place-items: center;
+  width: 44px; height: 44px;
+  background: var(--yellow); border: var(--line-thin); color: var(--ink);
+}
+.section-head__icon .icon { width: 24px; height: 24px; }
+.section-head__titles { flex: 1 1 auto; min-width: 0; }
+.section-head__title { margin: 0; font-size: clamp(1.55rem, 3.6vw, 2rem); }
+.section-head__sub { margin: 3px 0 0; color: var(--muted); font-size: 0.9rem; line-height: 1.3; }
+.section-head__tool { flex: none; margin-left: auto; }
+.badge.section-head__tool { font-size: 0.8rem; }
+/* The live feed's count badge has no real number until the feed loads: a small block stands in. */
+.feed-count-sk { display: none; width: 34px; height: 24px; min-height: 0; }
+.dash-section.is-loading .feed-count { display: none; }
+.dash-section.is-loading .feed-count-sk { display: block; }
+
+/* ==========================================================================
+   1. Link header panel
+   ========================================================================== */
+.link-panel__body,
+.link-panel__skeleton { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
+@media (min-width: 900px) {
+  .link-panel__body,
+  .link-panel__skeleton { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+}
+.link-panel__main { min-width: 0; }
+/* The short URL is set in the mono URL face (DESIGN section 4) so it keeps its real lowercase spelling. */
+.link-panel__url {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: clamp(1.5rem, 4.6vw, 2.5rem);
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.link-panel__slug { display: inline-block; max-width: 100%; }
+.link-panel__name { margin: 0 0 8px; color: var(--ink-2); font-weight: 700; overflow-wrap: anywhere; }
+.link-panel__target {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 0 0 12px; min-width: 0;
+  font-family: var(--font-mono); font-size: 0.92rem;
+}
+.link-panel__target .icon { margin-top: 2px; }
+.link-panel__target a { color: var(--ink-2); overflow-wrap: anywhere; word-break: break-word; }
+.link-panel__target a:hover { color: var(--red); }
+.link-panel__badges { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.link-panel__created { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.88rem; font-weight: 700; }
+.link-panel__working {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  margin: 12px 0 0; font-size: 0.9rem; color: var(--ink-2);
+}
+.link-panel__working a { font-family: var(--font-mono); font-size: 0.88rem; overflow-wrap: anywhere; }
+.link-panel__gone { margin-top: 14px; }
+
+.link-panel__side { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; min-width: 0; }
+@media (min-width: 900px) {
+  .link-panel__side { align-items: flex-end; max-width: 380px; }
+}
+.link-panel__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+@media (min-width: 900px) {
+  .link-panel__actions { justify-content: flex-end; }
+}
+.link-panel__hint {
+  display: flex; align-items: flex-start; gap: 7px;
+  margin: 0; max-width: 360px;
+  color: var(--ink-2); font-size: 0.85rem; font-weight: 700; line-height: 1.4;
+}
+.link-panel__hint .icon { margin-top: 2px; }
+@media (min-width: 900px) {
+  .link-panel__hint { text-align: right; justify-content: flex-end; }
+}
+
+/* LIVE indicator: status dot inside a caption box */
+.live-caption { margin: 0; font-size: 0.9rem; padding: 6px 13px 6px 11px; gap: 9px; }
+
+/* ==========================================================================
+   2. Controls row and the simulated-traffic notice
+   ========================================================================== */
+.dash-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; }
+.dash-controls__group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
+.dash-controls .segmented > button { min-height: 40px; }
+
+.sim-notice {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
+  padding: 12px 14px;
+  background: var(--yellow);
+  border: var(--line);
+}
+.sim-notice__tag { margin: 0; }
+.sim-notice__text { flex: 1 1 280px; margin: 0; font-weight: 700; font-size: 0.92rem; line-height: 1.4; }
+.sim-notice__clear { flex: none; }
+
+.stats-error { align-items: center; flex-wrap: wrap; }
+.stats-error__text { flex: 1 1 240px; margin: 0; }
+
+/* Empty banner (no clicks in this range) */
+.empty-banner { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 14px 20px; }
+.empty-banner__title { margin: 0 0 4px; font-size: clamp(1.5rem, 3.6vw, 1.9rem); }
+.empty-banner__text { margin: 0; color: var(--ink-2); }
+.empty-banner__actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+@media (min-width: 760px) {
+  .empty-banner { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .empty-banner__actions { grid-column: auto; justify-content: flex-end; }
+}
+
+/* ==========================================================================
+   3. KPI strip: one panel, cells split by 2px ink rules (2 across, 4 from 720px)
+   ========================================================================== */
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding: 0;
+  background: var(--ink);
+}
+@media (min-width: 720px) {
+  .kpi-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.kpi { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 14px 16px 16px; background: var(--panel); }
+.kpi__label {
+  margin: 0;
+  font-family: var(--font-body); font-size: 0.8rem; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase; line-height: 1.25;
+  color: var(--ink-2);
+}
+.kpi__value {
+  margin: 2px 0 0;
+  font-family: var(--font-display);
+  font-size: clamp(2.2rem, 5.4vw, 3rem);
+  letter-spacing: 0.03em;
+  line-height: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kpi__sub { margin: 0; min-height: 1.3em; color: var(--muted); font-size: 0.85rem; font-weight: 700; line-height: 1.3; }
+.kpi--life[data-state="expired"] .kpi__value,
+.kpi--life[data-state="destroyed"] .kpi__value { color: var(--red); }
+
+.kpi__sk { display: none; width: 58%; height: 0.82em; margin: 0.09em 0; min-height: 0; }
+.kpi.is-loading .kpi__num { display: none; }
+.kpi.is-loading .kpi__sk { display: block; }
+.kpi.is-loading .kpi__sub,
+.kpi.is-loading .meter { visibility: hidden; }
+
+/* Bots & blocked: secondary line across the strip */
+.kpi-strip__foot {
+  grid-column: 1 / -1;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  margin: 0; padding: 9px 16px;
+  background: var(--paper-2);
+  font-size: 0.9rem;
+}
+.kpi-strip__foot-label { font-weight: 700; font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.kpi-strip__foot .kpi__num { font-family: var(--font-display); font-weight: 400; font-size: 1.35rem; letter-spacing: 0.04em; line-height: 1; }
+.kpi-strip__foot-sub { color: var(--ink-2); font-weight: 700; }
+.kpi__sk--inline { width: 4.5em; height: 1.1em; margin: 0; }
+.kpi-strip__foot.is-loading .kpi__num,
+.kpi-strip__foot.is-loading .kpi-strip__foot-sub { display: none; }
+.kpi-strip__foot.is-loading .kpi__sk { display: inline-block; }
+
+/* Flat progress bar (clicks used / lifetime elapsed) */
+.meter { height: 14px; margin-top: 6px; border: var(--line-thin); background: var(--panel); }
+.meter__fill {
+  display: block; width: 0; height: 100%;
+  background: var(--blue);
+  transition: width var(--dur-3) var(--ease-out); /* audit-ok: progress bar fill moving to its new value */
+}
+.meter[data-level="mid"] .meter__fill { background: var(--orange); }
+.meter[data-level="high"] .meter__fill { background: var(--red); }
+
+/* ==========================================================================
+   Chart tooltip: a yellow caption box (shared by the time chart and the map)
+   ========================================================================== */
+.chart { position: relative; min-width: 0; }
+.chart-tip {
+  position: absolute; left: 0; top: 0; z-index: 6;
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 120px; max-width: 260px;
+  padding: 6px 11px 8px;
+  background: var(--yellow); color: var(--ink);
+  border: var(--line-thin);
+  pointer-events: none;
+}
+.chart-tip__label { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; line-height: 1.3; }
+.chart-tip__value { font-family: var(--font-display); font-size: 1.45rem; letter-spacing: 0.04em; line-height: 1.05; }
+.chart-tip__sub { font-size: 0.78rem; font-weight: 700; color: var(--ink-2); }
+
+.chart-note {
+  position: absolute; left: 50%; top: 42%; z-index: 2;
+  transform: translate(-50%, -50%);
+  margin: 0; max-width: calc(100% - 32px);
+  pointer-events: none;
+  text-align: center;
+}
+
+/* ==========================================================================
+   4. Clicks over time
+   ========================================================================== */
+.chart--ts { height: var(--ts-h); }
+.sk-chart__block { height: var(--ts-h); }
+.ts-svg { display: block; overflow: visible; touch-action: pan-y; }
+.ts-svg:focus { outline: none; }
+.ts-svg:focus-visible { outline: 3px solid var(--blue); outline-offset: 4px; }
+.ts-grid line { stroke: var(--ink); stroke-opacity: 0.14; stroke-width: 1; shape-rendering: crispEdges; }
+.ts-axis .domain { stroke: var(--ink); stroke-width: 2; shape-rendering: crispEdges; }
+.ts-axis .tick line { stroke: var(--ink); stroke-width: 2; shape-rendering: crispEdges; }
+.ts-axis text { fill: var(--ink-2); font-family: var(--font-body); font-size: 12px; font-weight: 700; }
+.ts-line { fill: none; stroke-width: 3; stroke-linejoin: miter; stroke-linecap: square; pointer-events: none; }
+.ts-marker { stroke: var(--ink); stroke-width: 2; pointer-events: none; }
+.ts-crosshair { stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: 4 3; pointer-events: none; shape-rendering: crispEdges; }
+.ts-focus { stroke: var(--ink); stroke-width: 2; pointer-events: none; }
+.ts-peak__box { stroke: var(--ink); stroke-width: 2; }
+.ts-peak__text { fill: var(--ink); font-family: var(--font-body); font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.ts-overlay { fill: transparent; cursor: crosshair; }
+/* Chart/table toggle: one label, pressed (table showing) fills yellow like a pressed chip */
+.ts-toggle[aria-pressed="true"] { --btn-bg: var(--yellow); --btn-hover: var(--yellow-dark); border-color: var(--ink); }
+
+/* Scroll boxes are positioned so they contain (and clip) the absolutely positioned visually-hidden
+   text in their rows; otherwise those spans sit below the box and stretch the page past the footer. */
+.table-wrap { position: relative; max-height: 320px; overflow: auto; overscroll-behavior: contain; border: var(--line-thin); background: var(--panel); }
+.data-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.data-table th, .data-table td { padding: 8px 12px; text-align: left; vertical-align: middle; border-bottom: var(--line-hair); }
+.data-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--paper-2);
+  border-bottom: var(--line-thin);
+  font-size: 0.75rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase;
+}
+.data-table tbody th { font-weight: 400; }
+.data-table .num { text-align: right; font-weight: 700; white-space: nowrap; }
+
+/* ==========================================================================
+   5. World map
+   ========================================================================== */
+/* The map box sets its own shape (the SVG fills it). No min-height here: on an aspect-ratio box it
+   would turn into a minimum width and push the map past the panel on phones. */
+.dash-page { --map-ratio: 2 / 1; }
+@media (max-width: 599.98px) {
+  .dash-page { --map-ratio: 8 / 5; }
+}
+.chart--map {
+  width: 100%;
+  aspect-ratio: var(--map-ratio);
+  overflow: hidden;
+  border: var(--line-thin);
+  background: var(--panel);
+}
+.sk-map__block { width: 100%; aspect-ratio: var(--map-ratio); }
+/* Block skeleton over the map box while the country shapes load (DESIGN section 10). It sits inside
+   the box's own border, so it drops the skeleton frame to avoid a double outline. */
+.map-skeleton { position: absolute; inset: 0; z-index: 1; min-height: 0; border: 0; }
+.map-svg { display: block; touch-action: pan-y; }
+.map-svg:focus-visible { outline: 3px solid var(--blue); outline-offset: -3px; }
+.map-sphere { stroke: var(--ink); stroke-width: 2; }
+.country { stroke: var(--ink); stroke-width: 0.6; stroke-linejoin: round; }
+.country.is-hover { stroke-width: 2; }
+.city__dot { stroke: var(--ink); stroke-width: 1.5; pointer-events: none; }
+.city__hit { fill: transparent; }
+.city.is-hover .city__dot { stroke-width: 2.6; }
+.map-hit { pointer-events: none; }
+.map-hit__burst {
+  stroke: var(--ink); stroke-width: 1.6; stroke-linejoin: miter;
+  transform-box: fill-box; transform-origin: center;
+  animation: hit-pop 2600ms var(--ease-out) both;
+}
+.map-hit--click .map-hit__burst { fill: var(--yellow); }
+.map-hit--blocked .map-hit__burst { fill: var(--red); }
+.map-hit--bot .map-hit__burst { fill: var(--paper-2); }
+/* One-shot impact: pops in, holds, fades. No spin, so it reads as a hit marker. */
+@keyframes hit-pop {
+  0% { transform: scale(0.2); opacity: 0; }
+  14% { transform: scale(1.2); opacity: 1; }
+  26% { transform: scale(1); }
+  80% { opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}
+/* Load failure: the explanation with a Retry button under it, centred in the map box */
+.map-status {
+  position: absolute; inset: 0; z-index: 3;
+  display: grid; align-content: center; justify-items: center; gap: 10px;
+  margin: 0; padding: 16px;
+  color: var(--ink-2); font-weight: 700; text-align: center;
+}
+.map-status__text { max-width: 46ch; }
+.map-note { position: absolute; left: 10px; bottom: 10px; z-index: 2; margin: 0; max-width: calc(100% - 20px); pointer-events: none; }
+
+/* Legend, lettered like a caption box */
+.map-legend {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 22px;
+  margin-top: 12px; padding: 8px 12px;
+  background: var(--panel);
+  border: var(--line-thin);
+  font-size: 0.76rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.map-legend__group { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.map-legend__scale, .map-legend__keys { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.map-legend__scale li, .map-legend__key { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { flex: none; width: 20px; height: 13px; border: var(--line-thin); }
+.swatch--heat-0 { background: var(--heat-0); }
+.swatch--heat-1 { background: var(--heat-1); }
+.swatch--heat-2 { background: var(--heat-2); }
+.swatch--heat-3 { background: var(--heat-3); }
+.swatch--heat-4 { background: var(--heat-4); }
+.map-key { flex: none; width: 18px; height: 18px; }
+.map-key__city { fill: var(--blue); stroke: var(--ink); stroke-width: 1.5; }
+.map-key__hit { fill: var(--yellow); stroke: var(--ink); stroke-width: 1.2; }
+.map-key__hit--blocked { fill: var(--red); }
+.map-key__hit--bot { fill: var(--paper-2); }
+
+/* ==========================================================================
+   6. Breakdown: tabs + horizontal bars (flat fill, ink outline, square ends)
+   ========================================================================== */
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs__tab {
+  display: inline-flex; align-items: center;
+  min-height: 40px; padding: 6px 14px;
+  border: var(--line-thin);
+  background: var(--panel); color: var(--ink);
+  font-weight: 700; font-size: 0.92rem; letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.tabs__tab:hover { background: var(--paper-2); }
+.tabs__tab[aria-selected="true"] { background: var(--ink); color: var(--yellow); }
+.tabs__tab:focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
+.tabpanel:focus-visible { outline: 3px solid var(--blue); outline-offset: 4px; }
+
+.hbars { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.hbars--scroll { position: relative; max-height: 470px; overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; }
+.hbar { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.hbar__lead {
+  flex: none; display: grid; place-items: center;
+  width: 38px; height: 38px;
+  border: var(--line-thin);
+  background: var(--panel); color: var(--ink);
+}
+.hbar__lead--letter { background: var(--ink); color: var(--yellow); font-family: var(--font-display); font-size: 1.2rem; line-height: 1; }
+.hbar__lead--pill { width: auto; height: auto; border: 0; background: transparent; }
+.hbar__main { flex: 1 1 auto; min-width: 0; display: grid; gap: 5px; }
+.hbar__top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.hbar__label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.hbar__value { flex: none; display: inline-flex; align-items: baseline; gap: 8px; }
+.hbar__count { font-family: var(--font-display); font-size: 1.25rem; letter-spacing: 0.04em; line-height: 1; }
+.hbar__pct { min-width: 3.6ch; text-align: right; color: var(--muted); font-size: 0.82rem; font-weight: 700; }
+.hbar__track { height: 16px; border: var(--line-thin); background: var(--panel); }
+.hbar__fill { display: block; height: 100%; background: var(--blue); }
+.hbar--other .hbar__label { color: var(--muted); }
+.hbar--other .hbar__fill { background: var(--muted); }
+
+.sk-bars { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.sk-bar { display: flex; align-items: center; gap: 12px; }
+.sk-bar__lead { flex: none; width: 38px; height: 38px; min-height: 0; }
+.sk-bar__main { flex: 1 1 auto; min-width: 0; }
+.sk-bar__track { height: 16px; margin-top: 4px; }
+
+/* Two-letter country code pill (flag emoji don't render everywhere) */
+.cc {
+  flex: none; display: inline-grid; place-items: center;
+  min-width: 38px; height: 26px; padding: 0 6px;
+  border: var(--line-thin);
+  background: var(--yellow); color: var(--ink);
+  font-family: var(--font-mono); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; line-height: 1;
+}
+.cc--unknown { background: var(--paper-2); color: var(--muted); }
+
+/* ==========================================================================
+   7. Live feed: rows split by ink rules, outcome as a badge
+   ========================================================================== */
+.feed-scroll { position: relative; max-height: 560px; overflow-y: auto; overscroll-behavior: contain; }
+.feed { list-style: none; margin: 0; padding: 0; }
+.feed-item {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px;
+  padding: 12px 8px;
+}
+.feed-item + .feed-item { border-top: var(--line-thin); }
+.feed-item--blocked { background: var(--paper-2); }
+.feed-item.is-new { animation: feed-in var(--dur-3) var(--ease-out) both; }
+@keyframes feed-in { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: none; } }
+.feed-item__body { min-width: 0; }
+.feed-item__title { margin: 0; font-weight: 700; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed-item__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 12px; margin: 3px 0 0; color: var(--ink-2); font-size: 0.85rem; line-height: 1.35; }
+.feed-item__device { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; }
+.feed-item__via { overflow-wrap: anywhere; }
+.feed-item__note { margin: 4px 0 0; color: var(--red-dark); font-size: 0.82rem; font-weight: 700; }
+.feed-item--bot .feed-item__note { color: var(--ink-2); }
+.feed-item__aside { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; text-align: right; }
+.feed-item__time { color: var(--muted); font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
+.feed-item__badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+@media (max-width: 479.98px) {
+  .feed-item { grid-template-columns: auto minmax(0, 1fr); }
+  .feed-item__aside { grid-column: 2; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-start; text-align: left; }
+}
+.feed-empty { padding: 26px 12px; }
+.feed-empty p { margin: 0; max-width: 40ch; font-weight: 700; }
+
+.sk-feed { list-style: none; margin: 0; padding: 0; }
+.sk-feed__row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 12px 8px; }
+.sk-feed__row + .sk-feed__row { border-top: 2px solid rgba(17, 17, 17, 0.16); }
+.sk-cc { width: 38px; height: 26px; min-height: 0; }
+
+/* ==========================================================================
+   Gate (paste a manage key) and the error state
+   ========================================================================== */
+.gate { width: 100%; max-width: 680px; margin: clamp(8px, 4vh, 40px) auto 0; }
+.gate__intro { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+.gate__intro .empty__art { flex: none; }
+.gate__copy { min-width: 0; }
+.gate__title { margin: 0 0 8px; font-size: clamp(2rem, 5.4vw, 2.7rem); }
+.gate__text { margin: 0; color: var(--ink-2); }
+.gate__form { display: grid; gap: 14px; }
+.gate__error { margin: 0; }
+.gate__actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+.gate__links { margin-top: 24px; padding-top: 18px; border-top: var(--line-thin); }
+.gate__links-title { margin: 0 0 10px; font-size: 1.5rem; }
+.gate__links-list { list-style: none; margin: 0; padding: 0; border: var(--line-thin); background: var(--panel); }
+.gate__links-list > li + li { border-top: var(--line-thin); }
+.gate-link { display: flex; align-items: center; gap: 12px; padding: 10px 14px; color: var(--ink); text-decoration: none; }
+.gate-link:hover { background: var(--paper-2); color: var(--ink); }
+.gate-link:focus-visible { outline-offset: -3px; }
+.gate-link[aria-current="page"] { background: var(--yellow); }
+.gate-link__icon { flex: none; display: grid; place-items: center; width: 32px; height: 32px; border: var(--line-thin); background: var(--yellow); }
+.gate-link[aria-current="page"] .gate-link__icon { background: var(--panel); }
+.gate-link__slug { flex: 1 1 auto; min-width: 0; font-family: var(--font-mono); font-size: 0.92rem; font-weight: 700; overflow-wrap: anywhere; }
+.gate-link__when { flex: none; color: var(--muted); font-size: 0.82rem; font-weight: 700; }
+.gate-link__go { flex: none; display: grid; }
+@media (max-width: 419.98px) {
+  .gate__intro { flex-direction: column; }
+  .gate-link__when { display: none; }
+}
+
+.state-panel { width: 100%; max-width: 600px; margin: clamp(8px, 4vh, 40px) auto 0; display: grid; justify-items: center; gap: 10px; text-align: center; }
+.state-panel__art { background: var(--red); color: #fff; }
+.state-panel__title { margin: 6px 0 0; font-size: clamp(1.9rem, 4.6vw, 2.4rem); }
+.state-panel__text { margin: 0; color: var(--ink-2); max-width: 48ch; }
+.state-panel__actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 8px; }
+
+/* Dialog */
+.modal__title { margin: 0 0 8px; font-size: 1.8rem; }
+.modal__text { margin: 0; color: var(--ink-2); }
+
+/* ==========================================================================
+   Reduced motion: live markers appear without the pop, rows without the slide
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .map-hit__burst, .feed-item.is-new { animation: none !important; }
+}

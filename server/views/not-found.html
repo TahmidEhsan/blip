@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>This Blip doesn't exist (yet) · Blip</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/pages.css">
+  <noscript><style>.js-only { display: none !important; }</style></noscript>
+</head>
+<body class="page page--notfound">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main"><a href="/"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg><span>Make your own</span></a></nav>
+  </header>
+
+  <main class="page-main container" id="main">
+    <section class="panel visit-panel notfound-panel" aria-labelledby="notfound-heading">
+      <p class="caption caption--corner">Error 404: link not found</p>
+
+      <div class="splash splash--lost" aria-hidden="true">
+        <div class="rays"></div>
+        <div class="burst burst--blue lost-burst is-popping"><span class="burst__inner">Whoops!</span></div>
+      </div>
+
+      <h1 class="visit-heading" id="notfound-heading">This Blip doesn't exist (yet)</h1>
+      <p class="visit-copy" id="notfound-copy">There's no Blip at this address. If <code class="slug-pill">/{{text:SLUG}}</code> is still free, it could be yours in about five seconds.</p>
+
+      <div class="slug-status js-only">
+        <span class="skeleton slug-status__skeleton" id="slug-check-skeleton" aria-hidden="true"></span>
+        <p class="slug-check" id="slug-check" role="status" aria-live="polite"><svg class="icon" id="slug-check-icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#info"></use></svg><span id="slug-check-text"></span></p>
+        <button type="button" class="btn btn--sm" id="slug-retry" hidden>
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#refresh-cw"></use></svg>
+          <span>Retry</span>
+        </button>
+      </div>
+
+      <div class="visit-actions">
+        <a class="btn btn--primary btn--lg claim-btn" id="claim-link" href="/?slug={{attr:SLUG}}" data-intent="claim">
+          <svg class="icon claim-icon claim-icon--claim" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg>
+          <svg class="icon claim-icon claim-icon--go" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-right"></use></svg>
+          <span class="claim-btn__label" id="claim-label">Claim this Blip</span>
+        </a>
+        <a class="btn btn--lg" href="/">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg>
+          <span>Back home</span>
+        </a>
+      </div>
+
+      <p class="visit-tip">Got here from a link someone shared? Double-check the spelling. Blip slugs are lowercase words joined with dashes, like <span class="mono">brave-otter</span>.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer container page-footer">
+    <p class="footer-made">Made with <a href="/">Blip</a>. Tiny links with big personality.</p>
+  </footer>
+
+  <script type="application/json" id="blip-data">{{json:DATA}}</script>
+  <script type="module" src="/assets/js/not-found.js"></script>
+</body>
+</html>

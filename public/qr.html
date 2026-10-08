@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>QR studio · Blip</title>
+  <meta name="description" content="Design bold, scannable QR codes for your Blip links.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/qr.css">
+</head>
+<body class="page-qr">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="/"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg><span>Home</span></a>
+      <a href="/#my-links"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#list"></use></svg><span>My links</span><span class="nav-count" id="navLinkCount" hidden>0</span></a>
+      <a href="/dashboard.html" id="nav-dashboard"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg><span>Dashboard</span></a>
+      <a href="/qr.html" id="nav-qr" aria-current="page"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg><span>QR studio</span></a>
+    </nav>
+  </header>
+
+  <main class="container qr-main" id="main">
+    <section class="qr-intro" aria-labelledby="qr-title">
+      <a class="qr-back" href="/#my-links"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-left"></use></svg><span>Back to my links</span></a>
+      <p class="caption qr-kicker"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg>Meanwhile, in the print shop...</p>
+      <h1 class="qr-title" id="qr-title">QR studio</h1>
+      <p class="qr-lede">Style a code for your link, check that it scans, then download it for posters, menus and stickers.</p>
+      <div class="qr-link-line qr-link-line--skeleton" id="qr-link-skeleton" aria-hidden="true">
+        <span class="skeleton qr-skel-url"></span>
+        <span class="skeleton qr-skel-badge"></span>
+        <span class="skeleton qr-skel-host"></span>
+      </div>
+      <p class="qr-link-line" id="qr-link-line" hidden>
+        <span class="qr-link-line__short" id="qr-short-url"></span>
+        <span class="badge" id="qr-status-badge"></span>
+        <span class="qr-link-line__target"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-right"></use></svg><span class="qr-link-line__host" id="qr-target"></span></span>
+      </p>
+    </section>
+
+    <!-- Loading: skeletons shaped like the studio -->
+    <div class="qr-studio qr-loading" id="qr-loading" aria-busy="true">
+      <p class="visually-hidden" role="status">Loading your link</p>
+      <div class="qr-preview-col">
+        <div class="panel qr-preview">
+          <span class="caption caption--corner">Preview</span>
+          <div class="qr-stage halftone"><div class="skeleton qr-skel-square"></div></div>
+          <div class="skeleton skeleton--text qr-skel-w60"></div>
+          <div class="skeleton qr-skel-bar"></div>
+          <div class="skeleton qr-skel-caption"></div>
+          <div class="skeleton skeleton--text qr-skel-w90"></div>
+          <div class="skeleton skeleton--text qr-skel-w70"></div>
+        </div>
+        <div class="qr-actions">
+          <div class="skeleton qr-skel-button qr-skel-button--lg qr-skel-button--main"></div>
+          <div class="skeleton qr-skel-button qr-skel-button--lg"></div>
+          <div class="skeleton qr-skel-button qr-skel-button--lg"></div>
+        </div>
+      </div>
+      <div class="panel qr-controls">
+        <span class="caption caption--corner">Style it</span>
+        <div class="qr-toolbar">
+          <div class="qr-toolbar__main">
+            <div class="skeleton qr-skel-button"></div>
+            <div class="skeleton qr-skel-button"></div>
+          </div>
+          <div class="qr-toolbar__status">
+            <div class="skeleton skeleton--text qr-skel-w60"></div>
+            <div class="skeleton qr-skel-button--sm"></div>
+          </div>
+        </div>
+        <div class="qr-section">
+          <div class="skeleton skeleton--title qr-skel-title"></div>
+          <div class="qr-skel-tiles">
+            <div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div>
+          </div>
+        </div>
+        <div class="qr-section">
+          <div class="skeleton skeleton--title qr-skel-title"></div>
+          <div class="qr-skel-tiles">
+            <div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div><div class="skeleton qr-skel-tile"></div>
+          </div>
+        </div>
+        <div class="qr-section">
+          <div class="skeleton skeleton--title qr-skel-title"></div>
+          <div class="skeleton qr-skel-row"></div>
+          <div class="skeleton qr-skel-row"></div>
+          <div class="skeleton qr-skel-row"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Empty, no-token and error states -->
+    <section class="panel qr-empty" id="qr-empty" hidden aria-labelledby="qr-empty-title">
+      <span class="caption caption--corner" id="qr-empty-kicker">No link picked</span>
+      <div class="empty__art" aria-hidden="true"><svg class="icon" id="qr-empty-icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#scan-qr-code"></use></svg></div>
+      <h2 class="qr-empty__title" id="qr-empty-title">Pick a link to style</h2>
+      <p class="qr-empty__text" id="qr-empty-text">The QR studio designs codes for links you created in this browser.</p>
+      <div class="qr-empty__actions">
+        <a class="btn btn--primary" id="qr-empty-home" href="/"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg><span>Go home</span></a>
+        <button type="button" class="btn" id="qr-retry" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#refresh-cw"></use></svg><span>Try again</span></button>
+      </div>
+      <div class="qr-empty__links" id="qr-empty-links" hidden>
+        <p class="label" id="qr-empty-links-label">Or style one of your links</p>
+        <div class="chip-group qr-empty__chips" id="qr-empty-chips" role="list" aria-labelledby="qr-empty-links-label"></div>
+      </div>
+    </section>
+
+    <!-- Studio -->
+    <div class="qr-studio" id="qr-studio" hidden>
+      <div class="qr-preview-col">
+        <section class="panel qr-preview" aria-labelledby="qr-preview-title">
+          <h2 class="caption caption--corner qr-panel-title" id="qr-preview-title">Preview</h2>
+
+          <div class="qr-alert qr-alert--danger" id="qr-status-note" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>
+            <p id="qr-status-note-text"></p>
+          </div>
+
+          <div class="qr-stage halftone">
+            <figure class="qr-card" id="qr-card">
+              <div class="qr-card__code" id="qr-canvas" role="img" aria-label="Styled QR code preview"></div>
+              <figcaption class="qr-card__caption" id="qr-caption-preview" hidden></figcaption>
+            </figure>
+          </div>
+
+          <div class="qr-meter" id="qr-meter">
+            <div class="qr-meter__head">
+              <span class="qr-meter__title"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#scan-eye"></use></svg>Scannability</span>
+              <span class="qr-meter__value"><span id="qr-meter-value">Checking</span><span class="qr-meter__tone" id="qr-meter-label">...</span></span>
+            </div>
+            <div class="qr-meter__track" aria-hidden="true"><span class="qr-meter__fill" id="qr-meter-fill"></span></div>
+          </div>
+
+          <div class="qr-alert qr-alert--warn" id="qr-warning" role="status" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#triangle-alert"></use></svg>
+            <p id="qr-warning-text"></p>
+          </div>
+          <div class="qr-alert qr-alert--info" id="qr-invert-note" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#contrast"></use></svg>
+            <p>Light dots on a dark background look bold, but some older scanner apps only read dark dots on a light background. Test with a couple of phones before you print.</p>
+          </div>
+          <div class="qr-alert qr-alert--info" id="qr-transparent-note" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#square-dashed"></use></svg>
+            <p>Transparent background: scannability is checked against white, so place the code on a light, plain surface.</p>
+          </div>
+
+          <div class="qr-encodes">
+            <p class="qr-encodes__label" id="qr-encodes-label">This code opens</p>
+            <div class="qr-encodes__row">
+              <code class="qr-encodes__url" id="qr-encoded-url" aria-labelledby="qr-encodes-label"></code>
+              <button type="button" class="btn btn--sm btn--icon" id="qr-copy-url" aria-label="Copy the encoded URL" title="Copy URL"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg></button>
+              <a class="btn btn--sm btn--icon" id="qr-open-url" href="/" target="_blank" rel="noopener noreferrer" aria-label="Open the encoded URL in a new tab" title="Open"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg></a>
+            </div>
+          </div>
+          <p class="qr-encodes__note" id="qr-encodes-note"></p>
+        </section>
+
+        <div class="qr-actions" role="group" aria-label="Export">
+          <button type="button" class="btn btn--primary btn--lg qr-actions__main" id="qr-download-png"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#image-down"></use></svg><span>Download PNG</span></button>
+          <button type="button" class="btn btn--lg" id="qr-download-svg"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#download"></use></svg><span>SVG</span></button>
+          <button type="button" class="btn btn--lg" id="qr-copy-image"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#clipboard-copy"></use></svg><span>Copy image</span></button>
+        </div>
+      </div>
+
+      <section class="panel qr-controls" id="qr-controls" aria-labelledby="qr-controls-title">
+        <h2 class="caption caption--corner qr-panel-title" id="qr-controls-title">Style it</h2>
+        <div class="qr-toolbar" role="group" aria-label="Style actions">
+          <div class="qr-toolbar__main">
+            <button type="button" class="btn btn--blue qr-save" id="qr-save" title="Save style (Ctrl+S)"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#save"></use></svg><span>Save style</span></button>
+            <button type="button" class="btn" id="qr-surprise" title="Random look in comic colours"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#dices"></use></svg><span>Surprise me</span></button>
+          </div>
+          <div class="qr-toolbar__status">
+            <p class="qr-save-state" id="qr-save-state" aria-live="polite"></p>
+            <button type="button" class="btn btn--sm" id="qr-reset" title="Revert to the last saved style"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span>Reset</span></button>
+          </div>
+        </div>
+
+        <section class="qr-section" aria-labelledby="sec-presets">
+          <h3 class="qr-section__title" id="sec-presets"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#swatch-book"></use></svg></span>Presets</h3>
+          <p class="hint qr-section__hint">Ready-made looks in comic colours. Pick one, then tweak anything below.</p>
+          <div class="qr-presets" id="qr-presets" role="group" aria-labelledby="sec-presets"></div>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-dots">
+          <h3 class="qr-section__title" id="sec-dots"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#grid-3x3"></use></svg></span>Dot style</h3>
+          <div class="qr-shapes" id="qr-dot-types" role="group" aria-labelledby="sec-dots"></div>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-corners">
+          <h3 class="qr-section__title" id="sec-corners"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#scan"></use></svg></span>Corners</h3>
+          <p class="qr-sublabel" id="lbl-corner-square">Outer squares</p>
+          <div class="qr-shapes qr-shapes--corners" id="qr-corner-square-types" role="group" aria-labelledby="lbl-corner-square"></div>
+          <p class="qr-sublabel" id="lbl-corner-dot">Inner dots</p>
+          <div class="qr-shapes qr-shapes--corners" id="qr-corner-dot-types" role="group" aria-labelledby="lbl-corner-dot"></div>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-colours">
+          <h3 class="qr-section__title" id="sec-colours"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#palette"></use></svg></span>Colours</h3>
+          <div class="qr-colors">
+            <label class="qr-color">
+              <input type="color" id="qr-dot-color">
+              <span class="qr-color__text"><span class="qr-color__name">Dots</span><span class="qr-color__hex" id="qr-dot-color-hex"></span></span>
+            </label>
+            <label class="qr-color">
+              <input type="color" id="qr-corner-square-color">
+              <span class="qr-color__text"><span class="qr-color__name">Outer corners</span><span class="qr-color__hex" id="qr-corner-square-color-hex"></span></span>
+            </label>
+            <label class="qr-color">
+              <input type="color" id="qr-corner-dot-color">
+              <span class="qr-color__text"><span class="qr-color__name">Inner corners</span><span class="qr-color__hex" id="qr-corner-dot-color-hex"></span></span>
+            </label>
+          </div>
+
+          <div class="qr-subpanel">
+            <label class="switch">
+              <input type="checkbox" id="qr-gradient-toggle" aria-controls="qr-gradient-opts" aria-describedby="qr-gradient-hint">
+              <span class="switch__track"></span>
+              <span>Two-tone dots</span>
+            </label>
+            <p class="hint" id="qr-gradient-hint">Blends the dots from one colour into a second one. Flat colours scan most reliably.</p>
+            <div class="qr-gradient" id="qr-gradient-opts" hidden>
+              <label class="qr-color">
+                <input type="color" id="qr-dot-color-2">
+                <span class="qr-color__text"><span class="qr-color__name">Second colour</span><span class="qr-color__hex" id="qr-dot-color-2-hex"></span></span>
+              </label>
+              <div class="segmented" id="qr-gradient-type" role="radiogroup" aria-label="Blend shape">
+                <button type="button" role="radio" aria-checked="true" data-value="linear">Linear</button>
+                <button type="button" role="radio" aria-checked="false" data-value="radial">Radial</button>
+              </div>
+              <div class="field qr-range-field" id="qr-rotation-field">
+                <label class="label qr-range-label" for="qr-gradient-rotation"><span>Angle</span><output id="qr-gradient-rotation-out" for="qr-gradient-rotation">0°</output></label>
+                <input type="range" class="range" id="qr-gradient-rotation" min="0" max="360" step="5" value="0">
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-background">
+          <h3 class="qr-section__title" id="sec-background"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#paint-bucket"></use></svg></span>Background</h3>
+          <div class="qr-bg-row">
+            <label class="qr-color">
+              <input type="color" id="qr-bg-color">
+              <span class="qr-color__text"><span class="qr-color__name">Background</span><span class="qr-color__hex" id="qr-bg-color-hex"></span></span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="qr-transparent-toggle">
+              <span class="switch__track"></span>
+              <span>Transparent</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-logo">
+          <h3 class="qr-section__title" id="sec-logo"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#target"></use></svg></span>Centre logo</h3>
+          <div class="qr-logos" id="qr-logos" role="group" aria-labelledby="sec-logo"></div>
+          <div class="qr-logo-actions">
+            <input type="file" id="qr-logo-file" accept="image/png,image/jpeg,image/svg+xml,.png,.jpg,.jpeg,.svg" hidden>
+            <button type="button" class="btn btn--sm" id="qr-logo-upload"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#image-up"></use></svg><span>Upload logo</span></button>
+            <button type="button" class="btn btn--sm btn--ghost" id="qr-logo-remove" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#trash"></use></svg><span>Forget my logo</span></button>
+          </div>
+          <p class="error-text" id="qr-logo-error" role="alert" hidden></p>
+          <p class="hint">PNG, JPG or SVG up to 512 kB. Your logo stays in this browser and is never uploaded, so the saved style shows no logo on other devices.</p>
+        </section>
+
+        <section class="qr-section" aria-labelledby="sec-frame">
+          <h3 class="qr-section__title" id="sec-frame"><span class="qr-section__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#frame"></use></svg></span>Margin &amp; caption</h3>
+          <div class="field qr-range-field">
+            <label class="label qr-range-label" for="qr-margin"><span>Quiet zone</span><output id="qr-margin-out" for="qr-margin">12</output></label>
+            <input type="range" class="range" id="qr-margin" min="0" max="40" step="1" value="12" aria-describedby="qr-margin-hint">
+            <p class="hint" id="qr-margin-hint">The blank border scanners use to find the code. Keep some if you print on busy backgrounds.</p>
+          </div>
+          <div class="field">
+            <label class="label qr-range-label" for="qr-caption"><span>Caption</span><span class="qr-caption-count" id="qr-caption-count">0/40</span></label>
+            <input type="text" class="input" id="qr-caption" maxlength="40" placeholder="Scan me for a surprise!" autocomplete="off" aria-describedby="qr-caption-hint">
+            <p class="hint" id="qr-caption-hint">Lettered under the code in PNG downloads. Handy for flyers and merch.</p>
+          </div>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer container">
+    <div class="footer-inner">
+      <p class="footer-made">Made with <a href="/">Blip</a>. Tiny links with big personality.</p>
+      <p class="footer-privacy"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#shield-check"></use></svg><span>We never store IP addresses. Visitors are counted with salted, one-way hashes.</span></p>
+    </div>
+  </footer>
+
+  <dialog id="qr-confirm" class="modal qr-confirm" aria-labelledby="qr-confirm-title" aria-describedby="qr-confirm-text">
+    <form method="dialog">
+      <div class="modal__body">
+        <span class="qr-confirm__icon" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#mouse-pointer-click"></use></svg></span>
+        <h2 id="qr-confirm-title" class="qr-confirm__title">Use up a click?</h2>
+        <p id="qr-confirm-text">Opening it yourself counts as a visit.</p>
+      </div>
+      <div class="modal__actions">
+        <button type="submit" value="cancel" class="btn btn--ghost" autofocus>Cancel</button>
+        <button type="submit" value="confirm" class="btn btn--primary"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg><span id="qr-confirm-ok-label">Open anyway</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/vendor/qr-code-styling.js" defer></script>
+  <script type="module" src="/assets/js/qr.js"></script>
+</body>
+</html>

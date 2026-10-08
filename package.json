@@ -2,7 +2,7 @@
   "name": "blip",
   "version": "1.0.0",
   "private": true,
-  "description": "Blip — a playful URL shortener with word slugs, vanity domains, teaser pages, live analytics maps, self-destructing links and a QR studio.",
+  "description": "Blip, a playful URL shortener with word slugs, vanity domains, teaser pages, live analytics maps, self-destructing links and a QR studio, drawn in a comic-book style.",
   "type": "module",
   "main": "server/index.js",
   "engines": {
@@ -11,15 +11,17 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server/index.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/"
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.js\"",
+    "audit:design": "node scripts/audit-design.mjs",
+    "icons": "node scripts/build-icons.mjs"
   },
   "dependencies": {
-    "@fontsource-variable/inter": "^5.3.0",
-    "@fontsource-variable/space-grotesk": "^5.3.0",
+    "@fontsource/bangers": "^5.3.0",
+    "@fontsource/comic-neue": "^5.3.0",
+    "@phosphor-icons/core": "^2.1.1",
     "d3": "^7.9.0",
     "express": "^5.2.1",
     "i18n-iso-countries": "^7.14.0",
-    "lucide": "^1.52.0",
     "qr-code-styling": "^1.9.2",
     "topojson-client": "^3.1.0",
     "ua-parser-js": "^1.0.41",

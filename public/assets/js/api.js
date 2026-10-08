@@ -1,4 +1,4 @@
-// Blip — shared browser helpers: API client, local link store, toasts, DOM builder.
+// Blip: shared browser helpers (API client, local link store, toasts, icons, DOM builder).
 // Every page imports from here; see SPEC.md §5 for the endpoints.
 
 export class ApiError extends Error {
@@ -27,7 +27,7 @@ async function request(method, path, { body, token, signal } = {}) {
     });
   } catch (err) {
     if (err?.name === 'AbortError') throw err;
-    throw new ApiError(0, 'network', 'Network error — is the Blip server running?');
+    throw new ApiError(0, 'network', 'Network error. Is the Blip server running?');
   }
 
   if (res.status === 204) return null;
@@ -39,7 +39,7 @@ async function request(method, path, { body, token, signal } = {}) {
   if (!res.ok) {
     const e = data?.error || {};
     const retry = res.headers.get('Retry-After');
-    const message = e.message || (res.status === 429 && retry ? `Slow down — try again in ${retry}s.` : `Request failed (${res.status})`);
+    const message = e.message || (res.status === 429 && retry ? `Slow down. Try again in ${retry}s.` : `Request failed (${res.status})`);
     throw new ApiError(res.status, e.code, message, e.field);
   }
   return data;
@@ -144,7 +144,7 @@ export const api = {
 };
 
 // ---------------------------------------------------------------------------
-// Local link store — manage tokens live only in this browser.
+// Local link store: manage tokens live only in this browser.
 // ---------------------------------------------------------------------------
 const STORE_KEY = 'blip.links.v1';
 
@@ -188,6 +188,25 @@ export const linkStore = {
   },
 };
 
+/**
+ * Keep the header's "My links" count (#navLinkCount) in step with the links saved in this browser,
+ * including changes made in another tab. The home page drives the badge itself from its list.
+ */
+export function syncNavCount() {
+  const badge = document.getElementById('navLinkCount');
+  if (!badge) return;
+  const render = () => {
+    const n = linkStore.all().length;
+    badge.textContent = String(n);
+    badge.hidden = n === 0;
+  };
+  render();
+  window.addEventListener('blip:links-changed', render);
+  window.addEventListener('storage', (event) => {
+    if (event.key === null || event.key === STORE_KEY) render();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
@@ -215,18 +234,44 @@ export function el(tag, attrs = {}, ...children) {
   return node;
 }
 
-/** Lucide icon placeholder; call refreshIcons() after inserting. */
-export function icon(name, attrs = {}) {
-  return el('i', { 'data-lucide': name, 'aria-hidden': 'true', ...attrs });
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ICON_SPRITE = '/assets/icons.svg';
+
+/**
+ * Icon from the Phosphor sprite (/assets/icons.svg, ids listed in scripts/build-icons.mjs).
+ * Decorative by default (aria-hidden). Pass { label } to make it a labelled image.
+ * icon('copy'), icon('bomb', { class: 'icon icon--lg' })
+ */
+export function icon(name, { label, class: cls = 'icon', ...attrs } = {}) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', cls);
+  svg.setAttribute('focusable', 'false');
+  if (label) {
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', label);
+  } else {
+    svg.setAttribute('aria-hidden', 'true');
+  }
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value !== undefined && value !== null && value !== false) svg.setAttribute(key, String(value));
+  }
+  svg.dataset.icon = name;
+  const use = document.createElementNS(SVG_NS, 'use');
+  use.setAttribute('href', `${ICON_SPRITE}#${name}`);
+  svg.append(use);
+  return svg;
 }
 
-export function refreshIcons(root) {
-  try {
-    window.lucide?.createIcons?.(root ? { root } : undefined);
-  } catch (e) {
-    console.warn('lucide', e);
-  }
+/** Swap the glyph of an icon created by icon() (or static sprite markup) in place. */
+export function setIcon(svg, name) {
+  const use = svg?.querySelector('use');
+  if (!use) return;
+  use.setAttribute('href', `${ICON_SPRITE}#${name}`);
+  svg.dataset.icon = name;
 }
+
+/** Kept for older call sites; sprite icons need no post-processing. */
+export function refreshIcons() {}
 
 let toastRegion = null;
 /** toast('Copied!', { type: 'success' | 'error' | 'info', timeout: 2800 }) */
@@ -235,8 +280,8 @@ export function toast(message, { type = 'info', timeout = 2800 } = {}) {
     toastRegion = el('div', { class: 'toast-region', role: 'status', 'aria-live': 'polite' });
     document.body.append(toastRegion);
   }
-  const glyph = type === 'success' ? '✓' : type === 'error' ? '⚠' : '✦';
-  const node = el('div', { class: `toast toast--${type}` }, el('span', { class: 'toast__icon', 'aria-hidden': 'true' }, glyph), el('span', {}, message));
+  const glyph = type === 'success' ? 'circle-check' : type === 'error' ? 'triangle-alert' : 'info';
+  const node = el('div', { class: `toast toast--${type}` }, icon(glyph), el('span', {}, message));
   toastRegion.append(node);
   const remove = () => {
     node.classList.add('is-leaving');
@@ -286,7 +331,7 @@ export function formatRelative(date, now = Date.now()) {
   return '';
 }
 
-/** "2d 4h", "5m 12s" — for countdowns */
+/** "2d 4h", "5m 12s" (for countdowns) */
 export function formatDuration(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return '0s';
   const s = Math.floor(ms / 1000);
@@ -303,10 +348,9 @@ export function formatDateTime(iso) {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-/** 🇬🇧 from "GB" */
-export function flagEmoji(code) {
-  if (!code || !/^[A-Za-z]{2}$/.test(code)) return '🌐';
-  return String.fromCodePoint(...[...code.toUpperCase()].map((c) => 0x1f1a5 + c.charCodeAt(0)));
+/** Two-letter country code for display pills ("GB"), or "??" when unknown. No emoji flags. */
+export function countryCode(code) {
+  return code && /^[A-Za-z]{2}$/.test(code) ? code.toUpperCase() : '??';
 }
 
 export function hostOf(url) {

@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live dashboard · Blip</title>
+  <meta name="description" content="Live click analytics for your Blip link: visitors, devices, referrers and a world map, updated as clicks land.">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#fbf3df">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/dashboard.css">
+  <!-- The page module comes first so it can show the gate (or the dashboard skeleton) without waiting
+       for the d3 download. It waits for the deferred chart libraries itself before drawing, and loads
+       them again if they failed (dashboard/vendor.js). -->
+  <script type="module" src="/assets/js/dashboard.js"></script>
+  <script src="/vendor/d3.min.js" defer></script>
+  <script src="/vendor/topojson-client.min.js" defer></script>
+</head>
+<body class="dash-page">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="/"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg><span>Home</span></a>
+      <a href="/#my-links"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#list"></use></svg><span>My links</span><span class="nav-count" id="navLinkCount" hidden>0</span></a>
+      <a href="/dashboard.html" id="nav-dashboard" aria-current="page"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg><span>Dashboard</span></a>
+      <a href="/qr.html" id="nav-qr"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg><span>QR studio</span></a>
+    </nav>
+  </header>
+
+  <main id="main" class="container dash" tabindex="-1">
+
+    <!-- Boot: a neutral placeholder until the script knows whether to show the gate or the dashboard -->
+    <section id="view-boot" class="panel boot" aria-label="Loading the dashboard" aria-busy="true">
+      <span class="skeleton caption--corner boot__caption" aria-hidden="true"></span>
+      <div class="boot__body" aria-hidden="true">
+        <div class="skeleton sk-url"></div>
+        <div class="skeleton skeleton--text sk-w-65"></div>
+        <div class="skeleton skeleton--text sk-w-40"></div>
+      </div>
+    </section>
+
+    <!-- Gate: pick a link or paste its manage key -->
+    <section id="view-gate" class="panel gate" aria-labelledby="gate-title" hidden>
+      <p class="caption caption--corner">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#key-round"></use></svg>
+        <span>Private dashboard</span>
+      </p>
+      <div class="gate__intro">
+        <span class="empty__art" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#key-round"></use></svg></span>
+        <div class="gate__copy">
+          <h1 id="gate-title" class="gate__title">Open a live dashboard</h1>
+          <p id="gate-text" class="gate__text">Every Blip link gets its own live analytics. Dashboards are private: your browser keeps the manage key for each link you create.</p>
+        </div>
+      </div>
+
+      <form id="token-form" class="gate__form" novalidate>
+        <div class="field">
+          <label class="label" for="gate-slug">Link slug or short URL</label>
+          <input id="gate-slug" name="slug" class="input" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="summer-sale-2026" maxlength="300" required>
+        </div>
+        <div class="field">
+          <label class="label" for="gate-token">Manage key</label>
+          <input id="gate-token" name="token" class="input mono" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste the manage key from the result card or My links" maxlength="200" required aria-describedby="gate-token-hint">
+          <p id="gate-token-hint" class="hint">It stays in this browser only, so you won't need it again here.</p>
+        </div>
+        <p id="gate-error" class="error-text gate__error" role="alert" hidden></p>
+        <div class="gate__actions">
+          <button id="gate-submit" type="submit" class="btn btn--primary">
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg>
+            <span>Open dashboard</span>
+          </button>
+          <a class="btn btn--ghost" href="/">
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg>
+            <span>Back home</span>
+          </a>
+        </div>
+      </form>
+
+      <div id="gate-links" class="gate__links" hidden>
+        <h2 class="gate__links-title">Links on this device</h2>
+        <ul id="gate-links-list" class="gate__links-list"></ul>
+      </div>
+    </section>
+
+    <!-- Error: the dashboard could not load -->
+    <section id="view-error" class="panel state-panel" aria-labelledby="error-title" hidden>
+      <p class="caption caption--red caption--corner">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#triangle-alert"></use></svg>
+        <span>Connection trouble</span>
+      </p>
+      <span class="empty__art state-panel__art" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#unplug"></use></svg></span>
+      <h1 id="error-title" class="state-panel__title">We couldn't load this dashboard</h1>
+      <p id="error-text" class="state-panel__text"></p>
+      <div class="state-panel__actions">
+        <button id="btn-retry" type="button" class="btn btn--primary">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-cw"></use></svg>
+          <span>Retry</span>
+        </button>
+        <a class="btn btn--ghost" href="/">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg>
+          <span>Back home</span>
+        </a>
+      </div>
+    </section>
+
+    <!-- Dashboard: every section stacks full width in one column -->
+    <div id="view-app" class="dash-app" hidden>
+
+      <!-- 1. Link header -->
+      <section id="link-panel" class="panel link-panel is-loading" aria-labelledby="link-title" aria-busy="true">
+        <p class="caption caption--corner">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg>
+          <span>Live analytics</span>
+        </p>
+
+        <div class="link-panel__skeleton" data-skeleton aria-hidden="true">
+          <div class="link-panel__main">
+            <div class="skeleton sk-url"></div>
+            <div class="skeleton skeleton--text sk-w-55"></div>
+            <div class="sk-row">
+              <div class="skeleton sk-badge"></div>
+              <div class="skeleton sk-badge"></div>
+              <div class="skeleton skeleton--text sk-w-20"></div>
+            </div>
+          </div>
+          <div class="link-panel__side">
+            <div class="skeleton sk-caption"></div>
+            <div class="sk-row">
+              <div class="skeleton sk-btn sk-btn--wide"></div>
+              <div class="skeleton sk-btn"></div>
+              <div class="skeleton sk-btn"></div>
+              <div class="skeleton sk-btn"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="link-panel__body" data-content>
+          <div class="link-panel__main">
+            <h1 id="link-title" class="link-panel__url"><span id="link-short"></span></h1>
+            <p id="link-name" class="link-panel__name" hidden></p>
+            <p class="link-panel__target">
+              <svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#corner-down-right"></use></svg>
+              <span class="visually-hidden">Destination:</span>
+              <a id="link-target" href="/" target="_blank" rel="noopener noreferrer"></a>
+            </p>
+            <div class="link-panel__badges">
+              <span id="link-status" class="badge badge--active">Active</span>
+              <span id="link-domain" class="badge badge--live">Live domain</span>
+              <span id="link-teaser" class="badge badge--teaser" hidden>Teaser</span>
+              <span class="link-panel__created">
+                <svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#clock"></use></svg>
+                <span>Created <time id="link-created"></time></span>
+              </span>
+            </div>
+            <p id="link-working" class="link-panel__working" hidden>
+              <span class="badge badge--vanity">Vanity preview</span>
+              <span>Works right now: <a id="link-working-url" href="/" target="_blank" rel="noopener noreferrer"></a></span>
+            </p>
+            <p id="link-gone" class="notice notice--red link-panel__gone" hidden>
+              <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>
+              <span id="link-gone-text"></span>
+            </p>
+          </div>
+
+          <div class="link-panel__side">
+            <p id="live-indicator" class="caption caption--paper live-caption" data-state="connecting" role="status" aria-live="polite">
+              <span id="live-dot" class="live-dot live-dot--warn" aria-hidden="true"></span>
+              <span id="live-label">Connecting</span>
+            </p>
+            <div class="link-panel__actions">
+              <button id="btn-copy" type="button" class="btn btn--primary">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg>
+                <span>Copy link</span>
+              </button>
+              <a id="btn-open" class="btn btn--sm" href="/" target="_blank" rel="noopener noreferrer">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg>
+                <span>Open</span>
+              </a>
+              <a id="btn-qr" class="btn btn--sm" href="/qr.html">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg>
+                <span>QR studio</span>
+              </a>
+              <a class="btn btn--ghost btn--sm" href="/">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg>
+                <span>Home</span>
+              </a>
+            </div>
+            <p id="open-hint" class="link-panel__hint" hidden>
+              <svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#mouse-pointer-click"></use></svg>
+              <span id="open-hint-text"></span>
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Controls: time range + demo traffic -->
+      <section class="panel panel--tight dash-controls" aria-label="Dashboard controls">
+        <div class="dash-controls__group">
+          <span id="range-label" class="label">Time range</span>
+          <div id="range-control" class="segmented" role="radiogroup" aria-labelledby="range-label">
+            <button type="button" role="radio" aria-checked="false" data-range="24h">24h</button>
+            <button type="button" role="radio" aria-checked="true" data-range="7d">7d</button>
+            <button type="button" role="radio" aria-checked="false" data-range="30d">30d</button>
+            <button type="button" role="radio" aria-checked="false" data-range="all">All</button>
+          </div>
+        </div>
+        <div id="demo-controls" class="dash-controls__group dash-controls__demo" hidden>
+          <span id="sim-label" class="label">Demo traffic</span>
+          <div id="sim-count" class="segmented" role="radiogroup" aria-labelledby="sim-label">
+            <button type="button" role="radio" aria-checked="false" data-count="10">10</button>
+            <button type="button" role="radio" aria-checked="true" data-count="25">25</button>
+            <button type="button" role="radio" aria-checked="false" data-count="50">50</button>
+          </div>
+          <button id="btn-simulate" type="button" class="btn btn--blue btn--sm">
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#flask-conical"></use></svg>
+            <span>Simulate traffic</span>
+          </button>
+        </div>
+      </section>
+
+      <div id="sim-notice" class="sim-notice" hidden>
+        <p class="caption caption--blue sim-notice__tag">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#flask-conical"></use></svg>
+          <span id="sim-chip-text">Includes 0 simulated clicks</span>
+        </p>
+        <p class="sim-notice__text">Simulated clicks are demo data for previewing the dashboard. They are labelled in the feed and never count toward the link's click limit.</p>
+        <button id="btn-clear-sim" type="button" class="btn btn--sm sim-notice__clear">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#eraser"></use></svg>
+          <span>Clear simulated</span>
+        </button>
+      </div>
+
+      <div id="stats-error" class="notice notice--red stats-error" role="alert" hidden>
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#triangle-alert"></use></svg>
+        <p id="stats-error-text" class="stats-error__text"></p>
+        <button id="stats-retry" type="button" class="btn btn--sm">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-cw"></use></svg>
+          <span>Retry</span>
+        </button>
+      </div>
+
+      <section id="empty-banner" class="panel empty-banner" aria-labelledby="empty-title" hidden>
+        <span class="empty__art" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#radio"></use></svg></span>
+        <div class="empty-banner__body">
+          <h2 id="empty-title" class="empty-banner__title">No clicks yet</h2>
+          <p id="empty-text" class="empty-banner__text">Share your link, or simulate some traffic to preview the dashboard.</p>
+        </div>
+        <div class="empty-banner__actions">
+          <button id="empty-copy" type="button" class="btn btn--sm">
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg>
+            <span>Copy link</span>
+          </button>
+          <button id="empty-simulate" type="button" class="btn btn--blue btn--sm" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#flask-conical"></use></svg>
+            <span>Simulate traffic</span>
+          </button>
+          <button id="empty-all" type="button" class="btn btn--sm" hidden>
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#calendar-range"></use></svg>
+            <span>Show all time</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- 3. KPI strip: one panel, four cells -->
+      <section class="panel kpi-strip" aria-label="Key numbers">
+        <div id="kpi-clicks" class="kpi is-loading" aria-busy="true">
+          <h2 id="kpi-clicks-label" class="kpi__label">Clicks</h2>
+          <p class="kpi__value"><span id="kpi-clicks-value" class="kpi__num" aria-describedby="kpi-clicks-label">0</span><span class="skeleton kpi__sk" aria-hidden="true"></span></p>
+          <p id="kpi-clicks-sub" class="kpi__sub"></p>
+        </div>
+        <div id="kpi-unique" class="kpi is-loading" aria-busy="true">
+          <h2 id="kpi-unique-label" class="kpi__label">Unique visitors</h2>
+          <p class="kpi__value"><span id="kpi-unique-value" class="kpi__num" aria-describedby="kpi-unique-label">0</span><span class="skeleton kpi__sk" aria-hidden="true"></span></p>
+          <p id="kpi-unique-sub" class="kpi__sub"></p>
+        </div>
+        <div id="kpi-24h" class="kpi is-loading" aria-busy="true">
+          <h2 id="kpi-24h-label" class="kpi__label">Last 24 hours</h2>
+          <p class="kpi__value"><span id="kpi-24h-value" class="kpi__num" aria-describedby="kpi-24h-label">0</span><span class="skeleton kpi__sk" aria-hidden="true"></span></p>
+          <p id="kpi-24h-sub" class="kpi__sub">Rolling window, updates live</p>
+        </div>
+        <div id="kpi-life" class="kpi kpi--life is-loading" aria-busy="true">
+          <h2 id="kpi-life-label" class="kpi__label">Lifetime</h2>
+          <p class="kpi__value"><span id="kpi-life-value" class="kpi__num" aria-describedby="kpi-life-label">Forever</span><span class="skeleton kpi__sk" aria-hidden="true"></span></p>
+          <p id="kpi-life-sub" class="kpi__sub"></p>
+          <div id="kpi-life-meter" class="meter" role="progressbar" aria-labelledby="kpi-life-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><span id="kpi-life-meter-fill" class="meter__fill"></span></div>
+        </div>
+        <p id="kpi-bots" class="kpi-strip__foot is-loading" aria-busy="true">
+          <svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#shield-ban"></use></svg>
+          <span id="kpi-bots-label" class="kpi-strip__foot-label">Bots &amp; blocked</span>
+          <strong id="kpi-bots-value" class="kpi__num">0</strong>
+          <span class="skeleton kpi__sk kpi__sk--inline" aria-hidden="true"></span>
+          <span id="kpi-bots-sub" class="kpi-strip__foot-sub"></span>
+        </p>
+      </section>
+
+      <!-- 4. Clicks over time -->
+      <section id="sec-ts" class="panel dash-section is-loading" aria-labelledby="ts-title" aria-busy="true">
+        <header class="section-head">
+          <span class="section-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#chart-area"></use></svg></span>
+          <div class="section-head__titles">
+            <h2 id="ts-title" class="section-head__title">Clicks over time</h2>
+            <p id="ts-sub" class="section-head__sub">Daily, last 7 days</p>
+          </div>
+          <button id="ts-table-toggle" type="button" class="btn btn--ghost btn--sm section-head__tool ts-toggle" aria-pressed="false" aria-controls="ts-table-wrap ts-chart" aria-label="Show clicks as a table">
+            <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#table"></use></svg>
+            <span>Table</span>
+          </button>
+        </header>
+        <div class="sk-chart" data-skeleton aria-hidden="true">
+          <div class="skeleton sk-chart__block"></div>
+        </div>
+        <div data-content>
+          <div id="ts-chart" class="chart chart--ts"></div>
+          <div id="ts-table-wrap" class="table-wrap" hidden>
+            <table class="data-table">
+              <caption id="ts-caption" class="visually-hidden">Clicks per period</caption>
+              <thead><tr><th scope="col">Period</th><th scope="col" class="num">Clicks</th></tr></thead>
+              <tbody id="ts-table-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. World map -->
+      <section id="sec-map" class="panel dash-section is-loading" aria-labelledby="map-title" aria-busy="true">
+        <header class="section-head">
+          <span class="section-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#earth"></use></svg></span>
+          <div class="section-head__titles">
+            <h2 id="map-title" class="section-head__title">Where clicks come from</h2>
+            <p id="map-sub" class="section-head__sub">Countries shaded by clicks, live clicks pop up as they land</p>
+          </div>
+        </header>
+        <div class="sk-map" data-skeleton aria-hidden="true">
+          <div class="skeleton sk-map__block"></div>
+          <div class="skeleton skeleton--text sk-w-45"></div>
+        </div>
+        <div data-content>
+          <div id="map" class="chart chart--map"></div>
+          <div id="map-legend" class="map-legend">
+            <div class="map-legend__group">
+              <span class="map-legend__title">Clicks per country</span>
+              <ul id="map-legend-scale" class="map-legend__scale"></ul>
+            </div>
+            <ul class="map-legend__keys">
+              <li class="map-legend__key">
+                <svg class="map-key" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><circle class="map-key__city" cx="9" cy="9" r="5"></circle></svg>
+                <span>City (size shows clicks)</span>
+              </li>
+              <li class="map-legend__key">
+                <svg class="map-key" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><polygon class="map-key__hit" points="9,1.4 10.37,3.98 13.1,2.31 12.8,5.35 15.99,4.74 14.17,7.33 16.6,9 14.17,10.67 15.99,13.26 12.8,12.65 13.1,15.69 10.37,14.02 9,16.6 7.63,14.02 4.9,15.69 5.2,12.65 2.01,13.26 3.83,10.67 1.4,9 3.83,7.33 2.01,4.74 5.2,5.35 4.9,2.31 7.63,3.98"></polygon></svg>
+                <span>Live click</span>
+              </li>
+              <li class="map-legend__key">
+                <svg class="map-key" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><polygon class="map-key__hit map-key__hit--blocked" points="9,1.4 10.37,3.98 13.1,2.31 12.8,5.35 15.99,4.74 14.17,7.33 16.6,9 14.17,10.67 15.99,13.26 12.8,12.65 13.1,15.69 10.37,14.02 9,16.6 7.63,14.02 4.9,15.69 5.2,12.65 2.01,13.26 3.83,10.67 1.4,9 3.83,7.33 2.01,4.74 5.2,5.35 4.9,2.31 7.63,3.98"></polygon></svg>
+                <span>Blocked</span>
+              </li>
+              <li class="map-legend__key">
+                <svg class="map-key" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><polygon class="map-key__hit map-key__hit--bot" points="9,1.4 10.37,3.98 13.1,2.31 12.8,5.35 15.99,4.74 14.17,7.33 16.6,9 14.17,10.67 15.99,13.26 12.8,12.65 13.1,15.69 10.37,14.02 9,16.6 7.63,14.02 4.9,15.69 5.2,12.65 2.01,13.26 3.83,10.67 1.4,9 3.83,7.33 2.01,4.74 5.2,5.35 4.9,2.31 7.63,3.98"></polygon></svg>
+                <span>Bot</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6. Breakdown: one panel, five tabs of horizontal bars -->
+      <section id="sec-breakdown" class="panel dash-section is-loading" aria-labelledby="bd-title" aria-busy="true">
+        <header class="section-head">
+          <span class="section-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#chart-bar"></use></svg></span>
+          <div class="section-head__titles">
+            <h2 id="bd-title" class="section-head__title">Breakdown</h2>
+            <p id="bd-sub" class="section-head__sub">Who clicked, on what, and from where</p>
+          </div>
+        </header>
+        <div id="bd-tabs" class="tabs" role="tablist" aria-labelledby="bd-title">
+          <button id="tab-devices" type="button" role="tab" class="tabs__tab" aria-selected="true" aria-controls="panel-devices" data-tab="devices">Devices</button>
+          <button id="tab-browsers" type="button" role="tab" class="tabs__tab" aria-selected="false" aria-controls="panel-browsers" data-tab="browsers" tabindex="-1">Browsers</button>
+          <button id="tab-os" type="button" role="tab" class="tabs__tab" aria-selected="false" aria-controls="panel-os" data-tab="os" tabindex="-1">Operating systems</button>
+          <button id="tab-referrers" type="button" role="tab" class="tabs__tab" aria-selected="false" aria-controls="panel-referrers" data-tab="referrers" tabindex="-1">Referrers</button>
+          <button id="tab-countries" type="button" role="tab" class="tabs__tab" aria-selected="false" aria-controls="panel-countries" data-tab="countries" tabindex="-1">Countries</button>
+        </div>
+        <ol class="sk-bars" data-skeleton aria-hidden="true">
+          <li class="sk-bar"><div class="skeleton sk-bar__lead"></div><div class="sk-bar__main"><div class="skeleton skeleton--text sk-w-35"></div><div class="skeleton sk-bar__track sk-w-90"></div></div></li>
+          <li class="sk-bar"><div class="skeleton sk-bar__lead"></div><div class="sk-bar__main"><div class="skeleton skeleton--text sk-w-25"></div><div class="skeleton sk-bar__track sk-w-65"></div></div></li>
+          <li class="sk-bar"><div class="skeleton sk-bar__lead"></div><div class="sk-bar__main"><div class="skeleton skeleton--text sk-w-30"></div><div class="skeleton sk-bar__track sk-w-40"></div></div></li>
+          <li class="sk-bar"><div class="skeleton sk-bar__lead"></div><div class="sk-bar__main"><div class="skeleton skeleton--text sk-w-20"></div><div class="skeleton sk-bar__track sk-w-25"></div></div></li>
+        </ol>
+        <div id="panel-devices" class="tabpanel" role="tabpanel" aria-labelledby="tab-devices" tabindex="0" data-content>
+          <ol id="devices-list" class="hbars" aria-label="Clicks by device"></ol>
+          <p id="devices-empty" class="mini-empty" hidden>No device data yet. Device types appear as visitors arrive.</p>
+        </div>
+        <div id="panel-browsers" class="tabpanel" role="tabpanel" aria-labelledby="tab-browsers" tabindex="0" data-content hidden>
+          <ol id="browsers-list" class="hbars" aria-label="Clicks by browser"></ol>
+          <p id="browsers-empty" class="mini-empty" hidden>No browser data yet.</p>
+        </div>
+        <div id="panel-os" class="tabpanel" role="tabpanel" aria-labelledby="tab-os" tabindex="0" data-content hidden>
+          <ol id="os-list" class="hbars" aria-label="Clicks by operating system"></ol>
+          <p id="os-empty" class="mini-empty" hidden>No platform data yet.</p>
+        </div>
+        <div id="panel-referrers" class="tabpanel" role="tabpanel" aria-labelledby="tab-referrers" tabindex="0" data-content hidden>
+          <ol id="ref-list" class="hbars" aria-label="Clicks by referrer"></ol>
+          <p id="ref-empty" class="mini-empty" hidden>No referrers yet. Direct visits and the sites that sent people here show up as they arrive.</p>
+        </div>
+        <div id="panel-countries" class="tabpanel" role="tabpanel" aria-labelledby="tab-countries" tabindex="0" data-content hidden>
+          <ol id="countries-list" class="hbars hbars--scroll" aria-label="Clicks by country"></ol>
+          <p id="countries-empty" class="mini-empty" hidden>No locations yet. Countries appear as visitors arrive.</p>
+        </div>
+      </section>
+
+      <!-- 7. Live feed -->
+      <section id="sec-feed" class="panel dash-section is-loading" aria-labelledby="feed-title" aria-busy="true">
+        <header class="section-head">
+          <span class="section-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#radio"></use></svg></span>
+          <div class="section-head__titles">
+            <h2 id="feed-title" class="section-head__title">Live feed</h2>
+            <p class="section-head__sub">Every visit as it happens, newest first</p>
+          </div>
+          <span id="feed-count" class="badge badge--neutral section-head__tool feed-count">0</span>
+          <span class="skeleton section-head__tool feed-count-sk" aria-hidden="true"></span>
+        </header>
+        <ol class="sk-feed" data-skeleton aria-hidden="true">
+          <li class="sk-feed__row"><div class="skeleton sk-cc"></div><div class="sk-feed__main"><div class="skeleton skeleton--text sk-w-40"></div><div class="skeleton skeleton--text sk-w-60"></div></div><div class="skeleton sk-badge"></div></li>
+          <li class="sk-feed__row"><div class="skeleton sk-cc"></div><div class="sk-feed__main"><div class="skeleton skeleton--text sk-w-30"></div><div class="skeleton skeleton--text sk-w-55"></div></div><div class="skeleton sk-badge"></div></li>
+          <li class="sk-feed__row"><div class="skeleton sk-cc"></div><div class="sk-feed__main"><div class="skeleton skeleton--text sk-w-45"></div><div class="skeleton skeleton--text sk-w-50"></div></div><div class="skeleton sk-badge"></div></li>
+        </ol>
+        <div class="feed-scroll" data-content>
+          <ol id="feed" class="feed" role="log" aria-labelledby="feed-title" aria-relevant="additions"></ol>
+          <div id="feed-empty" class="empty feed-empty">
+            <span class="empty__art" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#radio"></use></svg></span>
+            <p>Waiting for the first click. Visits show up here the moment they land.</p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <footer class="site-footer container">
+    <div class="footer-inner">
+      <p class="footer-made">Made with <a href="/">Blip</a>. Tiny links with big personality.</p>
+      <p class="footer-privacy"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#shield-check"></use></svg><span>We never store IP addresses. Visitors are counted with salted, one-way hashes.</span></p>
+    </div>
+  </footer>
+
+  <dialog id="confirm-dialog" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <form method="dialog">
+      <div class="modal__body">
+        <h2 id="confirm-title" class="modal__title">Clear simulated clicks?</h2>
+        <p id="confirm-text" class="modal__text">Real clicks stay untouched.</p>
+      </div>
+      <div class="modal__actions">
+        <button type="submit" value="cancel" class="btn btn--ghost" autofocus>Cancel</button>
+        <button id="confirm-ok" type="submit" value="confirm" class="btn btn--danger">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#eraser"></use></svg>
+          <span id="confirm-ok-label">Clear simulated</span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

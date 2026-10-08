@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blip · Tiny links with big personality</title>
+  <meta name="description" content="Blip is a playful URL shortener: word slugs, vanity domains, teaser pages, self-destructing links, live click maps and styled QR codes.">
+  <meta name="theme-color" content="#fbf3df">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/app.css">
+  <script src="/vendor/qr-code-styling.js" defer></script>
+  <script type="module" src="/assets/js/app.js"></script>
+</head>
+<body class="home">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+
+  <a class="skip-link" href="#targetUrl">Skip to the link box</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="/" aria-current="page"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#house"></use></svg><span>Home</span></a>
+      <a href="/#my-links"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#list"></use></svg><span>My links</span><span class="nav-count" id="navLinkCount" hidden>0</span></a>
+      <a href="/dashboard.html" id="nav-dashboard"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg><span>Dashboard</span></a>
+      <a href="/qr.html" id="nav-qr"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg><span>QR studio</span></a>
+    </nav>
+  </header>
+
+  <main id="main" class="container home-main">
+    <!-- Splash panel: the one place on the page with spinning rays -->
+    <section class="hero panel" id="create" aria-labelledby="heroTitle">
+      <div class="rays" aria-hidden="true"></div>
+      <p class="caption caption--ink caption--corner hero__kicker">Tiny links with big personality</p>
+      <div class="hero__inner">
+        <h1 class="hero__title" id="heroTitle">Give your links superpowers</h1>
+        <p class="hero__lede">Paste a long URL and Blip gives it a short, memorable name, with optional teaser pages, self-destruct timers, styled QR codes and a live click dashboard.</p>
+      </div>
+    </section>
+
+    <form class="create" id="shortenForm" novalidate aria-labelledby="shortenerTitle">
+      <h2 class="visually-hidden" id="shortenerTitle">Shorten a link</h2>
+
+      <div class="panel shortener">
+        <label class="caption caption--corner" for="targetUrl">Paste a long link</label>
+
+        <div class="config-warning" id="configWarning" role="alert" hidden>
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#cloud-off"></use></svg>
+          <p id="configWarningText">We can't reach the Blip server right now, so new links can't be created yet.</p>
+          <button type="button" class="btn btn--sm" id="configRetry"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#refresh-cw"></use></svg>Retry</button>
+        </div>
+
+        <div class="shortener__row">
+          <div class="url-field">
+            <span class="url-field__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#link"></use></svg></span>
+            <input class="input input--lg url-field__input" id="targetUrl" name="targetUrl" type="text" inputmode="url" autocomplete="url" autocapitalize="off" spellcheck="false" maxlength="2048" placeholder="example.com/a-really-long-page" aria-describedby="targetUrlError targetUrlHint">
+            <kbd class="kbd url-field__kbd" aria-hidden="true">/</kbd>
+          </div>
+          <button class="btn btn--primary btn--lg shortener__submit" id="shortenBtn" type="submit"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#zap"></use></svg><span>Shorten</span></button>
+        </div>
+        <p class="error-text field-error" id="targetUrlError" hidden></p>
+        <p class="visually-hidden" id="targetUrlHint">Press Enter to shorten. Press the slash key anywhere on the page to jump back here.</p>
+
+        <div class="active-options">
+          <div class="chip-group summary-chips" id="summaryChips" role="group" aria-label="Active options" hidden></div>
+          <p class="summary-hint" id="summaryHint"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#info"></use></svg><span>No extras yet: you'll get a fun word slug on this server's own domain.</span></p>
+        </div>
+      </div>
+
+      <section class="features" aria-labelledby="featuresTitle">
+        <div class="features__head">
+          <h2 class="caption features__title" id="featuresTitle">Add some personality</h2>
+          <p class="features__hint">Tap a feature to set it up. Mix and match as many as you like.</p>
+        </div>
+
+        <div class="feature-grid" id="featureGrid" role="group" aria-labelledby="featuresTitle">
+          <button type="button" class="feature-btn" id="featureBtn-slug" data-feature="slug" aria-pressed="false" aria-expanded="false" aria-controls="panel-slug">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#pencil-line"></use></svg></span>
+            <span class="feature-btn__label">Custom slug</span>
+            <span class="feature-btn__desc">Words people remember</span>
+            <span class="feature-btn__state" id="featureState-slug">Word slug</span>
+          </button>
+          <button type="button" class="feature-btn" id="featureBtn-domain" data-feature="domain" aria-pressed="false" aria-expanded="false" aria-controls="panel-domain">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#globe"></use></svg></span>
+            <span class="feature-btn__label">Playful domain</span>
+            <span class="feature-btn__desc">Vanity domains and ideas</span>
+            <span class="feature-btn__state" id="featureState-domain">Default</span>
+          </button>
+          <button type="button" class="feature-btn" id="featureBtn-teaser" data-feature="teaser" aria-pressed="false" aria-expanded="false" aria-controls="panel-teaser">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#clapperboard"></use></svg></span>
+            <span class="feature-btn__label">Teaser page</span>
+            <span class="feature-btn__desc">Countdown, trivia or brand</span>
+            <span class="feature-btn__state" id="featureState-teaser">Instant</span>
+          </button>
+          <button type="button" class="feature-btn" id="featureBtn-destruct" data-feature="destruct" aria-pressed="false" aria-expanded="false" aria-controls="panel-destruct">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg></span>
+            <span class="feature-btn__label">Self-destruct</span>
+            <span class="feature-btn__desc">Expire by time or clicks</span>
+            <span class="feature-btn__state" id="featureState-destruct">Never</span>
+          </button>
+          <button type="button" class="feature-btn" id="featureBtn-analytics" data-feature="analytics" aria-pressed="false" aria-expanded="false" aria-controls="panel-analytics">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#activity"></use></svg></span>
+            <span class="feature-btn__label">Live analytics</span>
+            <span class="feature-btn__desc">Real-time map and devices</span>
+            <span class="feature-btn__state" id="featureState-analytics">Always on</span>
+          </button>
+          <button type="button" class="feature-btn" id="featureBtn-qr" data-feature="qr" aria-pressed="false" aria-expanded="false" aria-controls="panel-qr">
+            <span class="feature-btn__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg></span>
+            <span class="feature-btn__label">QR studio</span>
+            <span class="feature-btn__desc">Styled, branded codes</span>
+            <span class="feature-btn__state" id="featureState-qr">Hero look</span>
+          </button>
+        </div>
+      </section>
+
+      <div class="feature-panels">
+        <!-- 1. Custom slug -->
+        <section class="feature-panel" id="panel-slug" data-feature="slug" aria-labelledby="panelTitle-slug" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#pencil-line"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-slug">Custom slug</h3>
+                  <p class="panel-head__desc">Swap random gibberish for words people actually remember.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm panel-reset" data-reset="slug" aria-label="Reset custom slug options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span class="panel-reset__text">Reset</span></button>
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="slug" aria-label="Close custom slug options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <div class="field">
+                <label class="label" for="slugInput">Your slug</label>
+                <div class="input-group slug-group" id="slugGroup">
+                  <span class="input-group__prefix" id="slugPrefix">blip.to/</span>
+                  <input class="input" id="slugInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="120" placeholder="summer-sale-2026" aria-describedby="slugPreview slugStatus" data-autofocus>
+                  <span class="input-group__suffix slug-state" id="slugState" data-state="idle">
+                    <span class="slug-state__icon slug-state__icon--checking" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#loader-circle"></use></svg></span>
+                    <span class="slug-state__icon slug-state__icon--ok" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#circle-check"></use></svg></span>
+                    <span class="slug-state__icon slug-state__icon--bad" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#circle-x"></use></svg></span>
+                    <button type="button" class="slug-clear" id="slugClear" aria-label="Clear slug" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                  </span>
+                </div>
+                <div class="slug-meta">
+                  <p class="slug-preview" id="slugPreview" hidden></p>
+                  <p class="slug-status" id="slugStatus" aria-live="polite">Leave it blank and we'll invent a fun one, like <span class="mono">brave-otter</span>.</p>
+                </div>
+              </div>
+
+              <div class="slug-actions">
+                <button type="button" class="btn btn--sm" id="wordSlugBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#dices"></use></svg>Word slug</button>
+                <button type="button" class="btn btn--sm" id="suggestSlugsBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#lightbulb"></use></svg>Suggest from phrase</button>
+              </div>
+
+              <div class="suggestions" id="slugSuggestionsWrap" hidden>
+                <p class="hint" id="slugSuggestHint" aria-live="polite"></p>
+                <div class="chip-group" id="slugSuggestions"></div>
+              </div>
+
+              <div class="panel-grid">
+                <div class="field">
+                  <label class="label" for="titleInput">Title <span class="label__optional">(optional)</span></label>
+                  <input class="input" id="titleInput" type="text" maxlength="120" autocomplete="off" placeholder="Summer sale landing page" aria-describedby="titleHint titleError">
+                  <p class="hint" id="titleHint">Shown on teaser pages and in My links. Also feeds phrase suggestions.</p>
+                  <p class="error-text" id="titleError" hidden></p>
+                </div>
+                <div class="field">
+                  <span class="label" id="slugStyleLabel">If left blank, use</span>
+                  <div class="segmented" id="slugStyle" role="radiogroup" aria-labelledby="slugStyleLabel">
+                    <button type="button" role="radio" aria-checked="true" data-value="words">Words <span class="seg-sample">brave-otter</span></button>
+                    <button type="button" role="radio" aria-checked="false" data-value="random">Random <span class="seg-sample">x8k9pq2</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. Playful domain -->
+        <section class="feature-panel" id="panel-domain" data-feature="domain" aria-labelledby="panelTitle-domain" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#globe"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-domain">Playful domain</h3>
+                  <p class="panel-head__desc">A quirky domain makes the short link itself spark curiosity.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm panel-reset" data-reset="domain" aria-label="Reset playful domain options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span class="panel-reset__text">Reset</span></button>
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="domain" aria-label="Close playful domain options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <div class="field">
+                <span class="label" id="domainLabel">Pick a domain</span>
+                <div class="chip-group domain-chips" id="domainChips" role="radiogroup" aria-labelledby="domainLabel" aria-describedby="domainNote"></div>
+                <p class="hint domain-note" id="domainNote"></p>
+                <p class="error-text" id="domainError" hidden></p>
+              </div>
+
+              <hr class="divider divider--dashed">
+
+              <div class="idea-gen">
+                <h4 class="idea-gen__title"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#lightbulb"></use></svg>Domain idea generator</h4>
+                <p class="hint idea-gen__hint">Domain hacks, short picks and playful twists. We can't buy domains for you: click an idea to copy it, then check it with a registrar.</p>
+                <div class="idea-gen__form">
+                  <label class="visually-hidden" for="domainKeyword">Keyword for domain ideas</label>
+                  <input class="input" id="domainKeyword" type="text" maxlength="40" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Try delicious, catly or your brand" aria-describedby="domainKeywordError">
+                  <button type="button" class="btn btn--blue" id="domainIdeasBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#lightbulb"></use></svg>Generate</button>
+                </div>
+                <p class="error-text" id="domainKeywordError" hidden></p>
+                <p class="hint" id="domainIdeasStatus" aria-live="polite"></p>
+                <ul class="idea-list" id="domainIdeas"></ul>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. Teaser page -->
+        <section class="feature-panel" id="panel-teaser" data-feature="teaser" aria-labelledby="panelTitle-teaser" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#clapperboard"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-teaser">Teaser page</h3>
+                  <p class="panel-head__desc">Greet visitors with a countdown, a fun fact or your message before they head off.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm panel-reset" data-reset="teaser" aria-label="Reset teaser page options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span class="panel-reset__text">Reset</span></button>
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="teaser" aria-label="Close teaser page options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <div class="teaser-layout">
+                <div class="teaser-controls">
+                  <label class="switch teaser-switch">
+                    <input type="checkbox" id="teaserEnabled" data-autofocus>
+                    <span class="switch__track" aria-hidden="true"></span>
+                    <span>Show a teaser before redirecting</span>
+                  </label>
+
+                  <div class="field">
+                    <span class="label" id="teaserStyleLabel">Style</span>
+                    <div class="segmented" id="teaserStyle" role="radiogroup" aria-labelledby="teaserStyleLabel">
+                      <button type="button" role="radio" aria-checked="true" data-value="countdown"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#hourglass"></use></svg>Countdown</button>
+                      <button type="button" role="radio" aria-checked="false" data-value="trivia"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#circle-question-mark"></use></svg>Trivia</button>
+                      <button type="button" role="radio" aria-checked="false" data-value="brand"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#megaphone"></use></svg>Brand message</button>
+                    </div>
+                  </div>
+
+                  <div class="field">
+                    <div class="field-row">
+                      <label class="label" for="teaserSeconds">Seconds before forwarding</label>
+                      <output class="range-out" id="teaserSecondsOut" for="teaserSeconds">5s</output>
+                    </div>
+                    <input class="range" id="teaserSeconds" type="range" min="3" max="15" step="1" value="5">
+                  </div>
+
+                  <div class="field" id="teaserMessageField" hidden>
+                    <div class="field-row">
+                      <label class="label" for="teaserMessage">Brand message <span class="req">required</span></label>
+                      <span class="counter" id="teaserMessageCount">0/280</span>
+                    </div>
+                    <textarea class="textarea" id="teaserMessage" maxlength="280" rows="3" placeholder="Summer sale: 30% off everything this week!" aria-describedby="teaserMessageError"></textarea>
+                    <p class="error-text" id="teaserMessageError" hidden></p>
+                  </div>
+
+                  <div class="field">
+                    <span class="label" id="teaserThemeLabel">Theme</span>
+                    <div class="theme-swatches" id="teaserThemes" role="radiogroup" aria-labelledby="teaserThemeLabel">
+                      <button type="button" role="radio" class="theme-swatch" data-value="hero" aria-checked="true"><span class="theme-swatch__chip" aria-hidden="true">Aa</span><span class="theme-swatch__label">Hero</span></button>
+                      <button type="button" role="radio" class="theme-swatch" data-value="caption" aria-checked="false"><span class="theme-swatch__chip" aria-hidden="true">Aa</span><span class="theme-swatch__label">Caption</span></button>
+                      <button type="button" role="radio" class="theme-swatch" data-value="noir" aria-checked="false"><span class="theme-swatch__chip" aria-hidden="true">Aa</span><span class="theme-swatch__label">Noir</span></button>
+                      <button type="button" role="radio" class="theme-swatch" data-value="sky" aria-checked="false"><span class="theme-swatch__chip" aria-hidden="true">Aa</span><span class="theme-swatch__label">Sky</span></button>
+                      <button type="button" role="radio" class="theme-swatch" data-value="paper" aria-checked="false"><span class="theme-swatch__chip" aria-hidden="true">Aa</span><span class="theme-swatch__label">Paper</span></button>
+                    </div>
+                  </div>
+                </div>
+
+                <figure class="teaser-figure">
+                  <div class="teaser-preview" id="teaserPreview" data-theme="hero" data-style="countdown" data-enabled="false" aria-hidden="true">
+                    <div class="tp-dots halftone"></div>
+                    <div class="burst tp-burst"><span class="burst__inner" id="teaserPreviewCount">5</span></div>
+                    <div class="tp-content">
+                      <p class="tp-kicker" id="teaserPreviewKicker">Taking you to</p>
+                      <p class="tp-main" id="teaserPreviewMain">your-site.com</p>
+                      <p class="tp-dest" id="teaserPreviewDest"></p>
+                    </div>
+                    <div class="tp-actions"><span class="tp-btn tp-btn--go">Go now</span><span class="tp-btn">Cancel</span></div>
+                    <div class="tp-off halftone"><span class="caption caption--ink"><svg class="icon" focusable="false"><use href="/assets/icons.svg#zap"></use></svg>Teaser off: instant redirect</span></div>
+                  </div>
+                  <figcaption class="teaser-caption" id="teaserPreviewCaption">Live preview of what visitors see</figcaption>
+                </figure>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4. Self-destruct -->
+        <section class="feature-panel" id="panel-destruct" data-feature="destruct" aria-labelledby="panelTitle-destruct" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-destruct">Self-destruct</h3>
+                  <p class="panel-head__desc">Secret links, flash sales, one-time invites: let it vanish on schedule.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm panel-reset" data-reset="destruct" aria-label="Reset self-destruct options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span class="panel-reset__text">Reset</span></button>
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="destruct" aria-label="Close self-destruct options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <div class="field">
+                <span class="label" id="destructLabel">When should it vanish?</span>
+                <div class="preset-grid" id="destructPresets" role="radiogroup" aria-labelledby="destructLabel">
+                  <button type="button" role="radio" class="preset" data-value="never" aria-checked="true" data-autofocus><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#infinity"></use></svg></span><span class="preset__text"><span class="preset__title">Never</span><span class="preset__sub">Lives on</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="click1" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#flame"></use></svg></span><span class="preset__text"><span class="preset__title">After 1 click</span><span class="preset__sub">Burn after reading</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="click10" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#mouse-pointer-click"></use></svg></span><span class="preset__text"><span class="preset__title">After 10 clicks</span><span class="preset__sub">First ten visitors</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="hour1" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#hourglass"></use></svg></span><span class="preset__text"><span class="preset__title">1 hour</span><span class="preset__sub">Flash link</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="day1" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#timer"></use></svg></span><span class="preset__text"><span class="preset__title">24 hours</span><span class="preset__sub">Daily drop</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="week1" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#calendar-clock"></use></svg></span><span class="preset__text"><span class="preset__title">7 days</span><span class="preset__sub">Week-long promo</span></span></button>
+                  <button type="button" role="radio" class="preset" data-value="custom" aria-checked="false"><span class="preset__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#sliders-horizontal"></use></svg></span><span class="preset__text"><span class="preset__title">Custom</span><span class="preset__sub">Date, clicks or both</span></span></button>
+                </div>
+              </div>
+
+              <div class="destruct-custom" id="destructCustom" hidden>
+                <div class="field">
+                  <label class="label" for="destructAt">Vanish on <span class="label__optional">(your local time)</span></label>
+                  <input class="input" id="destructAt" type="datetime-local" aria-describedby="destructAtError">
+                  <p class="error-text" id="destructAtError" hidden></p>
+                </div>
+                <div class="field">
+                  <label class="label" for="destructClicks">Or after this many clicks</label>
+                  <input class="input" id="destructClicks" type="number" min="1" max="1000000" step="1" inputmode="numeric" placeholder="25" aria-describedby="destructClicksError">
+                  <p class="error-text" id="destructClicksError" hidden></p>
+                </div>
+              </div>
+
+              <div class="destruct-summary" id="destructSummaryBox" data-armed="false">
+                <span class="destruct-summary__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg></span>
+                <p id="destructSummary" aria-live="polite">Lives forever, or until you hit Destroy now.</p>
+              </div>
+              <p class="hint destruct-note">Expired links show a playful “this link has self-destructed” page instead of your destination. Link previews from chat apps never use up clicks.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 5. Live analytics -->
+        <section class="feature-panel" id="panel-analytics" data-feature="analytics" aria-labelledby="panelTitle-analytics" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#activity"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-analytics">Live analytics</h3>
+                  <p class="panel-head__desc">Always on. Every link gets its own real-time dashboard.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="analytics" aria-label="Close live analytics info"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <p class="analytics-lede">There's nothing to switch on. Open a link's dashboard to watch visits arrive as they happen.</p>
+              <dl class="facts">
+                <div class="facts__item"><dt>Real-time feed</dt><dd>Each click appears the moment it lands, along with blocked visits to expired links.</dd></div>
+                <div class="facts__item"><dt>World map</dt><dd>The countries and cities your link reaches, shaded by how many clicks came from each.</dd></div>
+                <div class="facts__item"><dt>Devices and sources</dt><dd>Phones, browsers, operating systems and the sites that sent each visitor.</dd></div>
+                <div class="facts__item"><dt>Privacy first</dt><dd>Unique visitors are counted with salted one-way hashes. IP addresses are never stored.</dd></div>
+              </dl>
+              <div class="analytics-cta" id="analyticsCta"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. QR studio -->
+        <section class="feature-panel" id="panel-qr" data-feature="qr" aria-labelledby="panelTitle-qr" hidden>
+          <div class="feature-panel__inner">
+            <div class="panel feature-panel__card">
+              <header class="panel-head">
+                <span class="panel-head__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg></span>
+                <div class="panel-head__text">
+                  <h3 class="panel-head__title" id="panelTitle-qr">QR studio</h3>
+                  <p class="panel-head__desc">Every link ships with a styled QR code for flyers, slides and stickers.</p>
+                </div>
+                <div class="panel-head__actions">
+                  <button type="button" class="btn btn--ghost btn--sm panel-reset" data-reset="qr" aria-label="Reset QR studio options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg><span class="panel-reset__text">Reset</span></button>
+                  <button type="button" class="btn btn--ghost btn--sm btn--icon" data-close="qr" aria-label="Close QR studio options"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg></button>
+                </div>
+              </header>
+
+              <div class="qr-layout">
+                <figure class="qr-preview">
+                  <div class="qr-preview__stage" id="qrPanelPreview"><span class="skeleton qr-preview__skeleton" aria-hidden="true"></span></div>
+                  <figcaption class="qr-preview__caption" id="qrPanelCaption">Preview</figcaption>
+                </figure>
+                <div class="qr-controls">
+                  <div class="field">
+                    <span class="label" id="qrPresetLabel">Look</span>
+                    <div class="qr-presets" id="qrPresetList" role="radiogroup" aria-labelledby="qrPresetLabel"></div>
+                  </div>
+                  <div class="field">
+                    <span class="label" id="qrLogoLabel">Centre logo</span>
+                    <div class="qr-logos" id="qrLogoList" role="radiogroup" aria-labelledby="qrLogoLabel"></div>
+                  </div>
+                  <p class="hint">Fine-tune colours, corner shapes and captions, or upload your own logo, in the full QR studio after you create the link.</p>
+                  <p class="error-text" id="qrError" hidden></p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </form>
+
+    <p class="visually-hidden" id="resultAnnounce" role="status" aria-live="polite"></p>
+    <section class="result panel" id="result" aria-labelledby="resultTitle" hidden>
+      <h2 class="caption caption--corner result__title" id="resultTitle" tabindex="-1"><span class="result__title-icon" id="resultTitleIcon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#rocket"></use></svg></span><span id="resultTitleText">Your Blip is ready</span></h2>
+      <div class="burst result__burst" id="resultBurst" aria-hidden="true"><span class="burst__inner" id="resultBurstText">Blip!</span></div>
+
+      <div class="result__grid">
+        <div class="result__main">
+          <div class="result__badges" id="resultBadges"></div>
+          <p class="result__url" id="resultShortUrl"></p>
+          <p class="result__target"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#corner-down-right"></use></svg><span class="result__target-label">Goes to</span><span class="result__target-url truncate" id="resultTarget"></span></p>
+
+          <div class="working-row" id="resultWorkingRow" hidden>
+            <span class="working-row__label"><span class="live-dot" aria-hidden="true"></span>Works right now:</span>
+            <code class="working-row__url" id="resultWorkingUrl"></code>
+            <button type="button" class="btn btn--sm" id="resultCopyWorking"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg><span data-label>Copy</span></button>
+          </div>
+
+          <div class="manage-key" id="resultKeyRow" hidden>
+            <span class="manage-key__label"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#key-round"></use></svg>Manage key</span>
+            <code class="manage-key__value" id="resultKey" data-masked="true"></code>
+            <button type="button" class="btn btn--sm" id="resultKeyToggle" aria-pressed="false" aria-controls="resultKey"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#eye"></use></svg><span data-label>Show</span></button>
+            <button type="button" class="btn btn--sm" id="resultKeyCopy"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg><span data-label>Copy key</span></button>
+            <p class="hint manage-key__hint">Save this somewhere private. Paste it on a link's dashboard to manage the link from another device or browser. Anyone who has it can edit, destroy or view stats for this link.</p>
+          </div>
+
+          <p class="result__note" id="resultStatusNote" hidden></p>
+
+          <div class="result__actions">
+            <button type="button" class="btn btn--blue" id="resultCopy"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#copy"></use></svg><span data-label>Copy</span></button>
+            <button type="button" class="btn" id="resultOpen"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#external-link"></use></svg>Open</button>
+            <a class="btn" id="resultQrLink" href="/qr.html"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#qr-code"></use></svg>QR studio</a>
+            <a class="btn" id="resultDashLink" href="/dashboard.html"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#activity"></use></svg>Live dashboard</a>
+            <button type="button" class="btn" id="resultShare" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#share-2"></use></svg>Share</button>
+            <button type="button" class="btn btn--danger" id="resultDestroy"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#bomb"></use></svg>Destroy now</button>
+            <button type="button" class="btn btn--blue" id="resultRevive" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#rotate-ccw"></use></svg>Revive</button>
+          </div>
+
+          <ul class="result__summary" id="resultSummary" aria-label="Link options"></ul>
+        </div>
+
+        <div class="result__side">
+          <button type="button" class="result__qr" id="resultQr">
+            <span class="result__qr-code" id="resultQrCode"><span class="skeleton result__qr-skeleton" aria-hidden="true"></span></span>
+            <span class="result__qr-hint"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#download"></use></svg>Download PNG</span>
+          </button>
+          <button type="button" class="btn btn--ghost btn--sm" id="resultAnother"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg>Shorten another</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="links" id="my-links" aria-labelledby="linksTitle">
+      <div class="links__head">
+        <div class="links__heading">
+          <p class="caption caption--ink">Meanwhile, in your links...</p>
+          <h2 class="links__title" id="linksTitle">My links <span class="links__count" id="linksCount">0</span></h2>
+          <p class="links__sub">Saved in this browser. Your manage keys never leave this device except to talk to Blip.</p>
+        </div>
+        <button type="button" class="btn btn--sm" id="refreshLinks"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#refresh-cw"></use></svg><span>Refresh</span></button>
+      </div>
+
+      <p class="visually-hidden" id="linksStatus" aria-live="polite"></p>
+      <ul class="link-list" id="linksList" aria-labelledby="linksTitle"></ul>
+
+      <div class="panel links-empty" id="linksEmpty" hidden>
+        <div class="empty">
+          <span class="empty__art" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#link"></use></svg></span>
+          <h3 class="links-empty__title">No Blips yet</h3>
+          <p class="links-empty__text">Links you shorten here are remembered in this browser, so you can track, tweak or blow them up later.</p>
+          <button type="button" class="btn btn--yellow" id="emptyCreateBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#zap"></use></svg>Make my first Blip</button>
+        </div>
+      </div>
+
+      <div class="panel links-error" id="linksError" role="alert" hidden>
+        <span class="links-error__icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="/assets/icons.svg#wifi-off"></use></svg></span>
+        <p id="linksErrorText">We couldn't load your links.</p>
+        <button type="button" class="btn btn--sm" id="linksRetry"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#refresh-cw"></use></svg>Retry</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer container">
+    <div class="footer-inner">
+      <a class="brand footer-brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+      <p class="footer-made">Made with Blip. Tiny links with big personality.</p>
+      <p class="footer-privacy"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#shield-check"></use></svg><span>We never store IP addresses. Visitors are counted with salted, one-way hashes.</span></p>
+      <p class="footer-kbd">Press <kbd class="kbd">/</kbd> anywhere to paste a new link</p>
+    </div>
+  </footer>
+
+  <dialog class="modal confirm-modal" id="confirmDialog" aria-labelledby="confirmTitle" aria-describedby="confirmMessage">
+    <div class="modal__body">
+      <span class="confirm-modal__icon" id="confirmIcon" data-tone="danger" aria-hidden="true"></span>
+      <h2 class="confirm-modal__title" id="confirmTitle">Are you sure?</h2>
+      <p class="confirm-modal__message" id="confirmMessage"></p>
+    </div>
+    <div class="modal__actions">
+      <button type="button" class="btn btn--ghost" id="confirmCancel" autofocus>Cancel</button>
+      <button type="button" class="btn btn--danger" id="confirmOk">Confirm</button>
+    </div>
+  </dialog>
+</body>
+</html>

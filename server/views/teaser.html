@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{{text:TITLE}}</title>
+  <noscript><meta http-equiv="refresh" content="{{attr:REFRESH}}"></noscript>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/fonts/bangers/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-400.css">
+  <link rel="stylesheet" href="/vendor/fonts/comic-neue/latin-700.css">
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/pages.css">
+  <noscript><style>.js-only { display: none !important; }</style></noscript>
+</head>
+<body class="page page--teaser" data-theme="{{attr:THEME}}">
+  <div class="bg" aria-hidden="true"><div class="bg-dots"></div><div class="bg-dots bg-dots--red"></div><div class="bg-dots bg-dots--blue"></div></div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header container">
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">blip</span></a>
+    <nav class="site-nav" aria-label="Main"><a href="/"><svg class="icon icon--sm" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#plus"></use></svg><span>Make your own</span></a></nav>
+  </header>
+
+  <main class="page-main container" id="main">
+    <section class="panel visit-panel teaser-panel" id="teaser-card" data-style="countdown" aria-labelledby="teaser-heading">
+      <p class="caption caption--corner">Moments later...</p>
+
+      <div class="splash">
+        <div class="rays" aria-hidden="true"></div>
+        <span class="caption caption--ink splash__tag" id="paused-tag" hidden>Paused</span>
+        <div class="burst teaser-burst js-only" id="countdown" role="timer" aria-atomic="true">
+          <span class="burst__inner">
+            <span class="visually-hidden">Redirecting in </span>
+            <span class="teaser-count" id="count-num"></span>
+            <span class="teaser-count__unit" id="count-unit">seconds</span>
+          </span>
+        </div>
+        <noscript><div class="burst teaser-burst" aria-hidden="true"><span class="burst__inner">Hold tight!</span></div></noscript>
+      </div>
+
+      <div class="countdown-bar js-only" id="countdown-bar" aria-hidden="true"></div>
+
+      <h1 class="teaser-heading" id="teaser-heading">Taking you to <strong class="teaser-host" id="target-host">your destination</strong></h1>
+      <p class="teaser-linktitle" id="link-title" hidden></p>
+      <p class="teaser-url mono js-only" id="target-url"></p>
+
+      <div class="teaser-extra js-only" id="teaser-extra">
+        <div class="narration" id="note-trivia" hidden>
+          <h2 class="caption caption--ink narration__label"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#lightbulb"></use></svg>Did you know?</h2>
+          <p class="narration__text" id="trivia-text"></p>
+        </div>
+
+        <div class="narration" id="note-brand" hidden>
+          <h2 class="caption caption--ink narration__label"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#megaphone"></use></svg>A word from the sender</h2>
+          <p class="narration__text narration__text--message" id="brand-text"></p>
+        </div>
+
+        <div class="narration" id="note-countdown" hidden>
+          <h2 class="caption caption--ink narration__label"><svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#hourglass"></use></svg>Meanwhile...</h2>
+          <p class="narration__text" id="quip-text"></p>
+        </div>
+      </div>
+
+      <div class="teaser-actions js-only">
+        <button type="button" class="btn btn--primary btn--lg" id="go-now">
+          <span>Go now</span>
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#arrow-right"></use></svg>
+        </button>
+        <button type="button" class="btn btn--lg teaser-cancel" id="cancel" aria-describedby="teaser-status">
+          <svg class="icon" id="cancel-icon" aria-hidden="true" focusable="false"><use href="/assets/icons.svg#x"></use></svg>
+          <span id="cancel-label">Cancel</span>
+        </button>
+      </div>
+
+      <p class="teaser-status" id="teaser-status" role="status" aria-live="polite"></p>
+
+      <noscript>
+        <p class="teaser-noscript">You'll be forwarded automatically in a few seconds.</p>
+        <p class="teaser-actions"><a class="btn btn--primary btn--lg" href="{{attr:TARGET}}" rel="noopener noreferrer">Continue to destination</a></p>
+      </noscript>
+    </section>
+  </main>
+
+  <footer class="site-footer container page-footer">
+    <p class="footer-made">Shortened with <a href="/">Blip</a>. Tiny links with big personality.</p>
+  </footer>
+
+  <script type="application/json" id="blip-data">{{json:DATA}}</script>
+  <script type="module" src="/assets/js/teaser.js"></script>
+</body>
+</html>

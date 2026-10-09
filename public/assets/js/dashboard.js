@@ -65,11 +65,10 @@ const state = {
   statsTz: 0, // the `tz` the stats on screen were requested with: their bucket starts are local times in it
   editing: false, // the Edit settings dialog is open (live status toasts wait for it)
   allTime: null, // { clicks, uniqueVisitors, syntheticClicks }: all-time, from the stream
-  // All-time counted-click total already reflected in `stats`. Live click events carry a running
-  // all-time total; events at or below this mark are already in the snapshot and must not be counted
-  // again (simulated rows are inserted up front while their events trickle in over several seconds).
-  watermark: 0,
-  simCeiling: 0, // all-time total once our own pending simulation has fully landed
+  // `stats.throughClickId` is the highest click id stored when the stats were read: a live click event
+  // with an id up to it is already in `stats` and must not be counted again (a visit on another server
+  // instance reaches the stream up to 2 s late, and simulated rows are stored up front while their
+  // events trickle in over several seconds).
   range: readPref(RANGE_KEY, RANGES, '7d'),
   simCount: readPref(SIM_KEY, SIM_COUNTS, '25'),
   stream: null,
@@ -214,8 +213,6 @@ function resetLinkState() {
   state.link = null;
   state.stats = null;
   state.allTime = null;
-  state.watermark = 0;
-  state.simCeiling = 0;
   state.expiryCheck = null;
   state.failedRange = null;
   state.catchUp = false;
@@ -676,15 +673,12 @@ async function loadStats({ skeleton = false, throwOnError = false } = {}) {
     renderRangeText(range);
     $('map-sub').textContent = MAP_SUB_DEFAULT;
   }
-  // Everything that already exists server-side when we ask is part of the snapshot we get back.
-  const issuedWatermark = Math.max(state.allTime?.clicks || 0, state.simCeiling || 0);
   const tz = new Date().getTimezoneOffset();
   try {
     const stats = await api.stats(state.slug, state.token, { range, tz, signal: ctrl.signal });
     if (gen !== state.gen || ctrl.signal.aborted) return;
     state.stats = stats;
     state.statsTz = tz;
-    state.watermark = issuedWatermark;
     state.failedRange = null;
     $('stats-error').hidden = true;
     // Reveal first so the charts measure their real size when they draw.
@@ -901,11 +895,9 @@ async function simulate(button) {
   if (!state.slug || !state.token) return;
   const count = Number(state.simCount) || 25;
   setBusy(button, true);
-  const before = Math.max(state.allTime?.clicks || 0, state.watermark || 0);
   try {
     const res = await api.simulate(state.slug, state.token, count);
     const inserted = Number(res?.inserted ?? count);
-    state.simCeiling = Math.max(state.simCeiling, before + inserted);
     toast(`Simulating ${plural(inserted, 'demo click', 'demo clicks')}. Watch them land on the map.`, { type: 'success' });
     if (state.liveStatus !== 'open') scheduleRefresh();
   } catch (err) {
@@ -978,8 +970,6 @@ async function clearSimulated() {
       state.allTime.clicks = Math.max(0, state.allTime.clicks - deleted);
       state.allTime.syntheticClicks = 0;
     }
-    state.simCeiling = 0;
-    state.watermark = Math.max(0, state.watermark - deleted);
     charts?.feed.removeWhere((evt) => evt.isSynthetic);
     scheduleRefresh.cancel();
     await refresh();
@@ -1042,7 +1032,6 @@ function handleStreamEvent(type, data) {
       uniqueVisitors: Number(t.uniqueVisitors) || 0,
       syntheticClicks: Number(t.syntheticClicks) || 0,
     };
-    state.watermark = Math.max(state.watermark, state.allTime.clicks);
     renderKpis();
     renderSynthetic();
     renderEmptyBanner();
@@ -1066,8 +1055,9 @@ function handleLiveClick(evt) {
   if (!state.allTime) state.allTime = { clicks: 0, uniqueVisitors: 0, syntheticClicks: 0 };
   const runningTotal = Number(evt.totals?.clicks);
   const hasRunningTotal = evt.totals && Number.isFinite(runningTotal);
-  // A counted click whose running total is within the snapshot watermark is already in `stats`.
-  const alreadyCounted = counted && hasRunningTotal && runningTotal <= state.watermark;
+  // A click stored before the stats snapshot was read is already in `stats` (and in the link's count).
+  const statsThrough = Number(state.stats?.throughClickId);
+  const alreadyCounted = Number.isFinite(statsThrough) && Number(evt.id) <= statsThrough;
   if (hasRunningTotal) {
     // Running totals of staggered events can lag behind what `hello` reported: never move backwards.
     state.allTime.clicks = Math.max(state.allTime.clicks, runningTotal);
@@ -1076,7 +1066,8 @@ function handleLiveClick(evt) {
   } else if (counted) {
     state.allTime.clicks += 1;
   }
-  if (counted && evt.isSynthetic && !alreadyCounted) state.allTime.syntheticClicks += 1;
+  // Every streamed click came after the stream's `hello`, so the all-time numbers always take it.
+  if (counted && evt.isSynthetic) state.allTime.syntheticClicks += 1;
 
   const t = alreadyCounted ? null : state.stats?.totals;
   if (t) {

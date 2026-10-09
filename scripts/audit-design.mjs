@@ -223,7 +223,8 @@ const isCss = (f) => f.endsWith('.css');
 
 async function runAudit() {
   const uiFiles = [
-    ...walk(join(root, 'public'), ['.html', '.css', '.js']).filter((f) => !f.endsWith('icons.svg')),
+    // public/vendor holds third-party copies made by `npm run build` (scripts/build-vendor.mjs), not Blip's UI.
+    ...walk(join(root, 'public'), ['.html', '.css', '.js']).filter((f) => !f.endsWith('icons.svg') && !rel(f).startsWith('public/vendor/')),
     ...walk(join(root, 'server', 'views'), ['.html']),
   ];
   const serverText = walk(join(root, 'server'), ['.js']); // user-facing strings (errors, trivia, domain notes)

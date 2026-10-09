@@ -1,8 +1,14 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { insertClick } from '../server/db.js';
 import { liveTotals } from '../server/analytics.js';
-import { DAY, HOUR, MINUTE, UA, openStream, startServer } from './helpers.js';
+import { STREAM_STAGGER_MS } from '../server/live.js';
+import { STREAM_EVICT_AFTER_MS } from '../server/routes/api.js';
+import { fileUrlFromPath } from '../server/config.js';
+import { DAY, HOUR, MINUTE, UA, openStream, removeTempDir, startServer } from './helpers.js';
 
 function seededRandom(seed = 42) {
   let x = seed >>> 0;
@@ -43,8 +49,12 @@ describe('stats', () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('cache-control'), 'no-store');
     const body = res.json;
-    assert.deepEqual(Object.keys(body).sort(), ['browsers', 'countries', 'devices', 'generatedAt', 'os', 'points', 'range', 'recent', 'referrers', 'slug', 'timeseries', 'totals'].sort());
+    assert.deepEqual(Object.keys(body).sort(), ['browsers', 'countries', 'devices', 'generatedAt', 'os', 'points', 'range', 'recent', 'referrers', 'slug', 'throughClickId', 'timeseries', 'totals'].sort());
     assert.equal(body.slug, slug);
+    // The highest click id stored when the snapshot was read: every click of the link up to it is included.
+    const { maxId } = await s.db.get('SELECT MAX(id) AS maxId FROM clicks');
+    assert.equal(body.throughClickId, maxId);
+    assert.ok(body.recent.every((c) => c.id <= body.throughClickId));
     assert.equal(body.range, '7d');
     assert.equal(body.generatedAt, new Date(start).toISOString());
     assert.deepEqual(Object.keys(body.totals).sort(), ['blockedAfterExpiry', 'botClicks', 'clicks', 'expiredBotClicks', 'last24h', 'syntheticClicks', 'uniqueVisitors'].sort());
@@ -171,7 +181,7 @@ describe('stats', () => {
       assert.ok(Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180);
       assert.equal(p.lat, Math.round(p.lat * 10) / 10);
     }
-    const synthetic = s.db.prepare('SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM clicks WHERE is_synthetic = 1').get();
+    const synthetic = await s.db.get('SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM clicks WHERE is_synthetic = 1');
     assert.equal(synthetic.n, 30);
     assert.ok(synthetic.lo >= start - 7 * DAY);
     assert.equal(synthetic.hi, start, 'the last few land at now()');
@@ -201,19 +211,19 @@ describe('breakdowns', () => {
 
   it('keeps the top 8 browsers, OSes and referrers and folds the rest into "Other"', async () => {
     const { link, manageToken } = await s.createLink({ targetUrl: 'https://example.com/many', slug: 'many' });
-    const linkId = s.db.prepare('SELECT id FROM links WHERE slug = ?').get(link.slug).id;
+    const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', [link.slug])).id;
     // 11 distinct values with counts 12, 11, …, 2 (and a bot + a blocked row that must not count).
     for (let i = 0; i < 11; i += 1) {
       for (let n = 0; n < 12 - i; n += 1) {
-        insertClick(s.db, {
+        await insertClick(s.db, {
           link_id: linkId, ts: s.clock.t, visitor_hash: `v${i}-${n}`, device: 'desktop',
           browser: `Browser ${String.fromCharCode(65 + i)}`, os: `OS ${String.fromCharCode(65 + i)}`,
           referrer_host: i === 0 ? null : `site${i}.example`, is_bot: 0, is_synthetic: 0, outcome: 'redirect',
         });
       }
     }
-    insertClick(s.db, { link_id: linkId, ts: s.clock.t, device: 'bot', browser: 'Browser Z', is_bot: 1, outcome: 'redirect' });
-    insertClick(s.db, { link_id: linkId, ts: s.clock.t, device: 'desktop', browser: 'Browser Y', outcome: 'expired' });
+    await insertClick(s.db, { link_id: linkId, ts: s.clock.t, device: 'bot', browser: 'Browser Z', is_bot: 1, outcome: 'redirect' });
+    await insertClick(s.db, { link_id: linkId, ts: s.clock.t, device: 'desktop', browser: 'Browser Y', outcome: 'expired' });
 
     const { json } = await s.request('GET', `/api/links/${link.slug}/stats`, { token: manageToken });
     assert.equal(json.totals.clicks, 77);
@@ -250,7 +260,7 @@ describe('simulated traffic and the default 7d view', () => {
       assert.equal(json.totals.syntheticClicks, 200, `tz=${tz}`);
       assert.equal(json.timeseries.points.reduce((sum, p) => sum + p.clicks, 0), 200, `tz=${tz}`);
     }
-    const span = s.db.prepare('SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM clicks WHERE is_synthetic = 1').get();
+    const span = await s.db.get('SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM clicks WHERE is_synthetic = 1');
     assert.ok(span.lo >= start - 6 * DAY);
     assert.equal(span.hi, start);
   });
@@ -269,7 +279,7 @@ describe('simulated traffic disabled', () => {
     assert.equal(res.status, 404);
     assert.equal(res.json.error.code, 'not_found');
     assert.equal((await s.request('GET', '/api/config')).json.allowDemoTraffic, false);
-    assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM clicks').get().n, 0);
+    assert.equal((await s.db.get('SELECT COUNT(*) AS n FROM clicks')).n, 0);
   });
 });
 
@@ -334,14 +344,20 @@ describe('live stream (SSE)', () => {
     const stream = await openStream(s.base, link.slug, manageToken);
     try {
       await stream.next((e) => e.event === 'hello');
-      const started = Date.now();
       const res = await s.request('POST', `/api/links/${link.slug}/simulate`, { token: manageToken, body: { count: 3 } });
       assert.deepEqual(res.json, { inserted: 3 });
+      const stored = await s.db.get('SELECT COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id WHERE l.slug = ?', [link.slug]);
+      assert.equal(stored.n, 3, 'every simulated click is stored before the response, in one batch');
       const events = [];
-      for (let i = 0; i < 3; i += 1) events.push(await stream.next((e) => e.event === 'click'));
-      assert.ok(Date.now() - started >= 250, 'events are staggered ~150 ms apart');
+      const arrived = [];
+      for (let i = 0; i < 3; i += 1) {
+        events.push(await stream.next((e) => e.event === 'click'));
+        arrived.push(Date.now());
+      }
+      assert.ok(arrived[2] - arrived[0] >= 2 * STREAM_STAGGER_MS - 40, `events are staggered ~${STREAM_STAGGER_MS} ms apart`);
       assert.ok(events.every((e) => e.data.isSynthetic === true));
       assert.deepEqual(events.map((e) => e.data.totals.clicks), [1, 2, 3]);
+      assert.deepEqual(events.map((e) => e.data.id), [...events.map((e) => e.data.id)].sort((a, b) => a - b), 'in id order');
     } finally {
       stream.close();
     }
@@ -369,8 +385,11 @@ describe('live stream (SSE)', () => {
       const active = await stream.next((e) => e.event === 'status');
       assert.deepEqual(active.data, { status: 'active', expiredReason: null, clickCount: 2, clicksRemaining: 8 });
       assert.equal((await s.visit(link.slug)).status, 302);
+      // A real visit changes the click count, so it comes with a status event too.
+      const counted = await stream.next((e) => e.event === 'status');
+      assert.deepEqual(counted.data, { status: 'active', expiredReason: null, clickCount: 3, clicksRemaining: 7 });
 
-      // A PATCH that doesn't change the status sends no status event.
+      // A PATCH that changes none of that sends no status event.
       await s.request('PATCH', `/api/links/${link.slug}`, { token, body: { title: 'Still going' } });
       await assert.rejects(stream.next((e) => e.event === 'status', 200), /Timed out/);
     } finally {
@@ -396,16 +415,14 @@ describe('live stream (SSE)', () => {
 
   it('live totals stay exact across real, repeat, bot, blocked and simulated clicks', async () => {
     const { link, manageToken: token } = await s.createLink({ targetUrl: 'https://example.com/tally', slug: 'tally', maxClicks: 4 });
-    const linkId = s.db.prepare('SELECT id FROM links WHERE slug = ?').get('tally').id;
+    const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', ['tally'])).id;
     await s.visit('tally', { ua: UA.macFirefox });
-    assert.equal(s.liveTotals.has(linkId), false, 'no running totals while nobody is watching');
 
     const stream = await openStream(s.base, link.slug, token);
     const nextClick = () => stream.next((e) => e.event === 'click');
     try {
       const hello = await stream.next((e) => e.event === 'hello');
       assert.equal(hello.data.totals.clicks, 1);
-      assert.equal(s.liveTotals.has(linkId), true, 'seeded from the hello totals');
 
       await s.visit('tally', { ua: UA.iphone });
       assert.deepEqual((await nextClick()).data.totals, { clicks: 2, uniqueVisitors: 2 });
@@ -428,31 +445,30 @@ describe('live stream (SSE)', () => {
       await s.visit('tally', { ua: UA.windowsChrome }); // blocked: not counted
       const blocked = await nextClick();
       assert.equal(blocked.data.outcome, 'expired');
-      assert.deepEqual(blocked.data.totals, liveTotals(s.db, linkId), 'running totals equal a full recount');
+      assert.deepEqual(blocked.data.totals, await liveTotals(s.db, linkId), 'running totals equal a full recount');
 
-      // Clearing simulated clicks drops the running totals; the next event recounts from the database.
-      await s.request('DELETE', `/api/links/${link.slug}/simulated`, { token });
-      assert.equal(s.liveTotals.has(linkId), false);
+      // Clearing simulated clicks moves the clicks epoch: the stream recounts before its next event.
+      const cleared = await s.request('DELETE', `/api/links/${link.slug}/simulated`, { token });
+      assert.deepEqual(cleared.json, { deleted: 4 });
       await s.visit('tally', { ua: UA.iphone });
       const afterClear = await nextClick();
       assert.deepEqual(afterClear.data.totals, { clicks: 4, uniqueVisitors: 3 });
-      assert.deepEqual(afterClear.data.totals, liveTotals(s.db, linkId));
+      assert.deepEqual(afterClear.data.totals, await liveTotals(s.db, linkId));
     } finally {
       stream.close();
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(s.liveTotals.has(linkId), false, 'forgotten when the last dashboard disconnects');
   });
 
   it('ends the stream when the link is deleted and stops listening on disconnect', async () => {
     const { link, manageToken } = await s.createLink({ targetUrl: 'https://example.com/bye', slug: 'bye' });
     const first = await openStream(s.base, link.slug, manageToken);
     await first.next((e) => e.event === 'hello');
-    const listenersBefore = s.bus.listenerCount('link:' + s.db.prepare('SELECT id FROM links WHERE slug = ?').get('bye').id);
+    const byeId = async () => (await s.db.get('SELECT id FROM links WHERE slug = ?', ['bye'])).id;
+    const listenersBefore = s.bus.listenerCount('link:' + (await byeId()));
     assert.equal(listenersBefore, 1);
     first.close();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    const id = s.db.prepare('SELECT id FROM links WHERE slug = ?').get('bye').id;
+    const id = await byeId();
     assert.equal(s.bus.listenerCount(`link:${id}`), 0, 'listener removed after client disconnect');
 
     const second = await openStream(s.base, link.slug, manageToken);
@@ -461,6 +477,97 @@ describe('live stream (SSE)', () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(s.bus.listenerCount(`link:${id}`), 0, 'stream ended on delete');
     second.close();
+  });
+});
+
+describe('live stream across instances (polling)', () => {
+  // Two apps on one database file, like two Vercel instances on one Turso database: a visit handled
+  // by one never touches the other's in-process bus, so the other's dashboard only sees it by polling.
+  let dir;
+  let a;
+  let b;
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blip-instances-'));
+    const config = { databaseUrl: fileUrlFromPath(path.join(dir, 'shared.db')), streamPollMs: 100 };
+    a = await startServer({ config });
+    b = await startServer({ config });
+  });
+  after(async () => {
+    await a?.stop();
+    await b?.stop();
+    await removeTempDir(dir);
+  });
+
+  it('delivers clicks, totals and status changes stored by another instance', async () => {
+    const { link, manageToken: token } = await a.createLink({ targetUrl: 'https://example.com/elsewhere', slug: 'elsewhere', maxClicks: 2 });
+    await a.visit('elsewhere', { ua: UA.macFirefox });
+    const stream = await openStream(b.base, link.slug, token);
+    try {
+      const hello = await stream.next((e) => e.event === 'hello');
+      assert.equal(hello.data.totals.clicks, 1);
+
+      await a.visit('elsewhere', { ua: UA.iphone, headers: { 'cf-ipcountry': 'FR' } });
+      const click = await stream.next((e) => e.event === 'click', 2000);
+      assert.equal(click.data.country, 'FR');
+      assert.deepEqual(click.data.totals, { clicks: 2, uniqueVisitors: 2 });
+      const status = await stream.next((e) => e.event === 'status', 2000);
+      assert.deepEqual(status.data, { status: 'expired', expiredReason: 'clicks', clickCount: 2, clicksRemaining: 0 });
+
+      const sim = await a.request('POST', `/api/links/${link.slug}/simulate`, { token, body: { count: 3 } });
+      assert.deepEqual(sim.json, { inserted: 3 });
+      const simulated = [];
+      for (let i = 0; i < 3; i += 1) simulated.push((await stream.next((e) => e.event === 'click', 2000)).data.totals.clicks);
+      assert.deepEqual(simulated, [3, 4, 5]);
+
+      // Clearing on instance A is noticed by B's stream through the clicks epoch.
+      await a.request('DELETE', `/api/links/${link.slug}/simulated`, { token });
+      await a.request('PATCH', `/api/links/${link.slug}`, { token, body: { maxClicks: 5 } });
+      const revived = await stream.next((e) => e.event === 'status', 2000);
+      assert.equal(revived.data.status, 'active');
+      await a.visit('elsewhere', { ua: UA.ipad });
+      const afterClear = await stream.next((e) => e.event === 'click', 2000);
+      assert.deepEqual(afterClear.data.totals, { clicks: 3, uniqueVisitors: 3 });
+
+      // Deleting the link on A ends the stream on B.
+      await a.request('DELETE', `/api/links/${link.slug}`, { token });
+      await Promise.race([
+        stream.ended,
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('the stream did not end')), 2000)),
+      ]);
+    } finally {
+      stream.close();
+    }
+  });
+});
+
+describe('live stream maximum duration (STREAM_MAX_MS)', () => {
+  let s;
+  before(async () => {
+    s = await startServer({ config: { streamMaxMs: 300 } });
+  });
+  after(() => s.stop());
+
+  it('ends the stream cleanly once the time is up, so the client reconnects', async () => {
+    const { link, manageToken } = await s.createLink({ targetUrl: 'https://example.com/short-lived', slug: 'short-lived' });
+    const opened = Date.now();
+    const stream = await openStream(s.base, link.slug, manageToken);
+    try {
+      await stream.next((e) => e.event === 'hello');
+      await Promise.race([
+        stream.ended,
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('the stream did not end')), 3000)),
+      ]);
+      assert.ok(Date.now() - opened >= 250, 'not before STREAM_MAX_MS');
+      const again = await openStream(s.base, link.slug, manageToken);
+      try {
+        assert.equal(again.status, 200, 'its slot was freed, so a reconnect is accepted');
+        await again.next((e) => e.event === 'hello');
+      } finally {
+        again.close();
+      }
+    } finally {
+      stream.close();
+    }
   });
 });
 
@@ -517,6 +624,74 @@ describe('live stream limits', () => {
       assert.equal(fresh.status, 200);
     } finally {
       fresh.close();
+    }
+  });
+});
+
+describe('live stream limits with dashboards that never said goodbye', () => {
+  let s;
+  before(async () => {
+    // Trust the loopback proxy, so a test request can come from another client address.
+    s = await startServer({ streamLimits: { perLink: 2, perClient: 3 }, config: { trustProxy: 'loopback' } });
+  });
+  after(() => s.stop());
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+  it("ends the same client's oldest stream once it is old enough, instead of refusing the new one", async () => {
+    const a = await s.createLink({ targetUrl: 'https://example.com/evict-a', slug: 'evict-a' });
+    const b = await s.createLink({ targetUrl: 'https://example.com/evict-b', slug: 'evict-b' });
+    const open = [];
+    const connect = async (slug, token) => {
+      const stream = await openStream(s.base, slug, token);
+      open.push(stream);
+      if (stream.status === 200) await stream.next((e) => e.event === 'hello');
+      return stream;
+    };
+    try {
+      // Two streams the client never closes (as when a proxy doesn't pass the disconnect on).
+      const first = await connect('evict-a', a.manageToken);
+      const second = await connect('evict-a', a.manageToken);
+      assert.equal((await s.request('GET', '/api/links/evict-a/stream', { token: a.manageToken })).status, 429, 'young streams are never ended');
+
+      s.advance(STREAM_EVICT_AFTER_MS);
+      const third = await connect('evict-a', a.manageToken);
+      assert.equal(third.status, 200, 'the oldest stream made room');
+      await first.ended; // it received EOF
+      const fourth = await connect('evict-a', a.manageToken);
+      assert.equal(fourth.status, 200);
+      await second.ended;
+      // Still two per link: both open streams are young now.
+      assert.equal((await s.request('GET', '/api/links/evict-a/stream', { token: a.manageToken })).status, 429);
+
+      // The per-client cap (3) evicts the client's oldest stream on any link.
+      const onB = await connect('evict-b', b.manageToken);
+      assert.equal(onB.status, 200);
+      s.advance(STREAM_EVICT_AFTER_MS);
+      const again = await connect('evict-b', b.manageToken);
+      assert.equal(again.status, 200);
+      await third.ended;
+    } finally {
+      for (const stream of open) stream.close();
+    }
+    await settle();
+  });
+
+  it("never ends another client's stream", async () => {
+    const c = await s.createLink({ targetUrl: 'https://example.com/evict-c', slug: 'evict-c' });
+    const open = [];
+    try {
+      for (let i = 0; i < 2; i += 1) {
+        const stream = await openStream(s.base, 'evict-c', c.manageToken);
+        open.push(stream);
+        await stream.next((e) => e.event === 'hello');
+      }
+      s.advance(STREAM_EVICT_AFTER_MS * 2);
+      // Same token, another client address: the link is full of someone else's streams.
+      const res = await s.request('GET', '/api/links/evict-c/stream', { token: c.manageToken, headers: { 'X-Forwarded-For': '198.51.100.20' } });
+      assert.equal(res.status, 429);
+    } finally {
+      for (const stream of open) stream.close();
     }
   });
 });

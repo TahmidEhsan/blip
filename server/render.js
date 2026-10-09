@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VIEW_NAMES = Object.freeze(['teaser', 'expired', 'not-found', 'preview']);
+export const VIEW_NAMES = Object.freeze(['teaser', 'expired', 'not-found', 'preview', 'unavailable']);
 const VIEWS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'views');
 const PLACEHOLDER_RE = /\{\{\s*([a-z]+)\s*:\s*([A-Za-z0-9_]+)\s*\}\}/g;
 
@@ -73,5 +73,5 @@ export function createViewRenderer({ cache = process.env.NODE_ENV === 'productio
   };
 }
 
-/** Render one of the four known views (`teaser`, `expired`, `not-found`, `preview`). */
+/** Render one of the known views (`teaser`, `expired`, `not-found`, `preview`, `unavailable`). */
 export const renderView = createViewRenderer();

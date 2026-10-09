@@ -95,6 +95,8 @@ export function friendlyMessage(err, fallback = 'Something went wrong. Please tr
   if (!err) return fallback;
   if (err.code === 'network') return "Can't reach Blip right now. Check your connection and try again.";
   if (err.status === 429) return err.message && !/^Request failed/.test(err.message) ? err.message : 'Whoa, speedy! Give it a few seconds and try again.';
+  // A deployment without its database (or with settings it can't use) says what the owner should do.
+  if ((err.code === 'database_not_configured' || err.code === 'misconfigured') && err.message) return err.message;
   if (err.status >= 500) return 'Blip hiccuped on the server side. Please try again in a moment.';
   if (err.message && !/^Request failed/.test(err.message)) return err.message;
   return fallback;

@@ -1,16 +1,22 @@
 // Blip: GET /:slug visits (redirects, teasers, bot previews and self-destructed pages, SPEC §4.4).
 import express from 'express';
-import { consumeVisit, findLinkById, findLinkBySlug, insertClick, lastConsumedClickTs } from '../db.js';
-import { clickEventFromRow, isBotUA, parseUserAgent, referrerHost, visitorHash } from '../analytics.js';
-import { linkStatus, statusPayload } from '../links.js';
+import { consumeVisitAndRecordClick, findLinkById, findLinkBySlug, insertClick, lastConsumedClickTs } from '../db.js';
+import { isBotUA, parseUserAgent, referrerHost, visitorHash } from '../analytics.js';
+import { linkStatus } from '../links.js';
 import { SLUG_RE, normalizeSlug } from '../slugs.js';
 import { GEO_TIMEOUT_MS, cleanIp } from '../geo.js';
-import { linkChannel, publish } from '../bus.js';
+import { wake } from '../bus.js';
 import { pickTrivia } from '../data/trivia.js';
 import { teaserThemeId } from '../themes.js';
 
 const PREVIEW_TITLE = 'Open this Blip link in your browser';
 const EXPIRED_TITLE = 'This Blip has self-destructed';
+/**
+ * How long a visit that consumes nothing (a blocked attempt, a bot) waits for its click row before it
+ * answers anyway. A round trip normally takes milliseconds; when the database stalls, the visitor still
+ * gets their page and the row is stored late or, at worst, lost (it is analytics only).
+ */
+export const CLICK_WRITE_BUDGET_MS = 1500;
 
 /** Resolve `promise` or give up with null after `ms`; never rejects. */
 function settleWithin(promise, ms) {
@@ -43,11 +49,17 @@ export function createRedirectRouter(ctx) {
   const { db, bus } = ctx;
   const router = express.Router();
 
-  async function sendExpired(res, link, reason) {
+  /**
+   * 410 self-destructed page. `recording` is the blocked attempt being stored (or null for HEAD): it
+   * runs alongside the "expired at" lookup, and the page is sent once both are done.
+   */
+  async function sendExpired(res, link, reason, recording = null) {
+    const expiredAtLookup = reason === 'clicks' ? lastConsumedClickTs(db, link.id) : null;
+    const [lastClick] = await Promise.all([expiredAtLookup, recording]);
     let expiredAt = null;
     if (reason === 'time') expiredAt = link.expires_at;
     else if (reason === 'manual') expiredAt = link.destroyed_at;
-    else if (reason === 'clicks') expiredAt = lastConsumedClickTs(db, link.id) ?? link.updated_at;
+    else if (reason === 'clicks') expiredAt = lastClick ?? link.updated_at;
     const html = await ctx.renderView('expired', {
       TITLE: EXPIRED_TITLE,
       DATA: { slug: link.slug, reason, expiredAt: iso(expiredAt), clickCount: link.click_count, maxClicks: link.max_clicks ?? null },
@@ -89,54 +101,67 @@ export function createRedirectRouter(ctx) {
     res.status(200).type('html').send(html);
   }
 
-  const hasListeners = (linkId) => bus.listenerCount(linkChannel(linkId)) > 0;
+  /**
+   * The click row for this visit (no raw IP): device, browser, OS, referrer host, coarse location and
+   * visitor hash. The location lookup is capped at GEO_TIMEOUT_MS, and a failing one means "no
+   * location". Never rejects.
+   */
+  async function clickRow(req, link, { outcome, isBot, now }) {
+    const ua = req.get('user-agent') || '';
+    const ip = cleanIp(req.ip || req.socket?.remoteAddress || '');
+    const geo = await settleWithin(Promise.resolve().then(() => ctx.geoLookup(ip, req.headers)), GEO_TIMEOUT_MS);
+    const { device, browser, os } = parseUserAgent(ua);
+    return {
+      link_id: link.id,
+      ts: now,
+      visitor_hash: visitorHash(ctx.salt, ip, ua),
+      country: geo?.country ?? null,
+      region: geo?.region ?? null,
+      city: geo?.city ?? null,
+      lat: geo?.lat ?? null,
+      lon: geo?.lon ?? null,
+      device: isBot ? 'bot' : device,
+      browser,
+      os,
+      referrer_host: referrerHost(req.get('referer')),
+      is_bot: isBot ? 1 : 0,
+      is_synthetic: 0,
+      outcome,
+    };
+  }
 
   /**
-   * Store one click row (no raw IP) and push it to live dashboards. Analytics never blocks the
-   * visit: any failure here (a geo provider that throws, the link deleted while geo was pending,
-   * a SQLite error) is logged and swallowed so the visitor still gets their redirect or page.
+   * Store a click row for a visit that consumed nothing (a blocked attempt or a bot), then wake this
+   * instance's live dashboards for the link: they read the row from the database (dashboards on other
+   * instances see it at their next poll). Analytics never blocks or breaks the visit: a failure (the link
+   * deleted meanwhile, a database error) is logged and swallowed, and a write still pending after
+   * CLICK_WRITE_BUDGET_MS is left to finish on its own. Never rejects.
+   * @param {Promise<object>|object} row the click row, or a promise of it (from clickRow)
    */
-  async function recordClick(req, link, { outcome, isBot, now }) {
-    try {
-      const ua = req.get('user-agent') || '';
-      const ip = cleanIp(req.ip || req.socket?.remoteAddress || '');
-      const geo = await settleWithin(Promise.resolve().then(() => ctx.geoLookup(ip, req.headers)), GEO_TIMEOUT_MS);
-      if (ctx.isClosed()) return;
-      const { device, browser, os } = parseUserAgent(ua);
-      const row = insertClick(db, {
-        link_id: link.id,
-        ts: now,
-        visitor_hash: visitorHash(ctx.salt, ip, ua),
-        country: geo?.country ?? null,
-        region: geo?.region ?? null,
-        city: geo?.city ?? null,
-        lat: geo?.lat ?? null,
-        lon: geo?.lon ?? null,
-        device: isBot ? 'bot' : device,
-        browser,
-        os,
-        referrer_host: referrerHost(req.get('referer')),
-        is_bot: isBot ? 1 : 0,
-        is_synthetic: 0,
-        outcome,
+  async function storeClick(link, row) {
+    const write = Promise.resolve(row)
+      .then((click) => (ctx.isClosed() ? null : insertClick(db, click)))
+      .then(() => true, (err) => {
+        if (!ctx.isClosed()) console.error(`[blip] could not record a visit to /${link.slug}: ${ctx.redact(err?.message || err)}`);
+        return false;
       });
-      // Totals are only computed (incrementally) when a dashboard is actually listening.
-      if (hasListeners(link.id)) {
-        publish(bus, link.id, 'click', { ...clickEventFromRow(row), totals: ctx.liveTotals.advance(link.id, row) });
-      } else {
-        ctx.liveTotals.forget(link.id); // never leave a running total behind that this row didn't advance
-      }
-    } catch (err) {
-      console.error(`[blip] could not record a visit to /${link.slug}: ${err?.message || err}`);
+    write.then(() => {
+      if (!ctx.isClosed()) wake(bus, link.id);
+    });
+    if ((await settleWithin(write, CLICK_WRITE_BUDGET_MS)) === null) {
+      console.error(`[blip] recording a visit to /${link.slug} is slow; answering without waiting for it`);
     }
   }
 
+  // A visit makes at most two database round trips: look the link up, then consume the visit and
+  // store its click row in one write batch. Losing the race for the last click adds a read and the
+  // blocked attempt's row; a visit that consumes nothing (expired, bot) stores its row in one INSERT.
   router.get('/:slug', async (req, res) => {
     const now = ctx.now();
     setVisitHeaders(res);
     const requested = String(req.params.slug ?? '');
     const slug = requested.toLowerCase();
-    const link = SLUG_RE.test(slug) ? findLinkBySlug(db, slug) : null;
+    const link = SLUG_RE.test(slug) ? await findLinkBySlug(db, slug) : null;
     if (!link) {
       await sendNotFound(ctx, res, requested);
       return;
@@ -148,14 +173,13 @@ export function createRedirectRouter(ctx) {
 
     // 4. Expired / destroyed → logged as a blocked attempt, never counted.
     if (state.status !== 'active') {
-      if (!isHead) await recordClick(req, link, { outcome: 'expired', isBot, now });
-      await sendExpired(res, link, state.expiredReason);
+      await sendExpired(res, link, state.expiredReason, isHead ? null : storeClick(link, clickRow(req, link, { outcome: 'expired', isBot, now })));
       return;
     }
 
     // 5. Link-preview bots must not burn limited links (or learn the target).
     if (isBot && (link.max_clicks !== null || link.expires_at !== null)) {
-      if (!isHead) await recordClick(req, link, { outcome: 'bot-preview', isBot: true, now });
+      if (!isHead) await storeClick(link, clickRow(req, link, { outcome: 'bot-preview', isBot: true, now }));
       await sendPreview(res);
       return;
     }
@@ -172,21 +196,31 @@ export function createRedirectRouter(ctx) {
       return;
     }
 
-    // 6. Consume atomically (bots on unlimited links are logged but never consume).
-    if (!isBot && consumeVisit(db, link.id, now) === 0) {
-      const fresh = findLinkById(db, link.id) ?? link;
-      const lost = linkStatus(fresh, now);
-      await recordClick(req, fresh, { outcome: 'expired', isBot, now });
-      await sendExpired(res, fresh, lost.expiredReason ?? 'clicks');
+    const outcome = link.redirect_mode === 'teaser' ? 'teaser' : 'redirect';
+    if (isBot) {
+      // Bots on unlimited links are logged but never consume.
+      await storeClick(link, clickRow(req, link, { outcome, isBot, now }));
+      await sendActive(res, link);
       return;
     }
 
-    // 7. Record + publish, then 8. respond.
-    await recordClick(req, link, { outcome: link.redirect_mode === 'teaser' ? 'teaser' : 'redirect', isBot, now });
-    if (!isBot && link.max_clicks !== null && !ctx.isClosed() && hasListeners(link.id)) {
-      const fresh = findLinkById(db, link.id);
-      if (fresh && linkStatus(fresh, now).status !== 'active') publish(bus, link.id, 'status', statusPayload(fresh, now));
+    // 6 + 7. Consume atomically and store the click in the same write batch (one round trip, and a
+    //        cancelled request can never split them), then wake live dashboards and respond.
+    const row = await clickRow(req, link, { outcome, isBot, now });
+    const result = await consumeVisitAndRecordClick(db, link.id, now, row);
+    if (!result.consumed) {
+      // Lost the race (another visitor took the last click, or the link was stopped or deleted meanwhile).
+      const fresh = await findLinkById(db, link.id);
+      if (!fresh) {
+        await sendNotFound(ctx, res, requested);
+        return;
+      }
+      const lost = linkStatus(fresh, now);
+      await sendExpired(res, fresh, lost.expiredReason ?? 'clicks', storeClick(fresh, { ...row, outcome: 'expired' }));
+      return;
     }
+    // Also covers a visit that used up the last click: the stream sends the status change too.
+    if (!ctx.isClosed()) wake(bus, link.id);
     await sendActive(res, link);
   });
 

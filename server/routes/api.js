@@ -2,25 +2,31 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import {
-  deleteLink, deleteSyntheticClicks, findLinkById, findLinkBySlug, insertLink, isUniqueViolation, sha256Hex,
+  deleteLink, deleteSyntheticClicks, findLinkBySlug, findLinksBySlugs, insertLink, isUniqueViolation, sha256Hex,
   slugTaken, updateLink,
 } from '../db.js';
 import { HttpError, errorBody, sendError, validationError } from '../errors.js';
 import {
-  LIMITS, LINK_DEFAULTS, TEASER_LIMITS, TEASER_STYLES, TEASER_THEMES, isPlainObject, linkStatus, statusPayload,
-  toLinkDto, validateLinkBody,
+  LIMITS, LINK_DEFAULTS, TEASER_LIMITS, TEASER_STYLES, TEASER_THEMES, isPlainObject, toLinkDto, validateLinkBody,
 } from '../links.js';
 import {
-  SLUG_INPUT_MAX, SLUG_RE, checkSlug, normalizeSlug, randomSlug, suggestSlugs, validateSlug, wordSlug,
+  SLUG_INPUT_MAX, SLUG_RE, checkSlug, freeRandomSlug, freeWordSlug, normalizeSlug, suggestSlugs, validateSlug,
 } from '../slugs.js';
 import { KEYWORD_MAX, domainIdeas, domainOptions } from '../domains.js';
-import { STATS_RANGES, allTimeTotals, buildStats, parseTzOffset } from '../analytics.js';
+import { STATS_RANGES, buildStats, parseTzOffset } from '../analytics.js';
 import { clientKey, createRateLimiter } from '../ratelimit.js';
-import { linkChannel, publish } from '../bus.js';
+import { wake } from '../bus.js';
+import { serveLiveStream } from '../live.js';
 import { simulateTraffic } from '../simulate.js';
 
-const SSE_HEARTBEAT_MS = 15_000;
 const SSE_RETRY_AFTER_S = 10;
+/**
+ * A client at its live-stream cap that connects again ends its own oldest stream instead of getting a
+ * 429, once that stream is at least this old (two heartbeats). A dashboard that was closed or reloaded
+ * without its disconnect reaching the server (a proxy that never reports it) then never blocks the next
+ * one, while a client that really has many dashboards open can't make them take turns forever.
+ */
+export const STREAM_EVICT_AFTER_MS = 30_000;
 const BATCH_MAX = 100;
 const TOKEN_MAX = 256;
 
@@ -31,6 +37,9 @@ function queryString(req, name) {
   return typeof v === 'string' ? v : undefined;
 }
 
+/** The link was deleted while this request was working on it. */
+const linkGone = () => new HttpError(404, 'not_found', 'There’s no Blip link with that slug.');
+
 /** Constant-time comparison of sha256(token) with the stored hash. */
 export function tokenMatches(token, storedHash) {
   if (typeof token !== 'string' || !token || token.length > TOKEN_MAX || typeof storedHash !== 'string') return false;
@@ -40,7 +49,7 @@ export function tokenMatches(token, storedHash) {
 }
 
 /**
- * @param {object} ctx shared app context (db, config, now, random, bus, liveTotals, timers, streams, rateLimits, streamLimits)
+ * @param {object} ctx shared app context (db, config, now, random, bus, streams, rateLimits, streamLimits, redact)
  */
 export function createApiRouter(ctx) {
   const { db, config, bus } = ctx;
@@ -58,14 +67,14 @@ export function createApiRouter(ctx) {
   router.use(express.json({ limit: '16kb' }));
 
   /** Loads the link named by :slug and checks X-Manage-Token (401 / 404 / 403). */
-  function requireManage(req, res, next) {
+  async function requireManage(req, res, next) {
     const token = req.get('x-manage-token');
     if (!token) {
       sendError(res, 401, 'unauthorized', 'This action needs the link’s manage token (X-Manage-Token header).');
       return;
     }
     const slug = String(req.params.slug ?? '').toLowerCase();
-    const link = SLUG_RE.test(slug) ? findLinkBySlug(db, slug) : null;
+    const link = SLUG_RE.test(slug) ? await findLinkBySlug(db, slug) : null;
     if (!link) {
       sendError(res, 404, 'not_found', 'There’s no Blip link with that slug.');
       return;
@@ -79,7 +88,8 @@ export function createApiRouter(ctx) {
   }
 
   const dto = (link, now = ctx.now()) => toLinkDto(link, config, now);
-  const publishStatus = (link, now) => publish(bus, link.id, 'status', statusPayload(link, now));
+  /** Open dashboards on this instance re-read the link now (the others notice at their next poll). */
+  const notify = (link) => wake(bus, link.id);
 
   // ---- meta ----------------------------------------------------------------
   router.get('/health', (req, res) => {
@@ -99,11 +109,11 @@ export function createApiRouter(ctx) {
   });
 
   // ---- slugs & domains -----------------------------------------------------
-  router.get('/slugs/check', lookupLimiter, (req, res) => {
-    res.json(checkSlug(db, queryString(req, 'slug') ?? ''));
+  router.get('/slugs/check', lookupLimiter, async (req, res) => {
+    res.json(await checkSlug(db, queryString(req, 'slug') ?? ''));
   });
 
-  router.get('/slugs/suggest', lookupLimiter, (req, res) => {
+  router.get('/slugs/suggest', lookupLimiter, async (req, res) => {
     const phrase = queryString(req, 'phrase') ?? '';
     if (phrase.length > SLUG_INPUT_MAX) throw validationError('phrase', `phrase must be ${SLUG_INPUT_MAX} characters or fewer.`);
     const rawCount = queryString(req, 'count');
@@ -112,7 +122,7 @@ export function createApiRouter(ctx) {
       count = Number(rawCount);
       if (!Number.isInteger(count) || count < 1 || count > 12) throw validationError('count', 'count must be between 1 and 12.');
     }
-    res.json({ suggestions: suggestSlugs(db, phrase, count, { random: ctx.random, now: ctx.now }) });
+    res.json({ suggestions: await suggestSlugs(db, phrase, count, { random: ctx.random, now: ctx.now }) });
   });
 
   router.get('/domains/ideas', lookupLimiter, (req, res) => {
@@ -126,7 +136,7 @@ export function createApiRouter(ctx) {
   });
 
   // ---- links ---------------------------------------------------------------
-  router.post('/links', createLimiter, (req, res) => {
+  router.post('/links', createLimiter, async (req, res) => {
     const body = req.body ?? {};
     if (!isPlainObject(body)) throw validationError(null, 'Request body must be a JSON object.');
     const now = ctx.now();
@@ -144,11 +154,11 @@ export function createApiRouter(ctx) {
         throw new HttpError(400, 'slug_invalid', 'Slugs need at least one letter or number (a-z, 0-9 and dashes).', 'slug');
       }
       if (reason === 'reserved') throw new HttpError(400, 'slug_reserved', `“${slug}” is reserved. Pick another slug.`, 'slug');
-      if (isTaken(slug)) throw new HttpError(409, 'slug_taken', `“${slug}” is already taken. Try a suggestion.`, 'slug');
+      if (await isTaken(slug)) throw new HttpError(409, 'slug_taken', `“${slug}” is already taken. Try a suggestion.`, 'slug');
     } else {
       const style = body.slugStyle ?? 'words';
       if (style !== 'words' && style !== 'random') throw validationError('slugStyle', 'slugStyle must be "words" or "random".');
-      slug = style === 'random' ? randomSlug({ isTaken }) : wordSlug({ isTaken, random: ctx.random });
+      slug = style === 'random' ? await freeRandomSlug({ isTaken }) : await freeWordSlug({ isTaken, random: ctx.random });
     }
 
     const manageToken = crypto.randomBytes(24).toString('base64url');
@@ -161,26 +171,29 @@ export function createApiRouter(ctx) {
       created_at: now,
       updated_at: now,
     };
-    let id;
+    let stored;
     try {
-      id = insertLink(db, row);
+      stored = await insertLink(db, row);
     } catch (err) {
+      // Someone else took the slug between the check above and this insert.
       if (isUniqueViolation(err)) throw new HttpError(409, 'slug_taken', `“${slug}” is already taken. Try a suggestion.`, 'slug');
       throw err;
     }
-    res.status(201).json({ link: dto(findLinkById(db, id), now), manageToken });
+    res.status(201).json({ link: dto(stored, now), manageToken });
   });
 
-  router.post('/links/batch', (req, res) => {
+  router.post('/links/batch', async (req, res) => {
     const items = req.body?.items;
     if (!Array.isArray(items) || items.length > BATCH_MAX) {
       throw validationError('items', `items must be an array of at most ${BATCH_MAX} { slug, token } objects.`);
     }
     const now = ctx.now();
+    const slugOf = (item) => (typeof item?.slug === 'string' ? item.slug : '').toLowerCase();
+    const found = await findLinksBySlugs(db, items.map(slugOf).filter((slug) => SLUG_RE.test(slug))); // one round trip
     const results = items.map((item) => {
       const inputSlug = typeof item?.slug === 'string' ? item.slug : '';
       const slug = inputSlug.toLowerCase();
-      const link = SLUG_RE.test(slug) ? findLinkBySlug(db, slug) : null;
+      const link = SLUG_RE.test(slug) ? found.get(slug) ?? null : null;
       if (!link) return { slug: inputSlug, link: null, error: 'not_found' };
       if (!tokenMatches(item?.token, link.manage_token_hash)) return { slug: inputSlug, link: null, error: 'forbidden' };
       return { slug: inputSlug, link: dto(link, now), error: null };
@@ -192,128 +205,100 @@ export function createApiRouter(ctx) {
     res.json({ link: dto(res.locals.link) });
   });
 
-  router.patch('/links/:slug', requireManage, (req, res) => {
+  router.patch('/links/:slug', requireManage, async (req, res) => {
     const link = res.locals.link;
     const now = ctx.now();
-    const before = linkStatus(link, now);
     const fields = validateLinkBody(req.body ?? {}, { mode: 'update', config, now, current: link });
-    if (Object.keys(fields).length) updateLink(db, link.id, { ...fields, updated_at: now });
-    const updated = findLinkById(db, link.id);
-    const after = linkStatus(updated, now);
-    if (before.status !== after.status || before.expiredReason !== after.expiredReason) publishStatus(updated, now);
+    const updated = Object.keys(fields).length ? await updateLink(db, link.id, { ...fields, updated_at: now }) : link;
+    if (!updated) throw linkGone();
+    // A stream sends `status` only when the status, reason or click numbers actually changed.
+    if (Object.keys(fields).length) notify(updated);
     res.json({ link: dto(updated, now) });
   });
 
-  router.delete('/links/:slug', requireManage, (req, res) => {
+  router.delete('/links/:slug', requireManage, async (req, res) => {
     const link = res.locals.link;
-    deleteLink(db, link.id);
-    ctx.liveTotals.forget(link.id);
-    publish(bus, link.id, 'deleted', { slug: link.slug });
+    await deleteLink(db, link.id);
+    notify(link); // its streams end
     res.status(204).end();
   });
 
-  router.post('/links/:slug/destroy', requireManage, (req, res) => {
+  router.post('/links/:slug/destroy', requireManage, async (req, res) => {
     const link = res.locals.link;
     const now = ctx.now();
-    if (link.destroyed_at === null) {
-      updateLink(db, link.id, { destroyed_at: now, updated_at: now });
-    }
-    const updated = findLinkById(db, link.id);
-    publishStatus(updated, now);
+    const updated = link.destroyed_at === null ? await updateLink(db, link.id, { destroyed_at: now, updated_at: now }) : link;
+    if (!updated) throw linkGone();
+    notify(updated);
     res.json({ link: dto(updated, now) });
   });
 
-  router.post('/links/:slug/revive', requireManage, (req, res) => {
+  router.post('/links/:slug/revive', requireManage, async (req, res) => {
     const link = res.locals.link;
     const now = ctx.now();
-    if (link.destroyed_at !== null) {
-      updateLink(db, link.id, { destroyed_at: null, updated_at: now });
-    }
-    const updated = findLinkById(db, link.id);
-    publishStatus(updated, now);
+    const updated = link.destroyed_at !== null ? await updateLink(db, link.id, { destroyed_at: null, updated_at: now }) : link;
+    if (!updated) throw linkGone();
+    notify(updated);
     res.json({ link: dto(updated, now) });
   });
 
-  router.get('/links/:slug/stats', requireManage, (req, res) => {
+  router.get('/links/:slug/stats', requireManage, async (req, res) => {
     const range = queryString(req, 'range') ?? '7d';
     if (!STATS_RANGES.includes(range)) throw validationError('range', `range must be one of: ${STATS_RANGES.join(', ')}.`);
     const tz = parseTzOffset(queryString(req, 'tz'));
     if (tz === null) throw validationError('tz', 'tz must be a whole number of minutes between -840 and 840.');
-    res.json(buildStats(db, res.locals.link, { range, tz, now: ctx.now() }));
+    res.json(await buildStats(db, res.locals.link, { range, tz, now: ctx.now() }));
   });
 
-  // Open live streams per link id and per client key, so one client (or a leaked token) can't
-  // pin an unbounded number of long-lived connections.
+  // Open live streams per link id and per client key, so one client (or a leaked token) can't pin an
+  // unbounded number of long-lived connections. Counted per server instance. Each is a Set of entries
+  // `{ stream, linkId, client, openedAt }` in the order they opened, so the first one is the oldest.
   const openStreams = { byLink: new Map(), byClient: new Map() };
-  const bump = (map, key, delta) => {
-    const n = (map.get(key) ?? 0) + delta;
-    if (n > 0) map.set(key, n);
-    else map.delete(key);
+  const track = (map, key, entry) => {
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key).add(entry);
+  };
+  const untrack = (map, key, entry) => {
+    const set = map.get(key);
+    set?.delete(entry);
+    if (set && !set.size) map.delete(key);
+  };
+  const oldest = (set, pred) => {
+    for (const entry of set ?? []) if (pred(entry)) return entry;
+    return null;
   };
 
-  router.get('/links/:slug/stream', requireManage, (req, res) => {
+  router.get('/links/:slug/stream', requireManage, async (req, res) => {
     const link = res.locals.link;
-    const channel = linkChannel(link.id);
     const client = clientKey(req.ip);
     const { perLink, perClient } = ctx.streamLimits;
-    if ((openStreams.byLink.get(link.id) ?? 0) >= perLink || (openStreams.byClient.get(client) ?? 0) >= perClient) {
+    const now = ctx.now();
+    // Only this client's own streams can make room, and only ones old enough (STREAM_EVICT_AFTER_MS):
+    // a leaked token can never end the owner's dashboards.
+    const evictable = (entry) => entry.client === client && entry.stream && now - entry.openedAt >= STREAM_EVICT_AFTER_MS;
+    const evict = [];
+    const forLink = openStreams.byLink.get(link.id);
+    if ((forLink?.size ?? 0) >= perLink) evict.push(oldest(forLink, evictable));
+    const forClient = openStreams.byClient.get(client);
+    if ((forClient?.size ?? 0) - evict.length >= perClient) evict.push(oldest(forClient, (entry) => evictable(entry) && !evict.includes(entry)));
+    if (evict.includes(null)) {
       res.set('Retry-After', String(SSE_RETRY_AFTER_S));
       sendError(res, 429, 'rate_limited', 'Too many live dashboards are open. Close one and try again.');
       return;
     }
-    bump(openStreams.byLink, link.id, 1);
-    bump(openStreams.byClient, client, 1);
-    res.status(200).set({
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-store',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    res.flushHeaders();
-    req.socket?.setNoDelay?.(true);
+    for (const entry of evict) entry.stream.end(); // its onClose releases the slot
 
-    const write = (chunk) => {
-      if (!res.writableEnded && !res.destroyed) res.write(chunk);
-    };
-    const send = (event, data) => write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-
-    let closed = false;
-    const stream = {
-      end() {
-        cleanup();
-        if (!res.writableEnded) res.end();
+    const entry = { stream: null, linkId: link.id, client, openedAt: now };
+    track(openStreams.byLink, link.id, entry);
+    track(openStreams.byClient, client, entry);
+    await serveLiveStream(ctx, req, res, link, {
+      onOpen(stream) {
+        entry.stream = stream;
       },
-    };
-    const onEvent = ({ type, data }) => {
-      if (type === 'deleted') stream.end();
-      else send(type, data);
-    };
-    const heartbeat = setInterval(() => write(': ping\n\n'), SSE_HEARTBEAT_MS);
-    heartbeat.unref?.();
-    function cleanup() {
-      if (closed) return;
-      closed = true;
-      clearInterval(heartbeat);
-      bus.off(channel, onEvent);
-      ctx.streams.delete(stream);
-      bump(openStreams.byLink, link.id, -1);
-      bump(openStreams.byClient, client, -1);
-      // Running live totals are only kept while someone is watching this link.
-      if (bus.listenerCount(channel) === 0) ctx.liveTotals.forget(link.id);
-    }
-
-    bus.on(channel, onEvent);
-    ctx.streams.add(stream);
-    // `res` 'close' fires when the client disconnects or we end the stream.
-    res.on('close', cleanup);
-    req.on('close', () => {
-      if (res.destroyed || req.socket?.destroyed) cleanup();
+      onClose() {
+        untrack(openStreams.byLink, link.id, entry);
+        untrack(openStreams.byClient, client, entry);
+      },
     });
-    // Computed synchronously right after subscribing, so these totals also seed the running
-    // counters that later `click` events advance (no rescan on the first click).
-    const totals = allTimeTotals(db, link, ctx.now());
-    ctx.liveTotals.seed(link.id, totals);
-    send('hello', { slug: link.slug, totals });
   });
 
   router.post(
@@ -327,7 +312,7 @@ export function createApiRouter(ctx) {
     },
     simulateLimiter,
     requireManage,
-    (req, res) => {
+    async (req, res) => {
       const body = req.body ?? {};
       if (!isPlainObject(body)) throw validationError(null, 'Request body must be a JSON object.');
       let count = 12;
@@ -335,16 +320,18 @@ export function createApiRouter(ctx) {
         count = Number(body.count);
         if (!Number.isInteger(count) || count < 1 || count > 50) throw validationError('count', 'count must be between 1 and 50.');
       }
-      const inserted = simulateTraffic({
-        db, bus, link: res.locals.link, count, now: ctx.now(), random: ctx.random, timers: ctx.timers, liveTotals: ctx.liveTotals,
-      });
+      const link = res.locals.link;
+      const inserted = await simulateTraffic({ db, link, count, now: ctx.now(), random: ctx.random });
+      notify(link);
       res.json({ inserted });
     },
   );
 
-  router.delete('/links/:slug/simulated', requireManage, (req, res) => {
-    const deleted = deleteSyntheticClicks(db, res.locals.link.id);
-    ctx.liveTotals.forget(res.locals.link.id); // re-seeded from the database on the next live click
+  router.delete('/links/:slug/simulated', requireManage, async (req, res) => {
+    const link = res.locals.link;
+    // Also bumps the clicks epoch, so every open dashboard (on any instance) recounts its live totals.
+    const deleted = await deleteSyntheticClicks(db, link.id);
+    notify(link);
     res.json({ deleted });
   });
 

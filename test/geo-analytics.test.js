@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanIp, geoFromHeaders, isPublicIp, lookupGeo } from '../server/geo.js';
+import { readFileSync } from 'node:fs';
+import { GEOIP_PACKAGE, cleanIp, createGeoLookup, geoFromHeaders, isPublicIp, lookupGeo } from '../server/geo.js';
 import {
   countryInfo, isBotUA, parseTzOffset, parseUserAgent, rangeWindow, referrerHost, visitorHash,
 } from '../server/analytics.js';
@@ -57,6 +58,52 @@ describe('geo', () => {
     const geo = await lookupGeo('8.8.8.8', {}, { timeoutMs: 5000 });
     assert.equal(geo?.country, 'US');
     if (geo.lat !== null) assert.equal(geo.lat, Math.round(geo.lat * 10) / 10, 'coordinates rounded to 1 decimal');
+  });
+});
+
+describe('geo on Vercel', () => {
+  const VERCEL = {
+    'x-vercel-ip-country': 'JP',
+    'x-vercel-ip-city': 'S%C3%A3o%20Tom%C3%A9', // URI-encoded, as Vercel sends it
+    'x-vercel-ip-country-region': '13',
+    'x-vercel-ip-latitude': '35.6895',
+    'x-vercel-ip-longitude': '139.6917',
+  };
+
+  it('reads location from the x-vercel-ip-* headers, decoding the city', () => {
+    assert.deepEqual(geoFromHeaders(VERCEL, { vercel: true }), { country: 'JP', region: '13', city: 'São Tomé', lat: 35.7, lon: 139.7 });
+    assert.deepEqual(
+      geoFromHeaders({ 'x-vercel-ip-country': 'de', 'x-vercel-ip-city': 'M%FCnchen' }, { vercel: true }),
+      { country: 'DE', region: null, city: 'M%FCnchen', lat: null, lon: null },
+      'a city that is not valid URI encoding is kept as sent',
+    );
+  });
+
+  it("ignores other CDNs' headers, which on Vercel could only come from the visitor", async () => {
+    const spoofed = { 'cf-ipcountry': 'FR', 'cf-ipcity': 'Paris', 'cloudfront-viewer-country': 'IT' };
+    assert.equal(geoFromHeaders(spoofed, { vercel: true }), null);
+    assert.equal(geoFromHeaders({ ...spoofed, ...VERCEL }, { vercel: true }).country, 'JP');
+    assert.equal(await createGeoLookup({ vercel: true })('8.8.8.8', spoofed), null);
+    assert.equal((await createGeoLookup()('8.8.8.8', spoofed)).country, 'FR', 'elsewhere the first CDN header still wins');
+  });
+
+  it('never loads fast-geoip, even for a public IP without headers', async () => {
+    const imported = [];
+    const importer = async (name) => {
+      imported.push(name);
+      return { default: { lookup: async () => ({ country: 'US', ll: [1, 2] }) } };
+    };
+    assert.equal(await lookupGeo('8.8.8.8', {}, { vercel: true, importer }), null);
+    assert.deepEqual(imported, [], 'not imported on Vercel');
+    assert.equal((await lookupGeo('8.8.8.8', {}, { importer })).country, 'US', 'elsewhere it is the fallback');
+    assert.deepEqual(imported, [GEOIP_PACKAGE]);
+  });
+
+  it('imports fast-geoip through a specifier a file tracer cannot follow', () => {
+    // Vercel's tracer bundles every package named in an import() or require() call; fast-geoip is 159 MB.
+    const source = readFileSync(new URL('../server/geo.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /\b(?:import|require)\s*\(\s*['"`]fast-geoip/);
+    assert.doesNotMatch(source, /from\s+['"]fast-geoip['"]/);
   });
 });
 

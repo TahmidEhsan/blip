@@ -2,16 +2,13 @@
 // Synthetic clicks are flagged `is_synthetic = 1`, never touch `click_count`, and can be wiped at any time.
 import crypto from 'node:crypto';
 import { CITIES } from './data/cities.js';
-import { insertClick, transaction } from './db.js';
-import { clickEventFromRow, createLiveTotalsTracker } from './analytics.js';
-import { linkChannel, publish } from './bus.js';
+import { insertClicks } from './db.js';
 
 const DAY = 86_400_000;
 // The dashboard's default "7d" range is 7 local calendar days ending today, so it starts at local
 // midnight six days ago, i.e. never later than now − 6 days in any time zone. Spreading synthetic
 // clicks over the last 6 days keeps every one of them inside that default view.
 export const SIMULATE_SPREAD_MS = 6 * DAY;
-export const SIMULATE_STAGGER_MS = 150;
 
 const DEVICE_MIX = [['mobile', 55], ['desktop', 38], ['tablet', 7]];
 const PLATFORM_MIX = {
@@ -93,37 +90,14 @@ export function generateSyntheticClicks({ linkId, outcome, count, now, random })
 }
 
 /**
- * Insert synthetic clicks and, when a live dashboard is listening, schedule staggered `click` events.
- * @param {{
- *   db: import('node:sqlite').DatabaseSync, bus: import('node:events').EventEmitter, link: object, count: number,
- *   now: number, random: () => number, timers: Set<NodeJS.Timeout>,
- *   liveTotals?: ReturnType<typeof createLiveTotalsTracker>,
- * }} opts `liveTotals` is the app's shared running-totals tracker (a throwaway one is used when omitted)
- * @returns {number} rows inserted
+ * Insert synthetic clicks, all at once in one atomic batch (one round trip), before the response goes
+ * out. Nothing is scheduled afterwards: open dashboards pick the rows up from the database and play
+ * them back a little apart (server/live.js), whichever server instance they are connected to.
+ * @param {{ db: import('./db.js').Database, link: object, count: number, now: number, random: () => number }} opts
+ * @returns {Promise<number>} rows inserted (0 when the link was deleted meanwhile)
  */
-export function simulateTraffic({ db, bus, link, count, now, random, timers, liveTotals = createLiveTotalsTracker(db) }) {
+export async function simulateTraffic({ db, link, count, now, random }) {
   const outcome = link.redirect_mode === 'teaser' ? 'teaser' : 'redirect';
   const rows = generateSyntheticClicks({ linkId: link.id, outcome, count, now, random });
-  const listening = bus.listenerCount(linkChannel(link.id)) > 0;
-  // Seed the running totals BEFORE inserting, so advancing once per row below lands on the right numbers.
-  if (listening) liveTotals.ensure(link.id);
-  const stored = transaction(db, () => rows.map((row) => insertClick(db, row)));
-  if (!listening) {
-    // Nobody is watching: the rows are already in the stats, and a dashboard that opens later
-    // gets them through its `hello` totals and stats fetch.
-    liveTotals.forget(link.id);
-    return stored.length;
-  }
-
-  stored.forEach((row, i) => {
-    // is_unique was computed against the DB as rows were inserted (oldest first), in this same order.
-    const payload = { ...clickEventFromRow(row), totals: liveTotals.advance(link.id, row) };
-    const timer = setTimeout(() => {
-      timers.delete(timer);
-      publish(bus, link.id, 'click', payload);
-    }, i * SIMULATE_STAGGER_MS);
-    timer.unref?.();
-    timers.add(timer);
-  });
-  return stored.length;
+  return (await insertClicks(db, rows)).length;
 }

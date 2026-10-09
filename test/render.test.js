@@ -52,8 +52,8 @@ describe('renderTemplate', () => {
 });
 
 describe('renderView', () => {
-  it('only renders the four known views (no path traversal)', async () => {
-    assert.deepEqual([...VIEW_NAMES], ['teaser', 'expired', 'not-found', 'preview']);
+  it('only renders the known views (no path traversal)', async () => {
+    assert.deepEqual([...VIEW_NAMES], ['teaser', 'expired', 'not-found', 'preview', 'unavailable']);
     await assert.rejects(() => renderView('../app'), /Unknown view/);
     await assert.rejects(() => renderView('index'), /Unknown view/);
     await assert.rejects(() => renderView('teaser.html'), /Unknown view/);

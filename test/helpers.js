@@ -1,6 +1,9 @@
 // Shared test helpers: boot an isolated Blip app on an ephemeral port with a mutable clock.
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import fs from 'node:fs';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { createApp } from '../server/app.js';
 
 export const START_TIME = Date.parse('2026-10-07T12:00:00.000Z');
@@ -21,7 +24,9 @@ export const UA = {
  * Start an app + server. Rate limits are raised by default so tests can create many links;
  * pass `rateLimits: null` to keep the production limits.
  */
-export async function startServer({ config = {}, geoLookup, random, rateLimits, streamLimits, startTime = START_TIME } = {}) {
+export async function startServer({
+  config = {}, geoLookup, random, rateLimits, streamLimits, databaseTimeoutMs, startupTimeoutMs, startTime = START_TIME,
+} = {}) {
   const clock = { t: startTime };
   const instance = createApp({
     config: { dbPath: ':memory:', baseUrl: 'http://localhost:3030', allowDemoTraffic: true, ...config },
@@ -30,7 +35,10 @@ export async function startServer({ config = {}, geoLookup, random, rateLimits, 
     random,
     rateLimits: rateLimits === null ? undefined : { createLink: 100_000, simulate: 100_000, lookup: 100_000, ...(rateLimits || {}) },
     streamLimits,
+    databaseTimeoutMs,
+    startupTimeoutMs,
   });
+  await instance.ready; // migrations done, so tests can query `db` straight away
   const server = instance.app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -65,7 +73,7 @@ export async function startServer({ config = {}, geoLookup, random, rateLimits, 
     instance.endStreams();
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
-    instance.close();
+    await instance.close();
   }
 
   return {
@@ -85,7 +93,8 @@ export async function startServer({ config = {}, geoLookup, random, rateLimits, 
 
 /**
  * Open the SSE stream for a link and expose a promise-based event reader.
- * @returns {Promise<{ status: number, headers: Headers, next: (pred?: (e) => boolean, timeoutMs?: number) => Promise<{event: string, data: any}>, close: () => void }>}
+ * `ended` resolves when the server ends the stream (or close() aborts it).
+ * @returns {Promise<{ status: number, headers: Headers, ended: Promise<void>, next: (pred?: (e) => boolean, timeoutMs?: number) => Promise<{event: string, data: any}>, close: () => void }>}
  */
 export async function openStream(base, slug, token) {
   const controller = new AbortController();
@@ -112,8 +121,9 @@ export async function openStream(base, slug, token) {
     }
   };
 
+  let ended = Promise.resolve();
   if (res.ok && res.body) {
-    (async () => {
+    ended = (async () => {
       const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
       try {
         for (;;) {
@@ -144,6 +154,7 @@ export async function openStream(base, slug, token) {
   return {
     status: res.status,
     headers: res.headers,
+    ended,
     get comments() {
       return comments;
     },
@@ -162,6 +173,38 @@ export async function openStream(base, slug, token) {
       controller.abort();
     },
   };
+}
+
+let collectGarbage = null;
+
+/**
+ * Remove a temp folder that held database files. On Windows a closed libSQL database keeps its file
+ * open until its prepared statements are garbage collected, so when the first attempt fails this
+ * forces a collection, lets the finalizers run, and tries again. A folder that still can't be removed
+ * is left for the OS to clean up rather than failing the suite.
+ */
+export async function removeTempDir(dir) {
+  const attempt = () => fs.rmSync(dir, { recursive: true, force: true });
+  try {
+    attempt();
+    return;
+  } catch {
+    // locked: fall through
+  }
+  for (let i = 0; i < 5; i += 1) {
+    if (!collectGarbage) {
+      v8.setFlagsFromString('--expose-gc');
+      collectGarbage = vm.runInNewContext('gc');
+    }
+    collectGarbage();
+    await new Promise((resolve) => setTimeout(resolve, 20 * (i + 1)));
+    try {
+      attempt();
+      return;
+    } catch {
+      // still locked
+    }
+  }
 }
 
 /** Extract and parse the `<script type="application/json" id="blip-data">` payload of a view. */

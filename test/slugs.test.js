@@ -1,7 +1,8 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  RANDOM_ALPHABET, RESERVED_SLUGS, SLUG_RE, checkSlug, normalizeSlug, randomSlug, suggestSlugs, validateSlug, wordSlug,
+  RANDOM_ALPHABET, RESERVED_SLUGS, SLUG_RE, checkSlug, freeRandomSlug, freeWordSlug, normalizeSlug, randomSlug, suggestSlugs,
+  validateSlug, wordSlug,
 } from '../server/slugs.js';
 import { ADJECTIVES, NOUNS } from '../server/words.js';
 import { openDatabase, insertLink } from '../server/db.js';
@@ -13,8 +14,8 @@ describe('slugs', () => {
     ...LINK_DEFAULTS, slug, domain: 'localhost:3030', target_url: 'https://example.com/', manage_token_hash: 'x', created_at: 1, updated_at: 1,
   });
 
-  before(() => {
-    db = openDatabase(':memory:');
+  before(async () => {
+    db = await openDatabase(':memory:');
   });
   after(() => db.close());
 
@@ -47,18 +48,18 @@ describe('slugs', () => {
     }
   });
 
-  it('checkSlug reports empty / invalid / reserved / taken / available', () => {
-    addLink('taken-one');
-    assert.deepEqual(checkSlug(db, ''), { input: '', normalized: '', valid: false, available: false, reason: 'empty' });
-    assert.equal(checkSlug(db, '!!!').reason, 'invalid');
-    assert.equal(checkSlug(db, 'x'.repeat(201)).reason, 'invalid');
-    assert.equal(checkSlug(db, 'API').reason, 'reserved');
-    const taken = checkSlug(db, 'Taken One');
+  it('checkSlug reports empty / invalid / reserved / taken / available', async () => {
+    await addLink('taken-one');
+    assert.deepEqual(await checkSlug(db, ''), { input: '', normalized: '', valid: false, available: false, reason: 'empty' });
+    assert.equal((await checkSlug(db, '!!!')).reason, 'invalid');
+    assert.equal((await checkSlug(db, 'x'.repeat(201))).reason, 'invalid');
+    assert.equal((await checkSlug(db, 'API')).reason, 'reserved');
+    const taken = await checkSlug(db, 'Taken One');
     assert.equal(taken.normalized, 'taken-one');
     assert.equal(taken.valid, true);
     assert.equal(taken.available, false);
     assert.equal(taken.reason, 'taken');
-    assert.deepEqual(checkSlug(db, 'Fresh Idea'), { input: 'Fresh Idea', normalized: 'fresh-idea', valid: true, available: true, reason: null });
+    assert.deepEqual(await checkSlug(db, 'Fresh Idea'), { input: 'Fresh Idea', normalized: 'fresh-idea', valid: true, available: true, reason: null });
   });
 
   it('randomSlug uses 7 unambiguous characters and avoids collisions', () => {
@@ -86,23 +87,41 @@ describe('slugs', () => {
     assert.ok(SLUG_RE.test(triple));
   });
 
-  it('suggestSlugs returns valid, available, unique suggestions', () => {
-    addLink('summer-sale');
+  it('freeWordSlug and freeRandomSlug take an async isTaken and pick the same slugs', async () => {
+    const seeded = (seed) => () => {
+      seed = (seed * 16807) % 2147483647;
+      return (seed - 1) / 2147483646;
+    };
+    const takenTwoPart = (x) => x.split('-').length === 2;
+    assert.equal(
+      await freeWordSlug({ isTaken: async (x) => takenTwoPart(x), random: seeded(7) }),
+      wordSlug({ isTaken: takenTwoPart, random: seeded(7) }),
+      'same candidates, same order, same draws from random',
+    );
+    const asked = [];
+    const free = await freeRandomSlug({ isTaken: async (x) => { asked.push(x); return asked.length < 3; } });
+    assert.equal(asked.length, 3, 'one lookup per candidate until a free one');
+    assert.equal(free, asked[2]);
+    assert.equal(free.length, 7);
+  });
+
+  it('suggestSlugs returns valid, available, unique suggestions', async () => {
+    await addLink('summer-sale');
     const now = () => Date.parse('2026-10-07T12:00:00Z');
-    const list = suggestSlugs(db, 'Summer Sale', 8, { now });
+    const list = await suggestSlugs(db, 'Summer Sale', 8, { now });
     assert.equal(list.length, 8);
     assert.equal(new Set(list).size, 8);
     assert.ok(!list.includes('summer-sale'), 'taken slug must not be suggested');
     assert.equal(list[0], 'summer-sale-2026');
     assert.ok(list.includes('summer-sale-go'));
-    for (const s of list) assert.equal(checkSlug(db, s).available, true, s);
+    for (const s of list) assert.equal((await checkSlug(db, s)).available, true, s);
 
-    const words = suggestSlugs(db, '', 5);
+    const words = await suggestSlugs(db, '', 5);
     assert.equal(words.length, 5);
     for (const s of words) assert.match(s, /^[a-z]+-[a-z]+(-[a-z0-9]+)?$/);
 
-    assert.equal(suggestSlugs(db, 'api').includes('api'), false, 'reserved never suggested');
-    assert.equal(suggestSlugs(db, 'x', 50).length, 12, 'count is capped at 12');
+    assert.equal((await suggestSlugs(db, 'api')).includes('api'), false, 'reserved never suggested');
+    assert.equal((await suggestSlugs(db, 'x', 50)).length, 12, 'count is capped at 12');
   });
 
   it('word lists are big, unique and family-friendly shaped', () => {

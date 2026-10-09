@@ -1,7 +1,7 @@
 // Blip: slug normalisation, validation and generation (SPEC §4.1).
 import crypto from 'node:crypto';
 import { ADJECTIVES, NOUNS } from './words.js';
-import { slugTaken } from './db.js';
+import { slugTaken, takenSlugs } from './db.js';
 
 export const SLUG_MAX = 64;
 /** Raw slug input longer than this is rejected outright instead of being truncated. */
@@ -51,9 +51,9 @@ export function validateSlug(slug) {
 
 /**
  * Full check of user input, as returned by GET /api/slugs/check.
- * @returns {{ input: string, normalized: string, valid: boolean, available: boolean, reason: null|'empty'|'invalid'|'reserved'|'taken' }}
+ * @returns {Promise<{ input: string, normalized: string, valid: boolean, available: boolean, reason: null|'empty'|'invalid'|'reserved'|'taken' }>}
  */
-export function checkSlug(db, input) {
+export async function checkSlug(db, input) {
   const raw = input === null || input === undefined ? '' : String(input);
   const tooLong = raw.length > SLUG_INPUT_MAX;
   const normalized = tooLong ? '' : normalizeSlug(raw);
@@ -62,7 +62,7 @@ export function checkSlug(db, input) {
   else if (tooLong || !normalized) reason = 'invalid';
   else reason = validateSlug(normalized);
   const valid = reason === null;
-  if (valid && slugTaken(db, normalized)) reason = 'taken';
+  if (valid && await slugTaken(db, normalized)) reason = 'taken';
   return { input: raw, normalized, valid, available: valid && reason === null, reason };
 }
 
@@ -75,18 +75,56 @@ export function cryptoRandom() {
 const pickWord = (list, random) => list[Math.min(list.length - 1, Math.floor(random() * list.length))];
 
 /**
+ * Random slug candidates: crypto-random characters from an unambiguous alphabet, growing by one
+ * character every 10 attempts, 60 attempts in all. Lazy, so only the candidates tried are drawn.
+ */
+function* randomSlugCandidates(length) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const len = Math.min(SLUG_MAX, length + Math.floor(attempt / 10));
+    let slug = '';
+    for (let i = 0; i < len; i += 1) slug += RANDOM_ALPHABET[crypto.randomInt(RANDOM_ALPHABET.length)];
+    yield slug;
+  }
+}
+
+/**
+ * Word slug candidates: 12 × `adjective-noun`, then 12 × `adjective-noun-NN`, then
+ * 12 × `adjective-adjective-noun`, then (practically unreachable) `adjective-noun-<random>`.
+ * Lazy, so `random` is only called for the candidates tried.
+ */
+function* wordSlugCandidates(random) {
+  for (let i = 0; i < 12; i += 1) yield `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}`;
+  for (let i = 0; i < 12; i += 1) {
+    const n = 10 + Math.floor(random() * 90);
+    yield `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}-${n}`;
+  }
+  for (let i = 0; i < 12; i += 1) {
+    const a = pickWord(ADJECTIVES, random);
+    let b = pickWord(ADJECTIVES, random);
+    if (b === a) b = ADJECTIVES[(ADJECTIVES.indexOf(a) + 1) % ADJECTIVES.length];
+    yield `${a}-${b}-${pickWord(NOUNS, random)}`;
+  }
+  const base = `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}`;
+  for (const tail of randomSlugCandidates(4)) yield `${base}-${tail}`;
+}
+
+function firstFree(candidates, isTaken, kind) {
+  for (const slug of candidates) if (isUsableSlug(slug) && !isTaken(slug)) return slug;
+  throw new Error(`Could not generate a unique ${kind} slug`);
+}
+
+async function firstFreeAsync(candidates, isTaken, kind) {
+  for (const slug of candidates) if (isUsableSlug(slug) && !(await isTaken(slug))) return slug;
+  throw new Error(`Could not generate a unique ${kind} slug`);
+}
+
+/**
  * 7 crypto-random characters from an unambiguous alphabet; retries on collision
  * (and grows by one character every 10 failed attempts).
  * @param {{ isTaken?: (slug: string) => boolean, length?: number }} [opts]
  */
 export function randomSlug({ isTaken = () => false, length = 7 } = {}) {
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const len = Math.min(SLUG_MAX, length + Math.floor(attempt / 10));
-    let slug = '';
-    for (let i = 0; i < len; i += 1) slug += RANDOM_ALPHABET[crypto.randomInt(RANDOM_ALPHABET.length)];
-    if (isUsableSlug(slug) && !isTaken(slug)) return slug;
-  }
-  throw new Error('Could not generate a unique random slug');
+  return firstFree(randomSlugCandidates(length), isTaken, 'random');
 }
 
 /**
@@ -94,26 +132,24 @@ export function randomSlug({ isTaken = () => false, length = 7 } = {}) {
  * @param {{ isTaken?: (slug: string) => boolean, random?: () => number }} [opts]
  */
 export function wordSlug({ isTaken = () => false, random = cryptoRandom } = {}) {
-  const ok = (s) => isUsableSlug(s) && !isTaken(s);
-  for (let i = 0; i < 12; i += 1) {
-    const s = `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}`;
-    if (ok(s)) return s;
-  }
-  for (let i = 0; i < 12; i += 1) {
-    const n = 10 + Math.floor(random() * 90);
-    const s = `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}-${n}`;
-    if (ok(s)) return s;
-  }
-  for (let i = 0; i < 12; i += 1) {
-    const a = pickWord(ADJECTIVES, random);
-    let b = pickWord(ADJECTIVES, random);
-    if (b === a) b = ADJECTIVES[(ADJECTIVES.indexOf(a) + 1) % ADJECTIVES.length];
-    const s = `${a}-${b}-${pickWord(NOUNS, random)}`;
-    if (ok(s)) return s;
-  }
-  // Practically unreachable: append crypto-random characters until unique.
-  const base = `${pickWord(ADJECTIVES, random)}-${pickWord(NOUNS, random)}`;
-  return `${base}-${randomSlug({ isTaken: (tail) => isTaken(`${base}-${tail}`), length: 4 })}`;
+  return firstFree(wordSlugCandidates(random), isTaken, 'word');
+}
+
+/**
+ * randomSlug with an async `isTaken` (one database lookup per candidate tried; the first one is
+ * almost always free).
+ * @param {{ isTaken: (slug: string) => Promise<boolean>|boolean, length?: number }} opts
+ */
+export function freeRandomSlug({ isTaken, length = 7 }) {
+  return firstFreeAsync(randomSlugCandidates(length), isTaken, 'random');
+}
+
+/**
+ * wordSlug with an async `isTaken`: the same candidates, in the same order, drawing `random` the same way.
+ * @param {{ isTaken: (slug: string) => Promise<boolean>|boolean, random?: () => number }} opts
+ */
+export function freeWordSlug({ isTaken, random = cryptoRandom }) {
+  return firstFreeAsync(wordSlugCandidates(random), isTaken, 'word');
 }
 
 function withSuffix(base, suffix) {
@@ -131,20 +167,27 @@ function withPrefix(prefix, base) {
 /**
  * Up to `count` valid, available, unique slug suggestions.
  * With a phrase: the phrase itself, phrase + year, phrase + short words, adjective-phrase…, then word slugs.
- * @param {import('node:sqlite').DatabaseSync} db
+ * Candidates are checked against the database in bulk (one round trip per round, usually one or two).
+ * @param {import('./db.js').Database} db
  * @param {string} [phrase]
  * @param {number} [count]
  * @param {{ random?: () => number, now?: () => number }} [opts]
+ * @returns {Promise<string[]>}
  */
-export function suggestSlugs(db, phrase = '', count = 6, { random = cryptoRandom, now = Date.now } = {}) {
+export async function suggestSlugs(db, phrase = '', count = 6, { random = cryptoRandom, now = Date.now } = {}) {
   const want = Math.max(1, Math.min(12, Math.floor(Number(count)) || 6));
-  const isTaken = (s) => slugTaken(db, s);
   const out = [];
   const seen = new Set();
-  const offer = (candidate) => {
-    if (out.length >= want || !candidate || seen.has(candidate)) return;
-    seen.add(candidate);
-    if (isUsableSlug(candidate) && !isTaken(candidate)) out.push(candidate);
+  /** Offer candidates in order: new, usable and not taken ones are kept until `want` is reached. */
+  const offerAll = async (candidates) => {
+    const fresh = [];
+    for (const candidate of candidates) {
+      if (!candidate || seen.has(candidate)) continue;
+      seen.add(candidate);
+      if (isUsableSlug(candidate)) fresh.push(candidate);
+    }
+    const taken = await takenSlugs(db, fresh);
+    for (const candidate of fresh) if (out.length < want && !taken.has(candidate)) out.push(candidate);
   };
 
   const p = typeof phrase === 'string' && phrase.length <= SLUG_INPUT_MAX ? normalizeSlug(phrase) : '';
@@ -166,12 +209,17 @@ export function suggestSlugs(db, phrase = '', count = 6, { random = cryptoRandom
       withPrefix(adjectives[2], p),
       withSuffix(p, String(year + 1)),
     ];
-    for (const c of candidates) offer(c);
+    await offerAll(candidates);
   }
+  // Fill with word slugs, a round at a time: draw as many as are still missing, then check them together.
   let guard = 0;
   while (out.length < want && guard < want * 10) {
-    guard += 1;
-    offer(wordSlug({ isTaken: (s) => seen.has(s) || isTaken(s), random }));
+    const round = [];
+    while (round.length < want - out.length && guard < want * 10) {
+      guard += 1;
+      round.push(wordSlug({ isTaken: (s) => seen.has(s) || round.includes(s), random }));
+    }
+    await offerAll(round);
   }
   return out;
 }

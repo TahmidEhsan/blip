@@ -1,5 +1,9 @@
 // Blip: privacy-friendly visitor geolocation (SPEC §4.4).
 // 1. CDN/edge country headers, 2. the optional offline `fast-geoip` database.
+// On Vercel only Vercel's own x-vercel-ip-* headers count (its edge sets them on every request, while
+// any other CDN's header would come straight from the visitor), and fast-geoip is never loaded: its
+// 159 MB of data would not fit in a function, so it is imported through a specifier Vercel's file
+// tracer can't follow (see importOptional).
 // Coordinates are rounded to 1 decimal; raw IPs are never stored or logged.
 import net from 'node:net';
 
@@ -11,6 +15,22 @@ const REGION_HEADERS = ['cf-region-code', 'x-vercel-ip-country-region', 'cloudfr
 const LAT_HEADERS = ['cf-iplatitude', 'x-vercel-ip-latitude', 'cloudfront-viewer-latitude'];
 const LON_HEADERS = ['cf-iplongitude', 'x-vercel-ip-longitude', 'cloudfront-viewer-longitude'];
 const IGNORED_COUNTRIES = new Set(['XX', 'T1', 'ZZ', 'EU', 'AP']);
+
+/** The headers Vercel's edge sets on every request (the city is URI-encoded). */
+export const VERCEL_GEO_HEADERS = Object.freeze({
+  country: ['x-vercel-ip-country'],
+  city: ['x-vercel-ip-city'],
+  region: ['x-vercel-ip-country-region'],
+  lat: ['x-vercel-ip-latitude'],
+  lon: ['x-vercel-ip-longitude'],
+});
+const ANY_CDN_HEADERS = Object.freeze({
+  country: COUNTRY_HEADERS,
+  city: CITY_HEADERS,
+  region: REGION_HEADERS,
+  lat: LAT_HEADERS,
+  lon: LON_HEADERS,
+});
 
 /** Strip an IPv6 zone id and an IPv4-mapped `::ffff:` prefix. */
 export function cleanIp(ip) {
@@ -107,32 +127,50 @@ function coords(lat, lon) {
   return { lat: round1(la), lon: round1(lo) };
 }
 
-/** Geo from trusted edge headers (Cloudflare, Vercel, CloudFront, generic). */
-export function geoFromHeaders(headers) {
-  const country = header(headers, COUNTRY_HEADERS)?.toUpperCase();
+/**
+ * Geo from trusted edge headers (Cloudflare, Vercel, CloudFront, generic).
+ * @param {object} headers request headers
+ * @param {{ vercel?: boolean }} [opts] on Vercel, read only the x-vercel-ip-* headers
+ */
+export function geoFromHeaders(headers, { vercel = false } = {}) {
+  const names = vercel ? VERCEL_GEO_HEADERS : ANY_CDN_HEADERS;
+  const country = header(headers, names.country)?.toUpperCase();
   if (!country || !/^[A-Z]{2}$/.test(country) || IGNORED_COUNTRIES.has(country)) return null;
-  const { lat, lon } = coords(header(headers, LAT_HEADERS), header(headers, LON_HEADERS));
-  const region = header(headers, REGION_HEADERS);
+  const { lat, lon } = coords(header(headers, names.lat), header(headers, names.lon));
+  const region = header(headers, names.region);
   return {
     country,
     region: region && /^[A-Za-z0-9-]{1,10}$/.test(region) ? region.toUpperCase() : null,
-    city: decodeHeader(header(headers, CITY_HEADERS)),
+    city: decodeHeader(header(headers, names.city)),
     lat,
     lon,
   };
 }
 
+/** The optional offline geo database (an optionalDependency, so it may be missing). */
+export const GEOIP_PACKAGE = 'fast-geoip';
+
+/**
+ * import() of a package named at run time. A file tracer (Vercel's) only follows import() calls whose
+ * specifier is written out in the call, so a package loaded through here is never bundled.
+ */
+function importOptional(specifier) {
+  return import(specifier);
+}
+
+const importGeoip = (importer) => Promise.resolve()
+  .then(() => importer(GEOIP_PACKAGE))
+  .then((mod) => {
+    const lib = mod?.default ?? mod;
+    return typeof lib?.lookup === 'function' ? lib : null;
+  })
+  .catch(() => null);
+
 let geoipModule;
-/** Lazily import the optional fast-geoip package once; null when unavailable. */
-function loadGeoip() {
-  if (geoipModule === undefined) {
-    geoipModule = import('fast-geoip')
-      .then((mod) => {
-        const lib = mod.default ?? mod;
-        return typeof lib?.lookup === 'function' ? lib : null;
-      })
-      .catch(() => null);
-  }
+/** Lazily import the optional fast-geoip package once; null when unavailable. A test's importer is never cached. */
+function loadGeoip(importer) {
+  if (importer) return importGeoip(importer);
+  geoipModule ??= importGeoip(importOptional);
   return geoipModule;
 }
 
@@ -145,8 +183,8 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function geoFromDatabase(ip) {
-  const lib = await loadGeoip();
+async function geoFromDatabase(ip, importer) {
+  const lib = await loadGeoip(importer);
   if (!lib) return null;
   const r = await lib.lookup(ip);
   if (!r || typeof r.country !== 'string' || !/^[A-Z]{2}$/i.test(r.country)) return null;
@@ -162,17 +200,26 @@ async function geoFromDatabase(ip) {
 /**
  * @param {string} ip the client IP (never stored)
  * @param {Record<string, string|string[]|undefined>} headers request headers
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, vercel?: boolean, importer?: (specifier: string) => Promise<any> }} [opts]
+ *   `vercel`: trust only Vercel's headers and never load fast-geoip; `importer` replaces import() (tests)
  * @returns {Promise<{country: string, region: string|null, city: string|null, lat: number|null, lon: number|null} | null>}
  */
-export async function lookupGeo(ip, headers = {}, { timeoutMs = GEO_TIMEOUT_MS } = {}) {
-  const fromHeaders = geoFromHeaders(headers);
-  if (fromHeaders) return fromHeaders;
+export async function lookupGeo(ip, headers = {}, { timeoutMs = GEO_TIMEOUT_MS, vercel = false, importer } = {}) {
+  const fromHeaders = geoFromHeaders(headers, { vercel });
+  if (fromHeaders || vercel) return fromHeaders;
   const clean = cleanIp(ip);
   if (!isPublicIp(clean)) return null;
   try {
-    return await withTimeout(geoFromDatabase(clean), timeoutMs);
+    return await withTimeout(geoFromDatabase(clean, importer), timeoutMs);
   } catch {
     return null;
   }
+}
+
+/**
+ * The geo lookup an app uses: `(ip, headers) => Promise<geo|null>`.
+ * @param {{ vercel?: boolean }} [opts] true on Vercel (see lookupGeo)
+ */
+export function createGeoLookup({ vercel = false } = {}) {
+  return (ip, headers) => lookupGeo(ip, headers, { vercel });
 }

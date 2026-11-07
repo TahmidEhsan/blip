@@ -1,5 +1,7 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import http from 'node:http';
 import { insertClick } from '../server/db.js';
 import { liveTotals } from '../server/analytics.js';
 import { STREAM_STAGGER_MS } from '../server/live.js';
@@ -693,6 +695,108 @@ describe('live stream limits with dashboards that never said goodbye', () => {
       assert.equal(res.status, 429);
     } finally {
       for (const stream of open) stream.close();
+    }
+  });
+});
+
+describe('live streams whose dashboard left while the database was still being asked', () => {
+  // The dashboard aborts its stream request when the user picks another link or leaves the page. If that
+  // happens while the route still waits for the token check, the request's close events are over before
+  // the stream could listen for them: nothing may stay behind polling, or hold the link's only slot.
+  let s;
+  before(async () => {
+    s = await startServer({ streamLimits: { perLink: 1, perClient: 20 }, config: { streamPollMs: 50, trustProxy: 'loopback' } });
+  });
+  after(() => s.stop());
+
+  /** Hold the next links.findOne (the token check's lookup) until `release()`; `entered` resolves when it is called. */
+  function holdNextLookup() {
+    const real = Object.getPrototypeOf(s.db).collection.bind(s.db);
+    let entered;
+    let release;
+    const hold = { entered: new Promise((resolve) => { entered = resolve; }), released: new Promise((resolve) => { release = resolve; }) };
+    s.db.collection = (name) => {
+      const collection = real(name);
+      if (name !== 'links') return collection;
+      return new Proxy(collection, {
+        get(target, prop) {
+          if (prop !== 'findOne') return typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop];
+          return async (...args) => {
+            delete s.db.collection; // only this one call is held
+            entered();
+            await hold.released;
+            return target.findOne(...args);
+          };
+        },
+      });
+    };
+    return { ...hold, release };
+  }
+
+  it('end at once, freeing the slot and leaving nothing to poll', async () => {
+    const { manageToken } = await s.createLink({ targetUrl: 'https://example.com/left-early', slug: 'left-early' });
+    const linkId = (await s.db.collection('links').findOne({ slug: 'left-early' })).id;
+    const hold = holdNextLookup();
+    // Its own connection, so the server's side of it can be watched.
+    const sockets = [];
+    const onConnection = (socket) => sockets.push(socket);
+    s.server.on('connection', onConnection);
+    const leaving = http.request(`${s.base}/api/links/left-early/stream`, {
+      agent: false,
+      headers: { 'X-Manage-Token': manageToken, Accept: 'text/event-stream', 'X-Forwarded-For': '203.0.113.7' },
+    });
+    leaving.on('error', () => {});
+    leaving.end();
+    try {
+      await hold.entered; // the route waits for the token check...
+      const closed = once(sockets.at(-1), 'close');
+      leaving.destroy(); // ...and the dashboard goes away
+      await closed;
+    } finally {
+      s.server.off('connection', onConnection);
+      hold.release();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300)); // six poll intervals
+    assert.equal(s.bus.listenerCount(`link:${linkId}`), 0, 'no stream is left listening for the link');
+    const next = await openStream(s.base, 'left-early', manageToken, { headers: { 'X-Forwarded-For': '198.51.100.30' } });
+    try {
+      assert.equal(next.status, 200, 'the link has its only slot free for the next dashboard');
+      await next.next((e) => e.event === 'hello');
+    } finally {
+      next.close();
+    }
+  });
+
+  it('serve a client that is still there, even one whose request carried a body', async () => {
+    // Once a request body has been read, `req.destroyed` is true although the client is still connected,
+    // so it must not count as gone.
+    const { manageToken } = await s.createLink({ targetUrl: 'https://example.com/with-body', slug: 'with-body' });
+    const body = '{"ignored":true}';
+    const req = http.request(`${s.base}/api/links/with-body/stream`, {
+      method: 'GET',
+      headers: { 'X-Manage-Token': manageToken, Accept: 'text/event-stream', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    });
+    req.on('error', () => {});
+    req.end(body);
+    try {
+      const [res] = await Promise.race([
+        once(req, 'response'),
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('no answer')), 3000)),
+      ]);
+      assert.equal(res.statusCode, 200);
+      let text = '';
+      res.setEncoding('utf8');
+      await Promise.race([
+        new Promise((resolve) => {
+          res.on('data', (chunk) => {
+            text += chunk;
+            if (text.includes('event: hello')) resolve();
+          });
+        }),
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error(`no hello: ${text}`)), 3000)),
+      ]);
+    } finally {
+      req.destroy();
     }
   });
 });

@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { PROJECT_ROOT, resolveConfig } from './config.js';
 import {
-  QUERY_TIMEOUT_MS, createDatabase, databaseFailureHint, describeDatabaseUrl, ensureIpHashSalt, isDatabaseUnavailable, prepareDatabase, withDeadline,
+  QUERY_TIMEOUT_MS, createDatabase, databaseFailureHint, describeDatabaseUrl, ensureIpHashSalt, indexConflictHint, isDatabaseUnavailable, prepareDatabase,
+  withDeadline, writeTimeoutFor,
 } from './db.js';
 import { HttpError, errorBody } from './errors.js';
 import { createBus } from './bus.js';
@@ -104,12 +105,24 @@ export function redactSecrets(message, config) {
   return text.replace(/(mongodb(?:\+srv)?:\/\/)[^\s"'/]*@/gi, '$1[redacted]@');
 }
 
+/** A masked error message that ends like a sentence. */
+function maskedSentence(err, config) {
+  const message = redactSecrets(err?.message || err, config).trim();
+  return /[.!?]$/.test(message) ? message : `${message}.`;
+}
+
 /** A log line about a database failure: where (no credentials), the masked message, and what to check. */
 export function describeDatabaseFailure(err, config) {
   const hint = databaseFailureHint(err);
-  const message = redactSecrets(err?.message || err, config).trim();
-  const sentence = /[.!?]$/.test(message) ? message : `${message}.`;
-  return `(${describeDatabaseUrl(config?.mongodbUri)}, database ${config?.mongodbDb}): ${sentence}${hint ? ` ${hint}` : ''}`;
+  return `(${describeDatabaseUrl(config?.mongodbUri)}, database ${config?.mongodbDb}): ${maskedSentence(err, config)}${hint ? ` ${hint}` : ''}`;
+}
+
+/**
+ * A log line about an index the start-up could not build (ensureIndexes in db.js): which one, the masked
+ * message and what to do. Blip serves without it, and the next start tries again.
+ */
+export function describeIndexConflict({ collection, index, error }, config) {
+  return `could not create the index ${index} of ${collection} (database ${config?.mongodbDb}): ${maskedSentence(error, config)} ${indexConflictHint(error)} Until then Blip runs without it.`;
 }
 
 /**
@@ -137,8 +150,9 @@ export function describeDatabaseFailure(err, config) {
  *   waitUntil?: (promise: Promise<unknown>) => void,
  *   deferClickWrites?: boolean,
  *   connectOnFirstRequest?: boolean,
- * }} [options] `databaseTimeoutMs` and `startupTimeoutMs` override QUERY_TIMEOUT_MS and STARTUP_TIMEOUT_MS
- *   (tests use small values). `mongoClientOptions` are merged over the driver settings in db.js.
+ * }} [options] `databaseTimeoutMs` and `startupTimeoutMs` override QUERY_TIMEOUT_MS (and with it the write
+ *   limit, writeTimeoutFor) and STARTUP_TIMEOUT_MS (tests use small values). `mongoClientOptions` are merged
+ *   over the driver settings in db.js.
  *   `onDatabaseClient` runs right after the one MongoClient is created, and `waitUntil` receives work that
  *   may outlive its response: on Vercel these are attachDatabasePool and waitUntil from @vercel/functions
  *   (server/vercel.js). `deferClickWrites` answers a visit without waiting for its click row, which
@@ -166,6 +180,7 @@ export function createApp(options = {}) {
   });
   const startupTimeoutMs = Number(options.startupTimeoutMs) > 0 ? Number(options.startupTimeoutMs) : STARTUP_TIMEOUT_MS;
   const queryTimeoutMs = Number(options.databaseTimeoutMs) > 0 ? Number(options.databaseTimeoutMs) : QUERY_TIMEOUT_MS;
+  const writeTimeoutMs = writeTimeoutFor(queryTimeoutMs);
   const bus = createBus();
   let closed = false;
 
@@ -187,6 +202,13 @@ export function createApp(options = {}) {
     deferClickWrites: Boolean(options.deferClickWrites),
     /** What someone is waiting for gets one limit, however long the driver keeps retrying the operation. */
     answerInTime: (operation) => withDeadline(operation, queryTimeoutMs, 'The database took too long to answer.'),
+    /**
+     * The same for a write that can't simply be repeated: a visit's consume, a create's insert, simulated
+     * clicks. Its limit (writeTimeoutFor) leaves room for the driver's retry, because one socket timeout
+     * would end the wait just as the retry goes out, and a retry that succeeds then would have used up a
+     * click nobody got through on, or stored a link whose manage token nobody received.
+     */
+    writeInTime: (operation) => withDeadline(operation, writeTimeoutMs, 'The database took too long to answer.'),
   };
 
   // ---- database start-up: indexes + salt, shared by every request that arrives meanwhile ----
@@ -201,7 +223,8 @@ export function createApp(options = {}) {
     }
     if (!attempt) {
       const opening = (async () => {
-        await prepareDatabase(db);
+        const { conflicts } = await prepareDatabase(db);
+        if (!closed) for (const conflict of conflicts) console.error(`[blip] ${describeIndexConflict(conflict, config)}`);
         ctx.salt = await ensureIpHashSalt(db, config.ipHashSalt);
         initialized = true;
       })();

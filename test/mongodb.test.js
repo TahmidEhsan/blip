@@ -9,7 +9,8 @@ import { DATABASE_UNAVAILABLE_MESSAGE, createApp } from '../server/app.js';
 import { buildStats, liveStreamPoll, liveStreamSnapshot, liveTotals } from '../server/analytics.js';
 import { wake } from '../server/bus.js';
 import {
-  COUNTED_CLICK_FILTER, allocateIds, consumeVisit, deleteLink, deleteSyntheticClicks, insertClick, insertClicks, insertLink, isDatabaseUnavailable, isUniqueViolation,
+  COUNTED_CLICK_FILTER, WRITE_TIMEOUT_MS, allocateIds, consumeVisit, createDatabase, databaseFailureHint, deleteLink, deleteSyntheticClicks, insertClick, insertClicks,
+  insertLink, isDatabaseUnavailable, isUniqueViolation, writeTimeoutFor,
 } from '../server/db.js';
 import { STREAM_OVERLAP_IDS } from '../server/live.js';
 import { LINK_DEFAULTS } from '../server/links.js';
@@ -549,7 +550,7 @@ describe('ids that fell behind the stored documents', () => {
 });
 
 describe('a warm start', () => {
-  it('only reads', async () => {
+  it('only reads, apart from confirming the index that keeps link ids unique', async () => {
     const dbName = freshDatabaseName();
     const config = { mongodbUri: await testMongoUri(), mongodbDb: dbName };
     const first = createApp({ config });
@@ -561,26 +562,33 @@ describe('a warm start', () => {
     await second.ready;
     await second.close();
     assert.deepEqual(
-      log.names.slice(0, 4).sort(),
-      ['find meta', 'listIndexes clicks', 'listIndexes links', 'listIndexes visitors'],
-      'the schema version and every index list, sent together',
+      log.names.slice(0, 5).sort(),
+      ['createIndexes links', 'find meta', 'listIndexes clicks', 'listIndexes links', 'listIndexes visitors'],
+      'the schema version and every index list, sent together with the essential index',
     );
-    assert.deepEqual(log.names.slice(4), ['find meta'], 'then the salt, and no index builds');
+    const confirm = log.raw.find((command) => command.createIndexes === 'links');
+    assert.deepEqual(confirm.indexes.map((index) => index.name), ['id_unique'], 'only links.id_unique is sent, and it already exists');
+    assert.deepEqual(log.names.slice(5), ['find meta'], 'then the salt, and no index builds');
     await dropTestDatabase(dbName);
   });
 });
 
 describe('a visit on a database that stops answering', () => {
+  const TIMEOUT = 300;
   let s;
   before(async () => {
-    s = await startServer({ databaseTimeoutMs: 300 });
+    s = await startServer({ databaseTimeoutMs: TIMEOUT });
   });
   after(() => s.stop());
 
   // A promise that never settles: no socket timeout or driver retry can end the wait, only the visit's own limit.
   const never = () => new Promise(() => {});
 
-  for (const [what, collection, method, status] of [['the lookup', 'links', 'findOne', 503], ['the consume', 'links', 'findOneAndUpdate', 503]]) {
+  /** The wait was given up at `limit` (allowing for a busy machine), and not before. */
+  const assertGaveUpAt = (elapsed, limit) => assert.ok(elapsed >= limit - 50 && elapsed < limit + 2000, `took ${elapsed.toFixed(0)} ms for a limit of ${limit} ms`);
+
+  // The consume is a write that can't be repeated, so it waits as long as the driver's retry may take.
+  for (const [what, collection, method, limit] of [['the lookup', 'links', 'findOne', TIMEOUT], ['the consume', 'links', 'findOneAndUpdate', writeTimeoutFor(TIMEOUT)]]) {
     it(`gets the 503 page within its limit when ${what} hangs`, async (t) => {
       t.mock.method(console, 'error', () => {});
       const slug = `hung-${method.toLowerCase()}`;
@@ -590,10 +598,10 @@ describe('a visit on a database that stops answering', () => {
       const res = await s.visit(slug, { headers: PAGE });
       const elapsed = performance.now() - started;
       restore();
-      assert.equal(res.status, status);
+      assert.equal(res.status, 503);
       assert.equal(res.headers.get('retry-after'), '5');
       assert.match(res.text, /Blip can’t reach its database right now/);
-      assert.ok(elapsed >= 250 && elapsed < 2500, `took ${elapsed.toFixed(0)} ms`);
+      assertGaveUpAt(elapsed, limit);
     });
   }
 
@@ -607,9 +615,11 @@ describe('a visit on a database that stops answering', () => {
     assert.equal(res.status, 503);
   });
 
-  // Every database call an API request waits for has the same limit: one attempt may wait 8 s on its
-  // socket and the driver retries a timed-out read or write once, so without it these would take 16 s.
+  // Every database call an API request waits for has a limit: one attempt may wait 8 s on its socket and
+  // the driver retries a timed-out read or write once, so without it these would take 16 s. The writes that
+  // can't be repeated (a create's insert, simulated traffic) get the longer write limit.
   const neverFound = () => ({ toArray: never });
+  const WRITE = writeTimeoutFor(TIMEOUT);
   let made = 0;
   /** A link of its own, made before anything hangs, and its token. */
   const freshLink = async ({ destroyed = false } = {}) => {
@@ -619,10 +629,10 @@ describe('a visit on a database that stops answering', () => {
     if (destroyed) assert.equal((await s.request('POST', `/api/links/${slug}/destroy`, { token: manageToken })).status, 200);
     return { slug, token: manageToken };
   };
-  for (const [what, collection, method, behaviour, send, setup = {}] of [
+  for (const [what, collection, method, behaviour, send, setup = {}, limit = TIMEOUT] of [
     ['a create checks its slug', 'links', 'findOne', never, () => s.request('POST', '/api/links', { body: { targetUrl: 'https://example.com/hung', slug: 'hung-create' } })],
     ['a create looks for a free word slug', 'links', 'findOne', never, () => s.request('POST', '/api/links', { body: { targetUrl: 'https://example.com/hung' } })],
-    ['a create stores its link', 'links', 'insertOne', never, () => s.request('POST', '/api/links', { body: { targetUrl: 'https://example.com/hung', slug: 'hung-insert' } })],
+    ['a create stores its link', 'links', 'insertOne', never, () => s.request('POST', '/api/links', { body: { targetUrl: 'https://example.com/hung', slug: 'hung-insert' } }), {}, WRITE],
     ['a slug check', 'links', 'findOne', never, () => s.request('GET', '/api/slugs/check?slug=anything')],
     ['slug suggestions', 'links', 'find', neverFound, () => s.request('GET', '/api/slugs/suggest?phrase=summer')],
     ['the batch lookup of My links', 'links', 'find', neverFound, ({ slug, token }) => s.request('POST', '/api/links/batch', { body: { items: [{ slug, token }] } }), { link: true }],
@@ -630,7 +640,7 @@ describe('a visit on a database that stops answering', () => {
     ['Destroy now', 'links', 'findOneAndUpdate', never, ({ slug, token }) => s.request('POST', `/api/links/${slug}/destroy`, { token }), { link: true }],
     ['Bring back', 'links', 'findOneAndUpdate', never, ({ slug, token }) => s.request('POST', `/api/links/${slug}/revive`, { token }), { link: true, destroyed: true }],
     ['a delete', 'links', 'deleteOne', never, ({ slug, token }) => s.request('DELETE', `/api/links/${slug}`, { token }), { link: true }],
-    ['Simulate traffic', 'clicks', 'insertMany', never, ({ slug, token }) => s.request('POST', `/api/links/${slug}/simulate`, { token, body: { count: 3 } }), { link: true }],
+    ['Simulate traffic', 'clicks', 'insertMany', never, ({ slug, token }) => s.request('POST', `/api/links/${slug}/simulate`, { token, body: { count: 3 } }), { link: true }, WRITE],
     ['Clear simulated', 'clicks', 'deleteMany', never, ({ slug, token }) => s.request('DELETE', `/api/links/${slug}/simulated`, { token }), { link: true }],
   ]) {
     it(`answers 503 within its limit when ${what} hangs`, { timeout: 10_000 }, async (t) => {
@@ -648,9 +658,14 @@ describe('a visit on a database that stops answering', () => {
       assert.equal(res.status, 503, res.text);
       assert.deepEqual(res.json, { error: { code: 'unavailable', message: DATABASE_UNAVAILABLE_MESSAGE } });
       assert.equal(res.headers.get('retry-after'), '5');
-      assert.ok(elapsed >= 250 && elapsed < 2500, `took ${elapsed.toFixed(0)} ms`);
+      assertGaveUpAt(elapsed, limit);
     });
   }
+
+  it('gives the writes that cannot be repeated room for one retry: 21 s in production', () => {
+    assert.equal(WRITE_TIMEOUT_MS, 21_000, 'the socket timeout of the first attempt, then the retry: server selection and its socket timeout');
+    assert.equal(writeTimeoutFor(TIMEOUT), 3 * TIMEOUT, 'tests scale it with their socket timeout');
+  });
 });
 
 describe('when the click write fails', () => {
@@ -721,6 +736,88 @@ describe('when the click write fails', () => {
       assert.equal(await waited[0], true, 'it finishes on its own');
     });
   }
+});
+
+describe('a bulk write that fails below its writes', () => {
+  // A connected client whose insertMany or bulkWrite then fails below the writes themselves (the network
+  // drops, no server answers) throws a MongoBulkWriteError with no write errors, no code and no cause: the
+  // error it failed with is in its `errorResponse`. Here one collection at a time goes through a second
+  // handle on the same database, connected through the proxy before the proxy drops and refuses everything.
+  let s;
+  let proxy;
+  const handles = [];
+  before(async () => {
+    s = await startServer();
+    proxy = await startTcpProxy(await testMongoUri());
+  });
+  after(async () => {
+    proxy.setMode('ok');
+    await Promise.all(handles.map((db) => db.close()));
+    await proxy.close();
+    await s.stop();
+  });
+
+  /** A handle on the app's database that connected, then lost its network. */
+  async function cutOffHandle() {
+    proxy.setMode('ok');
+    const db = createDatabase({ uri: proxy.uri, dbName: s.db.name, timeoutMs: 300 });
+    handles.push(db);
+    await db.connect();
+    proxy.setMode('reset');
+    return db;
+  }
+  /** Send every operation on one collection of the app to a cut-off handle, until the returned function is called. */
+  async function cutOff(collectionName) {
+    const other = await cutOffHandle();
+    const real = Object.getPrototypeOf(s.db).collection.bind(s.db);
+    s.db.collection = (name) => (name === collectionName ? other.collection(name) : real(name));
+    return () => {
+      delete s.db.collection;
+    };
+  }
+
+  it('is told apart as "the database could not be reached", with what to check', async () => {
+    const err = await (await cutOffHandle()).collection('clicks').insertMany([{ id: 1 }]).then(() => null, (e) => e);
+    assert.equal(err?.name, 'MongoBulkWriteError');
+    assert.deepEqual([err.writeErrors, err.code, err.cause, err.hasErrorLabel('RetryableWriteError')], [[], undefined, undefined, false], 'nothing on the error itself says so');
+    assert.equal(err.errorResponse?.name, 'MongoServerSelectionError');
+    assert.equal(isDatabaseUnavailable(err), true);
+    assert.match(databaseFailureHint(err), /No server answered in time/);
+  });
+
+  it('simulated traffic whose visitors write fails answers 503 and stores no rows marked "not first"', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const { manageToken } = await s.createLink({ targetUrl: 'https://example.com/no-visitors', slug: 'no-visitors' });
+    const restore = await cutOff('visitors');
+    let res;
+    try {
+      res = await s.request('POST', '/api/links/no-visitors/simulate', { token: manageToken, body: { count: 6 } });
+    } finally {
+      restore();
+    }
+    assert.equal(res.status, 503, res.text);
+    assert.equal(res.headers.get('retry-after'), '5');
+    assert.deepEqual(await clickRowsOf(s.db, 'no-visitors'), [], 'a failed visitors write is no lost race');
+  });
+
+  it('simulated traffic whose insert fails answers 503, logged as a database failure and not as a bug', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const { manageToken } = await s.createLink({ targetUrl: 'https://example.com/no-insert', slug: 'no-insert' });
+    const restore = await cutOff('clicks');
+    let res;
+    try {
+      res = await s.request('POST', '/api/links/no-insert/simulate', { token: manageToken, body: { count: 4 } });
+    } finally {
+      restore();
+    }
+    assert.equal(res.status, 503, res.text);
+    assert.deepEqual(res.json, { error: { code: 'unavailable', message: DATABASE_UNAVAILABLE_MESSAGE } });
+    assert.equal(res.headers.get('retry-after'), '5');
+    const logged = errors.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(logged.some((line) => /database request failed .*No server answered in time/.test(line)), logged.join('\n'));
+    assert.ok(logged.every((line) => !/unhandled error/.test(line)), logged.join('\n'));
+    assert.deepEqual(await clickRowsOf(s.db, 'no-insert'), []);
+  });
 });
 
 describe('on Vercel, where a visit answers before its click row is stored', () => {
@@ -939,6 +1036,87 @@ describe('a database behind a failing network', () => {
     } finally {
       stream.close();
     }
+  });
+});
+
+describe('a write whose first attempt stalls past the socket timeout', () => {
+  // The proxy holds the one attempt the test picks (it never reaches the server), and lets everything
+  // through again once the driver reports that attempt failed: then the driver's own retry goes through, as
+  // after a dropped connection or a primary that stops answering for a moment. The caller must get that
+  // retry's answer: a 503 here would be for a click that was used up, or a link that was stored, anyway.
+  const TIMEOUT = 400;
+  const dbName = freshDatabaseName();
+  let proxy;
+  let s;
+  let holdNext = null; // `<command> <collection>` of the attempt to hold
+  const held = new Set(); // request ids of the attempts held
+  before(async () => {
+    proxy = await startTcpProxy(await testMongoUri());
+    s = await startServer({
+      dbName,
+      config: { mongodbUri: proxy.uri },
+      databaseTimeoutMs: TIMEOUT,
+      mongoClientOptions: { monitorCommands: true },
+      onDatabaseClient(client) {
+        client.on('commandStarted', (event) => {
+          if (holdNext !== `${event.commandName} ${event.command[event.commandName]}`) return;
+          holdNext = null;
+          held.add(event.requestId);
+          proxy.setMode('hang'); // before the command is written, so it waits in the proxy
+        });
+        client.on('commandFailed', (event) => {
+          if (held.has(event.requestId)) proxy.setMode('ok'); // its socket timed out: the retry gets through
+        });
+      },
+    });
+  });
+  after(async () => {
+    proxy?.setMode('ok');
+    await s?.stop();
+    await proxy?.close();
+    await dropTestDatabase(dbName);
+  });
+
+  /** Run `send` with the next `<command> <collection>` held once, and check it was held and retried. */
+  async function withFirstAttemptHeld(command, send) {
+    held.clear();
+    holdNext = command;
+    const started = performance.now();
+    try {
+      const res = await send();
+      const elapsed = performance.now() - started;
+      assert.equal(held.size, 1, `${command} was held`);
+      assert.ok(elapsed >= TIMEOUT - 50, `it waited for the retry (${elapsed.toFixed(0)} ms)`);
+      return res;
+    } finally {
+      holdNext = null;
+      proxy.setMode('ok');
+    }
+  }
+
+  it('a visit gets through on the click it used up', async () => {
+    await s.createLink({ targetUrl: 'https://example.com/burn-after-reading', slug: 'one-time-retry', maxClicks: 1 });
+    const res = await withFirstAttemptHeld('findAndModify links', () => s.visit('one-time-retry', { headers: PAGE }));
+    assert.equal(res.status, 302, 'not a 503 for a click the retry used up');
+    assert.equal(res.headers.get('location'), 'https://example.com/burn-after-reading');
+    assert.equal((await s.db.collection('links').findOne({ slug: 'one-time-retry' })).click_count, 1, 'one click, used once');
+    assert.equal((await clickRowsOf(s.db, 'one-time-retry')).length, 1);
+    assert.equal((await s.visit('one-time-retry', { headers: PAGE })).status, 410, 'and the next visitor finds it used up');
+  });
+
+  it('a create answers with its link and the token that manages it', async () => {
+    const res = await withFirstAttemptHeld('insert links', () => s.request('POST', '/api/links', { body: { targetUrl: 'https://example.com/launch', slug: 'launch-retry' } }));
+    assert.equal(res.status, 201, res.text);
+    assert.equal(res.json.link.slug, 'launch-retry');
+    assert.equal((await s.request('GET', '/api/links/launch-retry', { token: res.json.manageToken })).status, 200, 'the token that came back manages the stored link');
+    assert.equal(await s.db.collection('links').countDocuments({ slug: 'launch-retry' }), 1);
+  });
+
+  it('simulated traffic answers with the rows it stored, stored once', async () => {
+    const { manageToken } = await s.createLink({ targetUrl: 'https://example.com/sim-retry', slug: 'sim-retry' });
+    const res = await withFirstAttemptHeld('insert clicks', () => s.request('POST', '/api/links/sim-retry/simulate', { token: manageToken, body: { count: 5 } }));
+    assert.deepEqual([res.status, res.json], [200, { inserted: 5 }]);
+    assert.equal((await clickRowsOf(s.db, 'sim-retry')).length, 5, 'so nobody presses it again for rows that were stored');
   });
 });
 

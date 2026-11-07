@@ -38,6 +38,13 @@ const MAX_POLL_FAILURES = 3;
 const statusKey = (payload) => JSON.stringify(payload);
 
 /**
+ * True once the client of this request has gone. Its `close` events have fired then, so a listener added
+ * afterwards never hears them: a stream must check this after any wait (such as the token check). Not
+ * `req.destroyed`, which also turns true for a client still there once its request body has been read.
+ */
+export const clientGone = (req, res) => Boolean(res.destroyed || req.socket?.destroyed);
+
+/**
  * Serve the live stream of one link on `res`. The caller has already authorised the request.
  * Resolves once the `hello` event is out (or the stream has ended); the stream keeps running after that.
  * @param {object} ctx the app context: db, bus, config (streamPollMs, streamMaxMs), now, streams, redact
@@ -223,6 +230,13 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
     if (res.destroyed || req.socket?.destroyed) cleanup();
   });
   req.on('error', cleanup); // a cancelled request ("aborted")
+  // A client that left while the route waited for the database (its token check, or a cold start) closed
+  // before those listeners were there, so none of them will run: end the stream now, freeing its slot,
+  // instead of polling for nobody until streamMaxMs (or for good, without it).
+  if (clientGone(req, res)) {
+    cleanup();
+    return;
+  }
 
   try {
     const snap = await liveStreamSnapshot(db, link.id, ctx.now(), STREAM_OVERLAP_IDS);

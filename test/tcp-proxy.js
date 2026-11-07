@@ -5,12 +5,16 @@
 import net from 'node:net';
 import { once } from 'node:events';
 
+// Both are idempotent: piping a connected pair a second time would send every byte twice.
 function connect(pair) {
+  if (pair.connected) return;
+  pair.connected = true;
   pair.client.pipe(pair.upstream);
   pair.upstream.pipe(pair.client);
 }
 
 function disconnect(pair) {
+  pair.connected = false;
   pair.client.unpipe(pair.upstream);
   pair.upstream.unpipe(pair.client);
   pair.client.pause();
@@ -35,7 +39,7 @@ export async function startTcpProxy(uri) {
     }
     const upstream = net.connect(Number(targetPort), hostname);
     upstream.on('error', () => {});
-    const pair = { client, upstream };
+    const pair = { client, upstream, connected: false };
     pairs.add(pair);
     const drop = () => {
       pairs.delete(pair);

@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import { ADJECTIVES, NOUNS } from './words.js';
 import { slugTaken, takenSlugs } from './db.js';
+import { asText } from './errors.js';
 
 export const SLUG_MAX = 64;
 /** Raw slug input longer than this is rejected outright instead of being truncated. */
@@ -17,10 +18,10 @@ export const RESERVED_SLUGS = new Set([
 
 const trimDashes = (s) => s.replace(/^-+|-+$/g, '');
 
-/** "Summer Sale 2026!" → "summer-sale-2026", "Café_Menu" → "cafe-menu". */
+/** "Summer Sale 2026!" → "summer-sale-2026", "Café_Menu" → "cafe-menu". A value with no string form gives ''. */
 export function normalizeSlug(input) {
   if (input === null || input === undefined) return '';
-  let s = String(input)
+  let s = (asText(input) ?? '')
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()

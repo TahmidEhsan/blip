@@ -1,4 +1,4 @@
-// Blip: HTTP error type and the SPEC §5 error body shape.
+// Blip: HTTP error type, the SPEC §5 error body shape, and coercions request validation can't trip over.
 
 export class HttpError extends Error {
   /**
@@ -28,4 +28,26 @@ export function errorBody(code, message, field) {
 
 export function sendError(res, status, code, message, field) {
   res.status(status).json(errorBody(code, message, field));
+}
+
+// A JSON body can hold values String() and Number() throw on: an object whose toString or valueOf is not a
+// function ({"toString":1}), or an array nested too deep to join. These coerce like String() and Number()
+// do, and give such a value up as no value, so validation answers 400 instead of 500.
+
+/** String(value), or null when it can't be turned into a string. */
+export function asText(value) {
+  try {
+    return String(value);
+  } catch {
+    return null;
+  }
+}
+
+/** Number(value), or NaN when it can't be turned into a number. */
+export function asNumber(value) {
+  try {
+    return Number(value);
+  } catch {
+    return Number.NaN;
+  }
 }

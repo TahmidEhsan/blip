@@ -46,7 +46,7 @@ export async function sendNotFound(ctx, res, requested) {
 }
 
 export function createRedirectRouter(ctx) {
-  const { answerInTime, db, bus } = ctx;
+  const { answerInTime, writeInTime, db, bus } = ctx;
   const router = express.Router();
 
   /**
@@ -169,7 +169,8 @@ export function createRedirectRouter(ctx) {
   // click row (reserve its id and record the visitor together, insert it, check the link still exists).
   // Losing the race for the last click adds a read and the blocked attempt's row; a visit that consumes
   // nothing (expired, bot) only stores its row. On Vercel (ctx.deferClickWrites) the answer goes out after
-  // the first two, and the row is stored after it (see storeClick). The consume is always awaited.
+  // the first two, and the row is stored after it (see storeClick). The consume is always awaited, with the
+  // write limit (writeInTime): a consume the driver's retry completes must let its visitor through.
   router.get('/:slug', async (req, res) => {
     const now = ctx.now();
     setVisitHeaders(res);
@@ -221,7 +222,7 @@ export function createRedirectRouter(ctx) {
     // 6 + 7. Consume atomically, store the click, wake live dashboards and respond. Only a failure to
     //        consume can fail the visit: once a click is used up, the visitor gets through.
     const row = await clickRow(req, link, { outcome, isBot, now });
-    const result = await answerInTime(consumeVisit(db, link.id, now));
+    const result = await writeInTime(consumeVisit(db, link.id, now));
     if (!result.consumed) {
       // Lost the race (another visitor took the last click, or the link was stopped or deleted meanwhile).
       const fresh = await answerInTime(findLinkById(db, link.id));

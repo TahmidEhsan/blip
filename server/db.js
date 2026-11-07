@@ -26,7 +26,8 @@ import { uriHasCredentials } from './config.js';
 
 /**
  * Bumped whenever INDEXES changes (stored in meta under `schema_version`). A start-up that finds this
- * version and every index in place only reads; otherwise it creates what is missing (see ensureIndexes).
+ * version and every index in place only reads, apart from confirming links.id_unique (which changes
+ * nothing); otherwise it creates what is missing (see ensureIndexes).
  */
 export const SCHEMA_VERSION = 1;
 
@@ -41,6 +42,19 @@ export const COUNTED_CLICK_FILTER = Object.freeze({ outcome: Object.freeze({ $in
 export const QUERY_TIMEOUT_MS = 8000;
 /** Longest an operation may wait for a usable server. */
 export const SERVER_SELECTION_TIMEOUT_MS = 5000;
+
+/**
+ * The limit for a write Blip can't simply repeat (using up a click, storing a new link, storing simulated
+ * clicks): the first attempt's socket timeout, then the server selection and the socket timeout of the
+ * driver's retry. A limit of one socket timeout would end the wait just as the driver sends its retry, and
+ * when that retry goes through, the write is applied while the caller is told 503 (see `writeInTime` in
+ * app.js). WRITE_TIMEOUT_MS is 21 s.
+ * @param {number} [socketTimeoutMs] the socket timeout of one attempt (tests use small ones)
+ */
+export function writeTimeoutFor(socketTimeoutMs = QUERY_TIMEOUT_MS) {
+  return 2 * socketTimeoutMs + Math.min(socketTimeoutMs, SERVER_SELECTION_TIMEOUT_MS);
+}
+export const WRITE_TIMEOUT_MS = writeTimeoutFor(QUERY_TIMEOUT_MS);
 /** Longest the server may work on an aggregation: it gives up, and answers so, before the socket gives up on it. */
 export const AGGREGATION_TIME_LIMIT_MS = QUERY_TIMEOUT_MS - 1000;
 const MAX_POOL_SIZE = 20;
@@ -112,19 +126,30 @@ const UNAVAILABLE_CODES = new Set([
 const NETWORK_CODE_RE = /^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|ERR_SSL_|ERR_TLS_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_)/;
 
 /**
+ * An error and the errors it wraps, outermost first: its `cause` chain, and for a bulk write the error in
+ * `errorResponse` (a failed insertMany or bulkWrite throws a MongoBulkWriteError that keeps the network or
+ * server-selection error it failed with there, with no `code` and no `cause` of its own).
+ */
+function errorChain(err) {
+  const chain = [];
+  for (let e = err; e && typeof e === 'object' && chain.length < 5 && !chain.includes(e);) {
+    chain.push(e);
+    e = e.cause ?? (e.errorResponse instanceof Error ? e.errorResponse : undefined);
+  }
+  return chain;
+}
+
+/**
  * True when an operation failed because the database could not be reached (server selection, a network
  * error, a timeout, a failover, credentials it no longer accepts), as opposed to a bug or a constraint
  * violation. Such failures are transient: Blip answers them with 503 `unavailable` and tries again on the
- * next request. Looks through `cause` chains, because the driver wraps socket errors.
+ * next request. Looks through the errors it wraps (errorChain), because the driver wraps socket errors.
  */
 export function isDatabaseUnavailable(err) {
-  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) {
-    if (UNAVAILABLE_ERROR_NAMES.has(e.name)) return true;
-    if (typeof e.code === 'number' && UNAVAILABLE_CODES.has(e.code)) return true;
-    if (typeof e.code === 'string' && (e.code === 'CLIENT_CLOSED' || NETWORK_CODE_RE.test(e.code))) return true;
-    if (typeof e.hasErrorLabel === 'function' && e.hasErrorLabel('RetryableWriteError')) return true;
-  }
-  return false;
+  return errorChain(err).some((e) => UNAVAILABLE_ERROR_NAMES.has(e.name)
+    || (typeof e.code === 'number' && UNAVAILABLE_CODES.has(e.code))
+    || (typeof e.code === 'string' && (e.code === 'CLIENT_CLOSED' || NETWORK_CODE_RE.test(e.code)))
+    || (typeof e.hasErrorLabel === 'function' && e.hasErrorLabel('RetryableWriteError')));
 }
 
 /**
@@ -133,8 +158,9 @@ export function isDatabaseUnavailable(err) {
  * @returns {string|null} null when there is nothing more specific to say than the error itself
  */
 export function databaseFailureHint(err) {
-  const chain = [];
-  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) chain.push(e);
+  const chain = errorChain(err);
+  const essential = chain.find((e) => e.code === 'ESSENTIAL_INDEX');
+  if (essential) return essential.hint;
   const any = (test) => chain.some((e) => test(e, String(e.message ?? '')));
   if (any((e) => e.name === 'MongoParseError')) {
     return 'Check MONGODB_URI: copy the connection string again from Atlas (Connect, then Drivers), and percent-encode special characters in the password.';
@@ -179,7 +205,8 @@ export function isUniqueViolation(err, field = null) {
 
 /**
  * `promise`, or a rejection with a TimeoutError once `ms` have passed (isDatabaseUnavailable knows it). A
- * write it gives up on may still be applied; that is accepted, because the visitor gets a prompt 503.
+ * write it gives up on may still be applied. That is accepted for a write that can be repeated with the
+ * same result; one that can't waits writeTimeoutFor() instead, long enough for the driver's own retry.
  */
 export function withDeadline(promise, ms, message) {
   let timer;
@@ -313,29 +340,177 @@ async function indexNames(db, name) {
 }
 
 /**
+ * Server codes of an index build that the stored documents, or an index made by hand, stand in the way of:
+ * a duplicate key under a unique index (11000, 11001), the same fields under another name
+ * (IndexOptionsConflict, 85) and this name on other fields (IndexKeySpecsConflict, 86; only names that are
+ * missing are built, so it takes an index made by hand in the meantime). Building it again changes nothing
+ * until someone changes the data or the indexes.
+ */
+const INDEX_CONFLICT_CODES = new Set([11000, 11001, 85, 86]);
+const isIndexConflict = (err) => errorChain(err).some((e) => INDEX_CONFLICT_CODES.has(e.code));
+
+/** What to do about an index ensureIndexes could not build. Goes into the log after the server's message. */
+export function indexConflictHint(err) {
+  if (isUniqueViolation(err)) {
+    return 'Some of its documents share a value this index keeps unique: remove the extra ones in Atlas, keeping one of each, then restart Blip (on Vercel, redeploy), which builds it.';
+  }
+  return 'An index made by hand stands in its way (the message names it): drop that one in Atlas, then restart Blip (on Vercel, redeploy), which builds it.';
+}
+
+/**
+ * Indexes Blip never runs without, whatever stands in their way. Every change to a link finds it by its id
+ * (updateLink, consumeVisit, deleteLink, and its clicks and visitors by link_id), so two links sharing an id
+ * could change each other, across owners. Every start sends them to the server (confirmEssentialIndexes),
+ * and a conflict on one fails the start-up (essentialIndexError) the way any start-up failure does: Blip
+ * doesn't start, and on Vercel every request that needs the database answers 503 and tries again.
+ */
+const ESSENTIAL_INDEXES = new Set(['links.id_unique']);
+const isEssential = (name, index) => ESSENTIAL_INDEXES.has(`${name}.${index.name}`);
+
+/** The start-up failure for an essential index that can't be built: the server's error as `cause`, and what to do. */
+function essentialIndexError(collection, index, err) {
+  const hint = isUniqueViolation(err)
+    ? 'Two links share an id, and every change to a link finds it by its id: in Atlas, give all but one of them an id no other link has (their clicks and visitors refer to it as link_id), or remove them.'
+    : 'An index made by hand stands in its way (the message names it): drop that one in Atlas.';
+  return Object.assign(new Error(`could not create the index ${index} of ${collection}, which Blip can't run without: ${err?.message ?? err}`, { cause: err }), {
+    code: 'ESSENTIAL_INDEX',
+    hint: `${hint} Blip can't start until then; on Vercel, every request that needs the database (the API and short links) answers 503 and tries again.`,
+  });
+}
+
+/**
+ * Send each essential index to the server, listed or not. Its name in listIndexes proves nothing: the list
+ * also holds a build still in progress (another instance's, which fails if two links share an id) and an
+ * index made by hand under that name with other fields or options. createIndexes tells them apart: it does
+ * nothing for the finished index; it waits for a build in progress, then does nothing if that build
+ * succeeded, or builds the index again itself (refused the same way) if it failed; and it refuses an index
+ * made by hand under that name (86, or 85 when only options such as `hidden` differ). It is sent
+ * acknowledged (w: 1), so a connection string with w=0 can't make it fire and forget.
+ */
+async function confirmEssentialIndexes(db) {
+  for (const [name, indexes] of Object.entries(INDEXES)) {
+    for (const index of indexes.filter((spec) => isEssential(name, spec))) {
+      try {
+        await db.collection(name).createIndexes([index], { writeConcern: { w: 1 } });
+      } catch (err) {
+        throw isIndexConflict(err) ? essentialIndexError(name, index.name, err) : err;
+      }
+    }
+  }
+}
+
+/**
+ * Promise.all that settles only once every promise has, so each step of a start-up attempt waits for all of
+ * its commands before the next step (a start-up deadline in app.js, or a socket timeout, can still leave one
+ * running on the server, which is harmless: each is safe to repeat). With several failures it throws the
+ * essential-index one, since that is the one a person has to fix.
+ */
+async function settleAll(promises) {
+  const results = await Promise.allSettled(promises);
+  const failed = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+  if (failed.length) throw failed.find((err) => err?.code === 'ESSENTIAL_INDEX') ?? failed[0];
+  return results.map((result) => result.value);
+}
+
+/**
+ * Remove all but the oldest visitors document of each link and visitor. Two only exist after racing first
+ * visits found link_visitor_unique missing (the collection was dropped, and visits created it again), and
+ * one per visitor is all the first-visit rule ever needs, so nothing is lost.
+ * @returns {Promise<number>} documents removed
+ */
+async function removeDuplicateVisitors(db) {
+  const visitors = db.collection('visitors');
+  const groups = await visitors.aggregate([
+    { $group: { _id: { link_id: '$link_id', visitor_hash: '$visitor_hash' }, keep: { $min: '$_id' }, n: { $sum: 1 } } },
+    { $match: { n: { $gt: 1 } } },
+  ], { maxTimeMS: AGGREGATION_TIME_LIMIT_MS }).toArray();
+  if (!groups.length) return 0;
+  const { deletedCount } = await visitors.bulkWrite(groups.map(({ _id: key, keep }) => ({
+    deleteMany: { filter: { link_id: key.link_id, visitor_hash: key.visitor_hash, _id: { $ne: keep } } },
+  })), { ordered: false });
+  return deletedCount;
+}
+
+/**
+ * Build one index, or start from the refusal its build already got (`refused`). The visitors index, refused
+ * for duplicates, is built again once they are removed.
+ */
+async function buildIndex(db, name, index, refused = null) {
+  try {
+    if (refused) throw refused;
+    await db.collection(name).createIndexes([index]);
+  } catch (err) {
+    if (name !== 'visitors' || !isUniqueViolation(err)) throw err;
+    let removed = 0;
+    try {
+      removed = await removeDuplicateVisitors(db);
+    } catch {
+      // could not clean up: the index is reported as it is
+    }
+    if (!removed) throw err;
+    await db.collection(name).createIndexes([index]);
+  }
+}
+
+/**
+ * Create the missing indexes of one collection, in one command. When something stands in the way of one of
+ * them (isIndexConflict), they are built one at a time, so the others still are. A single missing index is
+ * not sent again: its refusal is already known.
+ * @returns {Promise<{ collection: string, index: string, error: Error }[]>} the ones that could not be built
+ */
+async function createMissingIndexes(db, name, indexes) {
+  if (!indexes.length) return [];
+  let refused;
+  try {
+    await db.collection(name).createIndexes(indexes);
+    return [];
+  } catch (err) {
+    if (!isIndexConflict(err)) throw err;
+    refused = err;
+  }
+  const conflicts = [];
+  for (const index of indexes) {
+    try {
+      await buildIndex(db, name, index, indexes.length === 1 ? refused : null);
+    } catch (err) {
+      if (!isIndexConflict(err)) throw err;
+      conflicts.push({ collection: name, index: index.name, error: err });
+    }
+  }
+  return conflicts;
+}
+
+/**
  * Create the indexes this build needs. Running it again is a no-op, and several cold starts running it at
- * once is safe: creating an index that exists does nothing. It reads the stored schema version and the
- * index names of every collection in INDEXES at once (one round trip), and when the version is current
- * and every index is there (the usual cold start), that is all it does. Otherwise it creates the indexes of
- * each collection that lacks one: a collection dropped in Atlas comes back on its next write with only
- * `_id_`, and gets its indexes back on the next start. An older version is raised last, so a start-up that
- * stops halfway is finished by the next one.
- * @returns {Promise<{ from: number, to: number }>} the version found and the version left behind
+ * once is safe: creating an index that exists does nothing. In one round trip it reads the stored schema
+ * version and the index names of every collection in INDEXES, and sends the essential indexes
+ * (confirmEssentialIndexes); when the version is current and every other index is listed (the usual cold
+ * start), that is all it does. Otherwise it creates each index that is missing: a collection dropped in Atlas
+ * comes back on its next write with only `_id_`, and gets its indexes back on the next start. An index that
+ * the data or an index made by hand stands in the way of is returned in `conflicts` instead of failing the
+ * start-up (which would fail the same way on every request until someone fixed it): Blip runs without it and
+ * says so (app.js), and the next start tries again. The exception is an essential index (ESSENTIAL_INDEXES,
+ * links.id_unique), whose conflict fails the start-up. Each step waits for all of its commands (settleAll).
+ * An older version is raised last, so a start-up that stops halfway is finished by the next one.
+ * @returns {Promise<{ from: number, to: number, conflicts: { collection: string, index: string, error: Error }[] }>}
+ *   the version found, the version left behind, and the indexes that could not be built
  */
 export async function ensureIndexes(db) {
   const meta = db.collection('meta');
   const collections = Object.keys(INDEXES);
-  const [version, ...present] = await Promise.all([
+  const [version, , ...present] = await settleAll([
     meta.findOne({ _id: 'schema_version' }),
+    confirmEssentialIndexes(db),
     ...collections.map((name) => indexNames(db, name)),
   ]);
   const from = Number(version?.value) || 0;
-  const lacking = collections.filter((name, i) => INDEXES[name].some((index) => !present[i].has(index.name)));
-  if (from >= SCHEMA_VERSION && !lacking.length) return { from, to: from };
-  await Promise.all(lacking.map((name) => db.collection(name).createIndexes(INDEXES[name])));
-  if (from >= SCHEMA_VERSION) return { from, to: from };
+  // The essential indexes are built or confirmed by now, whatever the lists say.
+  const missing = collections.map((name, i) => INDEXES[name].filter((index) => !isEssential(name, index) && !present[i].has(index.name)));
+  if (from >= SCHEMA_VERSION && missing.every((indexes) => !indexes.length)) return { from, to: from, conflicts: [] };
+  const conflicts = (await settleAll(collections.map((name, i) => createMissingIndexes(db, name, missing[i])))).flat();
+  if (from >= SCHEMA_VERSION) return { from, to: from, conflicts };
   await retryOnDuplicateKey(() => meta.updateOne({ _id: 'schema_version' }, { $max: { value: SCHEMA_VERSION } }, { upsert: true }));
-  return { from, to: SCHEMA_VERSION };
+  return { from, to: SCHEMA_VERSION, conflicts };
 }
 
 /**
@@ -627,8 +802,13 @@ async function recordFirstVisits(db, rows) {
   try {
     result = await db.collection('visitors').bulkWrite(operations, { ordered: false });
   } catch (err) {
-    // Racing upserts lose with a duplicate key ("not first"); anything else is a real failure.
-    if (!err.result || err.writeConcernError || ![err.writeErrors ?? []].flat().every((e) => isUniqueViolation(e))) throw err;
+    // Racing upserts lose with a duplicate key ("not first"). Anything else is a real failure: a write
+    // error of another kind, a write concern error, or a failure below the writes themselves (a dropped
+    // connection, no server), which the driver throws as a MongoBulkWriteError with no write errors at all.
+    const writeErrors = [err.writeErrors ?? []].flat();
+    const lostRaces = Boolean(err.result) && writeErrors.length > 0 && writeErrors.every((e) => isUniqueViolation(e))
+      && !err.result.getWriteConcernError?.();
+    if (!lostRaces) throw err;
     ({ result } = err);
   }
   return new Set(Object.keys(result.upsertedIds).map((operation) => candidates[Number(operation)]));

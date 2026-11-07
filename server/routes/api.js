@@ -5,7 +5,7 @@ import {
   deleteLink, deleteSyntheticClicks, findLinkBySlug, findLinksBySlugs, insertLink, isUniqueViolation, sha256Hex,
   slugTaken, updateLink,
 } from '../db.js';
-import { HttpError, errorBody, sendError, validationError } from '../errors.js';
+import { HttpError, asNumber, asText, errorBody, sendError, validationError } from '../errors.js';
 import {
   LIMITS, LINK_DEFAULTS, TEASER_LIMITS, TEASER_STYLES, TEASER_THEMES, isPlainObject, toLinkDto, validateLinkBody,
 } from '../links.js';
@@ -16,7 +16,7 @@ import { KEYWORD_MAX, domainIdeas, domainOptions } from '../domains.js';
 import { STATS_RANGES, buildStats, parseTzOffset } from '../analytics.js';
 import { clientKey, createRateLimiter } from '../ratelimit.js';
 import { wake } from '../bus.js';
-import { serveLiveStream } from '../live.js';
+import { clientGone, serveLiveStream } from '../live.js';
 import { simulateTraffic } from '../simulate.js';
 
 const SSE_RETRY_AFTER_S = 10;
@@ -52,7 +52,7 @@ export function tokenMatches(token, storedHash) {
  * @param {object} ctx shared app context (db, config, now, random, bus, streams, rateLimits, streamLimits, redact)
  */
 export function createApiRouter(ctx) {
-  const { answerInTime, db, config, bus } = ctx;
+  const { answerInTime, writeInTime, db, config, bus } = ctx;
   const router = express.Router();
 
   const limiter = (max) => createRateLimiter({ max, windowMs: 60_000, now: ctx.now });
@@ -111,7 +111,10 @@ export function createApiRouter(ctx) {
   // ---- slugs & domains -----------------------------------------------------
   // Every database call a request waits for goes through answerInTime: one attempt waits at most
   // QUERY_TIMEOUT_MS on its socket and the driver retries a timed-out read or write once, so without its own
-  // deadline a stalled cluster would hold the request about twice as long.
+  // deadline a stalled cluster would hold the request about twice as long. A 503 for a write that was
+  // applied anyway is harmless where repeating it gives the same result (PATCH, destroy, revive, delete,
+  // clear). The two writes here that can't be repeated, a create's insert and simulated traffic, go through
+  // writeInTime instead, whose limit leaves room for the driver's retry (app.js).
   router.get('/slugs/check', lookupLimiter, async (req, res) => {
     res.json(await answerInTime(checkSlug(db, queryString(req, 'slug') ?? '')));
   });
@@ -148,9 +151,11 @@ export function createApiRouter(ctx) {
     const isTaken = (s) => answerInTime(slugTaken(db, s));
     let slug;
     const rawSlug = body.slug;
-    if (rawSlug !== undefined && rawSlug !== null && String(rawSlug).trim() !== '') {
+    // asText, not String(): a JSON value String() throws on (such as {"toString":1}) is no slug either.
+    const rawText = asText(rawSlug);
+    if (rawSlug !== undefined && rawSlug !== null && rawText?.trim() !== '') {
       if (typeof rawSlug !== 'string' && typeof rawSlug !== 'number') throw validationError('slug', 'slug must be a string.');
-      const input = String(rawSlug);
+      const input = rawText;
       slug = input.length > SLUG_INPUT_MAX ? '' : normalizeSlug(input);
       const reason = validateSlug(slug);
       if (reason === 'empty' || reason === 'invalid') {
@@ -176,7 +181,7 @@ export function createApiRouter(ctx) {
     };
     let stored;
     try {
-      stored = await answerInTime(insertLink(db, row));
+      stored = await writeInTime(insertLink(db, row));
     } catch (err) {
       // Someone else took the slug between the check above and this insert. Only a duplicate slug says so:
       // insertLink handles an id that was already stored itself.
@@ -272,6 +277,8 @@ export function createApiRouter(ctx) {
   };
 
   router.get('/links/:slug/stream', requireManage, async (req, res) => {
+    // A client that left during the token check needs no stream, and must not end an older one of its own.
+    if (clientGone(req, res)) return;
     const link = res.locals.link;
     const client = clientKey(req.ip);
     const { perLink, perClient } = ctx.streamLimits;
@@ -321,11 +328,11 @@ export function createApiRouter(ctx) {
       if (!isPlainObject(body)) throw validationError(null, 'Request body must be a JSON object.');
       let count = 12;
       if (body.count !== undefined && body.count !== null) {
-        count = Number(body.count);
+        count = asNumber(body.count);
         if (!Number.isInteger(count) || count < 1 || count > 50) throw validationError('count', 'count must be between 1 and 50.');
       }
       const link = res.locals.link;
-      const inserted = await answerInTime(simulateTraffic({ db, link, count, now: ctx.now(), random: ctx.random }));
+      const inserted = await writeInTime(simulateTraffic({ db, link, count, now: ctx.now(), random: ctx.random }));
       notify(link);
       res.json({ inserted });
     },

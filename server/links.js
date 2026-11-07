@@ -1,6 +1,6 @@
 // Blip: link status, LinkDTO mapping and create/update body validation (SPEC §4.3, §5.1, §5.2).
 import os from 'node:os';
-import { HttpError, validationError } from './errors.js';
+import { HttpError, asText, validationError } from './errors.js';
 import { bareHostname, normalizeTargetUrl, URL_MAX } from './urls.js';
 import { storedQrStyle, validateQrStyle } from './qrstyle.js';
 import { isDomainLive } from './domains.js';
@@ -196,7 +196,8 @@ export function validateLinkBody(body, { mode, config, now, current }) {
   if (has('title')) out.title = cleanText(body.title, 'title', LIMITS.titleMax);
 
   if (has('domain')) {
-    const domain = body.domain === null || body.domain === '' ? config.baseHost : String(body.domain).trim().toLowerCase();
+    // A value with no string form (asText gives null) is an unknown domain like any other.
+    const domain = body.domain === null || body.domain === '' ? config.baseHost : (asText(body.domain) ?? '').trim().toLowerCase();
     if (!isKnownDomain(config, domain)) {
       // A client echoing back the link's own legacy stored domain (an old base host, or a vanity
       // domain no longer offered) means "keep it as it is": normalise to the current base host.

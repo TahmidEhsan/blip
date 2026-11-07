@@ -2,7 +2,8 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import {
-  INDEXES, SCHEMA_VERSION, createDatabase, deleteLink, ensureIndexes, ensureIpHashSalt, insertClick, insertLink, prepareDatabase,
+  INDEXES, SCHEMA_VERSION, createDatabase, databaseFailureHint, deleteLink, ensureIndexes, ensureIpHashSalt, indexConflictHint, insertClick, insertLink,
+  prepareDatabase,
 } from '../server/db.js';
 import { resolveConfig } from '../server/config.js';
 import { createApp } from '../server/app.js';
@@ -46,6 +47,46 @@ const LINK = {
   ...LINK_DEFAULTS, domain: 'localhost:3030', target_url: 'https://example.com/', manage_token_hash: 'abc', created_at: 1, updated_at: 1,
 };
 
+/**
+ * Prepare a database, then leave it the way changes made by hand in Atlas can, so that two of its indexes
+ * can't be built: two links share a slug (slug_unique was dropped first), and the fields of
+ * link_visitor_unique sit under another name. On clicks, link_ts_id is gone (nothing stands in its way), and
+ * `link_id` was made again on other fields: an index of that name is there, so it is left as it is.
+ */
+async function standInTheWay(uri, dbName) {
+  const db = createDatabase({ uri, dbName });
+  try {
+    await prepareDatabase(db);
+    await db.collection('links').dropIndex('slug_unique');
+    await db.collection('links').insertMany([{ id: 50, slug: 'twin' }, { id: 51, slug: 'twin' }]);
+    await db.collection('clicks').dropIndex('link_ts_id');
+    await db.collection('clicks').dropIndex('link_id');
+    await db.collection('clicks').createIndex({ link_id: 1, ts: -1 }, { name: 'link_id' });
+    await db.collection('visitors').dropIndex('link_visitor_unique');
+    await db.collection('visitors').createIndex({ link_id: 1, visitor_hash: 1 }, { name: 'by_hand', unique: true });
+  } finally {
+    await db.close();
+  }
+}
+/** `[collection, index, server code]` of what standInTheWay leaves unbuildable: a duplicate key, and IndexOptionsConflict. */
+const STOOD_IN_THE_WAY = [['links', 'slug_unique', 11000], ['visitors', 'link_visitor_unique', 85]];
+
+/**
+ * Prepare a database, then give two of its links one id, the way only changes made by hand in Atlas can
+ * (id_unique dropped first, then documents copied in). Returns the slugs of the two.
+ */
+async function shareAnId(uri, dbName, id) {
+  const db = createDatabase({ uri, dbName });
+  try {
+    await prepareDatabase(db);
+    await db.collection('links').dropIndex('id_unique');
+    await db.collection('links').insertMany([{ id, slug: `twin-${id}-a` }, { id, slug: `twin-${id}-b` }]);
+    return [`twin-${id}-a`, `twin-${id}-b`];
+  } finally {
+    await db.close();
+  }
+}
+
 describe('preparing a database', () => {
   it('reopening an existing database is idempotent and keeps data, indexes and the salt', async () => {
     const uri = await testMongoUri();
@@ -77,11 +118,11 @@ describe('preparing a database', () => {
   it('running it twice in a row is a no-op', async () => {
     const db = createDatabase({ uri: await testMongoUri(), dbName: freshDatabaseName() });
     try {
-      assert.deepEqual(await ensureIndexes(db), { from: 0, to: SCHEMA_VERSION });
+      assert.deepEqual(await ensureIndexes(db), { from: 0, to: SCHEMA_VERSION, conflicts: [] });
       await insertLink(db, { ...LINK, slug: 'present' });
       const once1 = await snapshot(db);
       assert.deepEqual(once1.indexes, EXPECTED_INDEXES);
-      assert.deepEqual(await ensureIndexes(db), { from: SCHEMA_VERSION, to: SCHEMA_VERSION }, 'the second run finds nothing to do');
+      assert.deepEqual(await ensureIndexes(db), { from: SCHEMA_VERSION, to: SCHEMA_VERSION, conflicts: [] }, 'the second run finds nothing to do');
       assert.deepEqual(await snapshot(db), once1, 'and changes nothing');
     } finally {
       await closeTestDatabase(db);
@@ -112,17 +153,217 @@ describe('preparing a database', () => {
       dbName,
       clientOptions: { monitorCommands: true },
       onClient: (client) => client.on('commandStarted', (e) => {
-        if (e.commandName === 'createIndexes') created.push(e.command.createIndexes);
+        if (e.commandName === 'createIndexes') created.push(`${e.command.createIndexes} ${e.command.indexes.map((index) => index.name).join(' ')}`);
       }),
     });
     try {
-      assert.deepEqual(await prepareDatabase(again), { from: SCHEMA_VERSION, to: SCHEMA_VERSION }, 'the schema version was current all along');
+      assert.deepEqual(await prepareDatabase(again), { from: SCHEMA_VERSION, to: SCHEMA_VERSION, conflicts: [] }, 'the schema version was current all along');
       assert.deepEqual(await indexNames(again), EXPECTED_INDEXES);
-      assert.deepEqual(created.sort(), ['clicks', 'visitors'], 'only the collections that lacked indexes');
+      assert.deepEqual(
+        created.sort(),
+        ['clicks id_unique link_id link_ts_id link_real_ts', 'links id_unique', 'visitors link_visitor_unique'],
+        'only the collections that lacked indexes, and the essential index every start confirms',
+      );
       created.length = 0;
       await prepareDatabase(again);
-      assert.deepEqual(created, [], 'and the start after that only reads');
+      assert.deepEqual(created, ['links id_unique'], 'and the start after that only reads, apart from that one');
       await assert.rejects(again.collection('visitors').insertMany([{ link_id: 1, visitor_hash: 'x' }, { link_id: 1, visitor_hash: 'x' }]), /duplicate key/, 'the first-visit rule has its unique index again');
+    } finally {
+      await again.close();
+      await dropTestDatabase(dbName);
+    }
+  });
+
+  it('a visitors collection that racing visits filled twice for one visitor keeps one and gets its unique index back', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    const first = createDatabase({ uri, dbName });
+    let link;
+    try {
+      await prepareDatabase(first);
+      link = await insertLink(first, { ...LINK, slug: 'raced-reset' });
+      // Analytics reset by hand while an instance kept serving: with link_visitor_unique gone along with the
+      // collection, two racing first visits by one visitor each stored a document.
+      await first.collection('visitors').drop();
+      await first.collection('visitors').insertMany([
+        { link_id: link.id, visitor_hash: 'twice', is_synthetic: 0 },
+        { link_id: link.id, visitor_hash: 'twice', is_synthetic: 0 },
+        { link_id: link.id, visitor_hash: 'once', is_synthetic: 0 },
+        { link_id: link.id + 1, visitor_hash: 'twice', is_synthetic: 0 },
+      ]);
+    } finally {
+      await first.close();
+    }
+    const again = createDatabase({ uri, dbName });
+    try {
+      const [oldest] = await again.collection('visitors').find({ link_id: link.id, visitor_hash: 'twice' }).sort({ _id: 1 }).toArray();
+      assert.deepEqual(await prepareDatabase(again), { from: SCHEMA_VERSION, to: SCHEMA_VERSION, conflicts: [] }, 'nothing left in the way');
+      assert.deepEqual(await indexNames(again), EXPECTED_INDEXES);
+      const left = await again.collection('visitors').find({}).sort({ link_id: 1, visitor_hash: 1 }).toArray();
+      assert.deepEqual(left.map((v) => [v.link_id - link.id, v.visitor_hash]), [[0, 'once'], [0, 'twice'], [1, 'twice']], 'one document per link and visitor');
+      assert.deepEqual(left[1]._id, oldest._id, 'the oldest one stays');
+    } finally {
+      await again.close();
+      await dropTestDatabase(dbName);
+    }
+  });
+
+  it('two links that share an id fail the start-up instead of being served, and the first start after the fix builds the index', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    const [, second] = await shareAnId(uri, dbName, 70);
+    const again = createDatabase({ uri, dbName });
+    try {
+      await assert.rejects(prepareDatabase(again), (err) => {
+        assert.equal(err.code, 'ESSENTIAL_INDEX');
+        assert.equal(err.cause.code, 11000);
+        assert.match(err.message, /^could not create the index id_unique of links, which Blip can't run without: .*E11000 duplicate key error .*dup key: \{ id: 70 \}/);
+        assert.match(databaseFailureHint(err), /^Two links share an id, .* Blip can't start until then; on Vercel, every request that needs the database \(the API and short links\) answers 503 and tries again\.$/);
+        assertPlainCopy(databaseFailureHint(err), 'the hint');
+        return true;
+      });
+      assert.equal(await again.collection('links').countDocuments({ id: 70 }), 2, 'no link is ever removed to make room');
+      assert.ok(!(await indexNames(again)).links.includes('id_unique'));
+
+      await again.collection('links').updateOne({ slug: second }, { $set: { id: 71 } });
+      assert.deepEqual((await prepareDatabase(again)).conflicts, []);
+      assert.deepEqual((await indexNames(again)).links, EXPECTED_INDEXES.links);
+    } finally {
+      await again.close();
+      await dropTestDatabase(dbName);
+    }
+  });
+
+  it('the check of id_unique waits for its answer even when the connection string asks for no acknowledgement', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    await shareAnId(uri, dbName, 75);
+    // w=0 makes the driver send a write and report success without a reply; the check must not be one.
+    const again = createDatabase({ uri, dbName, clientOptions: { writeConcern: { w: 0 } } });
+    try {
+      await assert.rejects(prepareDatabase(again), (err) => err.code === 'ESSENTIAL_INDEX' && err.cause.code === 11000);
+    } finally {
+      await again.close();
+      await dropTestDatabase(dbName);
+    }
+  });
+
+  it('a start-up step waits for all of its commands, and names the essential index when another one failed too', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    await shareAnId(uri, dbName, 76);
+    const again = createDatabase({ uri, dbName });
+    // The read of the schema version fails too, after the essential index was refused: the step must wait
+    // for it, and still report the refusal, which is what a person has to fix.
+    let readSettled = false;
+    const real = again.collection.bind(again);
+    again.collection = (name) => {
+      const collection = real(name);
+      if (name !== 'meta') return collection;
+      return new Proxy(collection, {
+        get(target, prop) {
+          if (prop === 'findOne') {
+            return () => new Promise((resolve, reject) => {
+              setTimeout(() => {
+                readSettled = true;
+                reject(Object.assign(new Error('the schema version could not be read'), { code: 'TEST_SLOW_FAILURE' }));
+              }, 300);
+            });
+          }
+          const value = target[prop];
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    };
+    try {
+      await assert.rejects(prepareDatabase(again), (err) => {
+        assert.equal(err.code, 'ESSENTIAL_INDEX', 'the refusal, not the other failure');
+        assert.equal(readSettled, true, 'thrown only once every command of the step had settled');
+        return true;
+      });
+    } finally {
+      delete again.collection;
+      await again.close();
+      await dropTestDatabase(dbName);
+    }
+  });
+
+  it('an index made by hand in the way of id_unique fails the start-up too, under that name or another', async () => {
+    const uri = await testMongoUri();
+    // listIndexes would show `id_unique` in the first case, so only the server can tell it isn't Blip's index:
+    // not unique, no id would ever be refused. The second already keeps ids unique, under the name Atlas
+    // suggests, and still stands in the way of Blip's own (85); dropping it is all the hint asks.
+    const cases = [
+      { name: 'id_unique', options: {}, code: 86 },
+      { name: 'id_1', options: { unique: true }, code: 85 },
+    ];
+    for (const { name, options, code } of cases) {
+      const dbName = freshDatabaseName();
+      const first = createDatabase({ uri, dbName });
+      try {
+        await prepareDatabase(first);
+        await first.collection('links').dropIndex('id_unique');
+        await first.collection('links').createIndex({ id: 1 }, { name, ...options });
+        await first.collection('links').insertMany([{ id: 90, slug: 'only-one' }, { id: 91, slug: 'another-one' }]);
+      } finally {
+        await first.close();
+      }
+      const again = createDatabase({ uri, dbName });
+      try {
+        await assert.rejects(prepareDatabase(again), (err) => {
+          assert.equal(err.code, 'ESSENTIAL_INDEX', name);
+          assert.equal(err.cause.code, code, name);
+          assert.match(err.message, /^could not create the index id_unique of links, which Blip can't run without: /);
+          assert.match(databaseFailureHint(err), /^An index made by hand stands in its way \(the message names it\): drop that one in Atlas\. Blip can't start until then; /);
+          return true;
+        });
+        await again.collection('links').dropIndex(name);
+        assert.deepEqual((await prepareDatabase(again)).conflicts, [], `${name}: the start after it is dropped builds Blip's own`);
+        assert.deepEqual((await indexNames(again)).links, EXPECTED_INDEXES.links);
+      } finally {
+        await again.close();
+        await dropTestDatabase(dbName);
+      }
+    }
+  });
+
+  it('an index the data or a hand-made index stands in the way of is reported, and every other one is built', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    await standInTheWay(uri, dbName);
+    const sent = [];
+    const again = createDatabase({
+      uri,
+      dbName,
+      clientOptions: { monitorCommands: true },
+      onClient: (client) => client.on('commandStarted', (e) => {
+        if (e.commandName === 'createIndexes') sent.push(`${e.command.createIndexes} ${e.command.indexes.map((index) => index.name).join(' ')}`);
+      }),
+    });
+    try {
+      const { from, to, conflicts } = await prepareDatabase(again);
+      assert.deepEqual([from, to], [SCHEMA_VERSION, SCHEMA_VERSION]);
+      assert.deepEqual(conflicts.map((c) => [c.collection, c.index, c.error.code]).sort(), STOOD_IN_THE_WAY);
+      assert.deepEqual(
+        sent.sort(),
+        ['clicks link_ts_id', 'links id_unique', 'links slug_unique', 'visitors link_visitor_unique'],
+        'each sent once: a lone index that was refused is not built a second time',
+      );
+      const hint = (index) => indexConflictHint(conflicts.find((c) => c.index === index).error);
+      assert.match(hint('slug_unique'), /remove the extra ones in Atlas, keeping one of each/);
+      assert.match(hint('link_visitor_unique'), /An index made by hand stands in its way/);
+      for (const index of ['slug_unique', 'link_visitor_unique']) assertPlainCopy(hint(index), 'the hint');
+      const names = await indexNames(again);
+      assert.ok(names.clicks.includes('link_ts_id'), 'the index nothing stood in the way of was built');
+      assert.deepEqual((await again.collection('clicks').indexes()).find((index) => index.name === 'link_id').key, { link_id: 1, ts: -1 }, 'and one Blip did not make is left alone');
+      assert.equal(await again.collection('links').countDocuments({ slug: 'twin' }), 2, 'no link is ever removed to make room');
+
+      // Once the way is clear, the next start builds them.
+      await again.collection('links').deleteOne({ id: 51 });
+      await again.collection('visitors').dropIndex('by_hand');
+      assert.deepEqual((await prepareDatabase(again)).conflicts, []);
+      const rebuilt = await indexNames(again);
+      assert.deepEqual([rebuilt.links, rebuilt.visitors], [EXPECTED_INDEXES.links, EXPECTED_INDEXES.visitors]);
     } finally {
       await again.close();
       await dropTestDatabase(dbName);
@@ -367,6 +608,82 @@ describe('start-up', () => {
     } finally {
       server.close();
       await instance.close();
+    }
+  });
+
+  it('an index it cannot build is logged once, and Blip serves without building it on every request', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const uri = await testMongoUri();
+    const mongodbDb = freshDatabaseName();
+    await standInTheWay(uri, mongodbDb);
+    let builds = 0;
+    // Like a new instance on Vercel: the first request opens the database.
+    const instance = createApp({
+      config: { mongodbUri: uri, mongodbDb },
+      connectOnFirstRequest: true,
+      mongoClientOptions: { monitorCommands: true },
+      onDatabaseClient: (client) => client.on('commandStarted', (e) => {
+        if (e.commandName === 'createIndexes') builds += 1;
+      }),
+    });
+    const { server, base } = await listen(instance);
+    try {
+      assert.equal((await fetch(`${base}/api/slugs/check?slug=after-the-reset`)).status, 200, 'not a 503');
+      const afterStart = builds;
+      assert.ok(afterStart > 0);
+      const created = await fetch(`${base}/api/links`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ targetUrl: 'https://example.com/still', slug: 'still-here' }) });
+      assert.equal(created.status, 201);
+      assert.equal((await fetch(`${base}/still-here`, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0' } })).status, 302);
+      assert.equal(builds, afterStart, 'later requests build nothing');
+      const logged = errors.mock.calls.map((c) => String(c.arguments[0]));
+      assert.equal(logged.length, STOOD_IN_THE_WAY.length, logged.join('\n'));
+      for (const [collection, index] of STOOD_IN_THE_WAY) {
+        assert.ok(logged.some((line) => line.startsWith(`[blip] could not create the index ${index} of ${collection} (database ${mongodbDb}): `) && line.endsWith('Until then Blip runs without it.')), `${index}: ${logged.join('\n')}`);
+      }
+      assert.ok(logged.every((line) => !/could not open the database/.test(line)));
+    } finally {
+      server.close();
+      await instance.close();
+      await dropTestDatabase(mongodbDb);
+    }
+  });
+
+  it('an app whose links share an id answers 503 and says why on every request, and serves once they are fixed', async (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const uri = await testMongoUri();
+    const mongodbDb = freshDatabaseName();
+    const [first, second] = await shareAnId(uri, mongodbDb, 80);
+    // Like a new instance on Vercel: the first request opens the database.
+    const instance = createApp({ config: { mongodbUri: uri, mongodbDb }, connectOnFirstRequest: true });
+    const { server, base } = await listen(instance);
+    try {
+      for (let i = 0; i < 2; i += 1) {
+        const res = await fetch(`${base}/api/slugs/check?slug=anything`);
+        assert.equal(res.status, 503);
+        assert.equal(res.headers.get('retry-after'), '5');
+        assert.equal((await res.json()).error.code, 'unavailable');
+      }
+      const visit = await fetch(`${base}/${first}`, { redirect: 'manual', headers: { Accept: 'text/html', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0' } });
+      assert.equal(visit.status, 503, 'a visit never reaches either link');
+      const logged = errors.mock.calls.map((c) => String(c.arguments[0]));
+      assert.equal(logged.length, 3, `once for each request, which each try again: ${logged.join('\n')}`);
+      for (const line of logged) {
+        assert.ok(line.startsWith(`[blip] could not open the database (mongodb://127.0.0.1:`), line);
+        assert.match(line, new RegExp(`database ${mongodbDb}\\): could not create the index id_unique of links, which Blip can't run without: .*E11000 duplicate key error .*\\. Two links share an id, `));
+      }
+
+      const fix = createDatabase({ uri, dbName: mongodbDb });
+      try {
+        await fix.collection('links').updateOne({ slug: second }, { $set: { id: 81 } });
+      } finally {
+        await fix.close();
+      }
+      assert.equal((await fetch(`${base}/api/slugs/check?slug=anything`)).status, 200, 'the next request builds the index and serves');
+      assert.equal(errors.mock.calls.length, 3, 'and logs nothing more');
+    } finally {
+      server.close();
+      await instance.close();
+      await dropTestDatabase(mongodbDb);
     }
   });
 

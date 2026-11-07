@@ -1,8 +1,10 @@
 // Copy every /vendor file Blip's pages load into public/vendor, at the same URL (`npm run build`).
 //
 // Locally the server serves /vendor/* straight from node_modules (server/app.js). On Vercel only
-// public/** reaches the CDN (express.static and these routes never run there), so the build puts the
-// files there instead. The list is not hand-kept: the script scans the pages, stylesheets and scripts
+// public/** reaches the CDN (express.static and these routes never run there), so the files live there
+// too. They are COMMITTED: Vercel lists the static files of a clean checkout before it runs the build, so
+// anything only this script creates would never be published. Run it and commit the result after changing
+// a vendor package; a test fails when the committed copies are stale or untracked. The list is not hand-kept: the script scans the pages, stylesheets and scripts
 // (public/**/*.html, *.css, *.js and server/views/*.html) for /vendor/ URLs, maps each one to its
 // package through server/vendor.js, and follows the relative url()s inside the font stylesheets to the
 // font files. A reference it can't resolve fails the build, so a page never ships a broken /vendor link.

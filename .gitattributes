@@ -1,0 +1,2 @@
+# Third-party copies are kept byte-for-byte (a test compares them with node_modules).
+public/vendor/** -text

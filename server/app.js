@@ -1,5 +1,6 @@
 // Blip: Express application factory (SPEC §2, §7).
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { PROJECT_ROOT, resolveConfig } from './config.js';
 import { createDatabase, describeDatabaseUrl, ensureIpHashSalt, isDatabaseUnavailable, prepareDatabase } from './db.js';
@@ -30,6 +31,9 @@ export const DEFAULT_RATE_LIMITS = Object.freeze({ createLink: 20, simulate: 30,
 export const DEFAULT_STREAM_LIMITS = Object.freeze({ perLink: 10, perClient: 20 });
 
 const PUBLIC_DIR = path.join(PROJECT_ROOT, 'public');
+// A literal path on purpose: it is what makes Vercel's file tracer bundle the page into the function
+// (the "includeFiles" setting is ignored for Express projects).
+const HOME_PAGE = fileURLToPath(new URL('../public/index.html', import.meta.url));
 const NODE_MODULES = path.join(PROJECT_ROOT, 'node_modules');
 
 /** Sent on every response (SPEC §7.1). vercel.json repeats them for the files Vercel's CDN serves itself. */
@@ -162,10 +166,17 @@ export function createApp(options = {}) {
   app.set('trust proxy', config.trustProxy);
   app.use(securityHeaders);
 
+  // The home page never needs the database. On Vercel the function owns "/", so the CDN's copy of
+  // index.html is never used for it and the function serves it here.
+  app.get('/', (req, res, next) => {
+    res.sendFile(HOME_PAGE, (err) => {
+      if (err && !res.headersSent) next(err.status === 404 || err.code === 'ENOENT' ? undefined : err);
+    });
+  });
+
   // Vendor libraries straight from node_modules (no CDN, because the CSP only allows 'self'). They come
-  // before the static site so a local run always serves the installed versions, even when an earlier
-  // `npm run build` left copies in public/vendor (those are for Vercel, whose CDN serves public/**
-  // itself and never sends static requests to this app).
+  // before the static site so a local run always serves the installed versions. The committed copies in
+  // public/vendor are for Vercel, whose CDN serves public/** itself and never sends those requests here.
   const vendorOptions = { maxAge: config.nodeEnv === 'production' ? '7d' : 0 };
   for (const [route, file] of Object.entries(VENDOR_FILES)) {
     const abs = path.join(NODE_MODULES, file);

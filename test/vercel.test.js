@@ -56,10 +56,10 @@ describe('vercel.json', () => {
     assert.deepEqual(Object.fromEntries(all.headers.map((h) => [h.key, h.value])), { ...SECURITY_HEADERS });
   });
 
-  it('is ignored by git together with the build output', () => {
+  it('keeps the build output out of git, and the vendor copies in it', () => {
     const ignored = fs.readFileSync(path.join(PROJECT_ROOT, '.gitignore'), 'utf8').split(/\r?\n/);
-    assert.ok(ignored.includes('/public/vendor/'));
     assert.ok(ignored.includes('/.vercel/'));
+    assert.ok(!ignored.some((line) => line.includes('public/vendor')), 'Vercel lists static files before the build, so they must be committed');
   });
 });
 
@@ -71,6 +71,22 @@ describe('vendor build (npm run build)', () => {
     result = buildVendor({ outDir: out });
   });
   after(() => fs.rmSync(out, { recursive: true, force: true }));
+
+  it('matches the copies committed in public/vendor, every one tracked by git', () => {
+    // Vercel lists a clean checkout's static files BEFORE it runs the build, so an untracked copy never
+    // reaches its CDN and that URL falls through to the function.
+    const listed = spawnSync('git', ['ls-files', 'public/vendor'], { cwd: PROJECT_ROOT, encoding: 'utf8' });
+    assert.equal(listed.status, 0);
+    const tracked = new Set(listed.stdout.split(/\r?\n/).filter(Boolean));
+    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+    const built = walk(path.join(out, 'vendor'));
+    assert.ok(built.length > 0);
+    for (const file of built) {
+      const rel = path.relative(out, file).split(path.sep).join('/');
+      assert.ok(tracked.has(`public/${rel}`), `public/${rel} is committed`);
+      assert.ok(fs.readFileSync(file).equals(fs.readFileSync(path.join(PROJECT_ROOT, 'public', rel))), `public/${rel} is up to date (run npm run build)`);
+    }
+  });
 
   it('copies every /vendor URL the pages, views, styles and scripts use, at the same path', () => {
     const refs = findVendorReferences();

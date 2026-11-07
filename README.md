@@ -177,6 +177,8 @@ Example:
 PORT=8080 BASE_URL=https://blip.example.com DOMAINS=cat.ly,go.to LIVE_DOMAINS=cat.ly TRUST_PROXY=1 npm start
 ```
 
+`npm start` and `npm run dev` also read these settings from a `.env` file in the project folder when one exists. Variables already set in your shell take priority. Git ignores `.env`, and Vercel never reads it: set values for the live site in the project's environment variables.
+
 ## Where the data lives
 
 - **On your machine (the default):** a SQLite file at `DB_PATH`, `./data/blip.db` unless you change it. The folder and file are created on first run, and nothing else needs installing. Absolute and relative paths both work, Windows drive letters included.

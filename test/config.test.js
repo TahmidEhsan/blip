@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import path from 'node:path';
 import {
-  DEFAULT_STREAM_POLL_MS, PROJECT_ROOT, VERCEL_NO_DATABASE_PROBLEM, VERCEL_STREAM_MAX_MS, fileUrlFromPath, isVercel, loadConfig,
-  parseTrustProxy, resolveConfig,
+  DEFAULT_STREAM_POLL_MS, LOCAL_NO_DATABASE_PROBLEM, VERCEL_NO_DATABASE_PROBLEM, VERCEL_STREAM_MAX_MS, defaultDatabaseName, isVercel, loadConfig,
+  parseTrustProxy, resolveConfig, uriHasCredentials,
 } from '../server/config.js';
-import { describeDatabaseUrl, filePathFromUrl } from '../server/db.js';
+import { describeDatabaseFailure, redactSecrets } from '../server/app.js';
+import { databaseFailureHint, describeDatabaseUrl } from '../server/db.js';
+import { assertPlainCopy } from './helpers.js';
 
 describe('config', () => {
   it('has sensible defaults', () => {
@@ -16,7 +17,8 @@ describe('config', () => {
     assert.equal(c.baseHost, 'localhost:3030');
     assert.deepEqual(c.domains, ['blip.to', 'cat.ly', 'go.to', 'p.wrk']);
     assert.deepEqual(c.liveDomains, []);
-    assert.equal(c.dbPath, path.join(PROJECT_ROOT, 'data', 'blip.db'));
+    assert.equal(c.mongodbUri, null);
+    assert.equal(c.mongodbDb, 'blip_dev');
     assert.equal(c.ipHashSalt, null);
     assert.equal(c.allowDemoTraffic, true);
     assert.equal(c.trustProxy, false);
@@ -46,7 +48,6 @@ describe('config', () => {
     assert.equal(parseTrustProxy('2'), 2);
     assert.equal(parseTrustProxy('loopback'), 'loopback');
     assert.equal(loadConfig({ IP_HASH_SALT: 's3cret' }).ipHashSalt, 's3cret');
-    assert.equal(loadConfig({ DB_PATH: ':memory:' }).dbPath, ':memory:');
   });
 
   it('rejects invalid ports and base URLs', () => {
@@ -62,87 +63,220 @@ describe('config', () => {
     assert.deepEqual(c.domains, ['cat.ly']);
     assert.deepEqual(c.liveDomains, ['cat.ly']);
     assert.equal(resolveConfig({ port: 5555 }).baseUrl, 'http://localhost:5555');
-    assert.equal(resolveConfig({ dbPath: ':memory:' }).dbPath, ':memory:');
-    assert.equal(resolveConfig({ dbPath: ':memory:' }).databaseUrl, ':memory:', 'the database URL follows dbPath');
   });
 });
 
 describe('database location', () => {
-  const secret = 'eyJhbGciOiJFZERTQSJ9.c2VjcmV0';
+  const secret = 'p4ssw0rd-not-for-logs';
+  const URI = `mongodb+srv://blip-user:${secret}@cluster0.example.mongodb.net/?retryWrites=true`;
 
-  it('defaults to the local file data/blip.db as a file: URL, with no token', () => {
-    const c = loadConfig({});
-    assert.equal(c.databaseUrl, fileUrlFromPath(path.join(PROJECT_ROOT, 'data', 'blip.db')));
-    assert.match(c.databaseUrl, /^file:\/\/\/.*\/data\/blip\.db$/);
-    assert.equal(c.databaseAuthToken, null);
-    assert.equal(loadConfig({ DB_PATH: ':memory:' }).databaseUrl, ':memory:');
+  it('reads the connection string and the database name', () => {
+    const c = loadConfig({ MONGODB_URI: ` ${URI} `, MONGODB_DB: ' my_links ' });
+    assert.equal(c.mongodbUri, URI);
+    assert.equal(c.mongodbDb, 'my_links');
+    assert.equal(c.databaseProblem, null);
+    assert.equal(loadConfig({ MONGODB_URI: 'mongodb://127.0.0.1:27017' }).mongodbUri, 'mongodb://127.0.0.1:27017');
   });
 
-  it('turns Windows and POSIX paths into file: URLs that keep spaces, # and %', () => {
-    assert.equal(fileUrlFromPath('C:\\Users\\me\\blip data\\x#1%.db', path.win32), 'file:///C:/Users/me/blip%20data/x%231%25.db');
-    assert.equal(fileUrlFromPath('D:\\blip.db', path.win32), 'file:///D:/blip.db');
-    assert.equal(fileUrlFromPath('\\\\server\\share\\blip.db', path.win32), 'file:////server/share/blip.db');
-    assert.equal(fileUrlFromPath('/var/lib/blip/blip.db', path.posix), 'file:///var/lib/blip/blip.db');
-    assert.equal(fileUrlFromPath('/srv/my data/blip.db', path.posix), 'file:///srv/my%20data/blip.db');
+  it('has no database and says so without a connection string, pointing at .env', () => {
+    for (const env of [{}, { MONGODB_URI: '  ' }, { MONGODB_DB: 'my_links' }]) {
+      const c = loadConfig(env);
+      assert.equal(c.mongodbUri, null);
+      assert.equal(c.databaseProblem, LOCAL_NO_DATABASE_PROBLEM);
+    }
+    assert.equal(resolveConfig({}).mongodbUri, null);
+    assert.equal(resolveConfig({}).databaseProblem, LOCAL_NO_DATABASE_PROBLEM);
+    assert.match(LOCAL_NO_DATABASE_PROBLEM, /MONGODB_URI/);
+    assert.match(LOCAL_NO_DATABASE_PROBLEM, /\.env/);
+    for (const problem of [LOCAL_NO_DATABASE_PROBLEM, VERCEL_NO_DATABASE_PROBLEM]) assertPlainCopy(problem, 'the no-database message');
   });
 
-  it('resolves a relative DB_PATH against the project root and an absolute one as given', () => {
-    const relative = loadConfig({ DB_PATH: 'tmp/other.db' });
-    assert.equal(relative.dbPath, path.join(PROJECT_ROOT, 'tmp', 'other.db'));
-    assert.equal(relative.databaseUrl, fileUrlFromPath(path.join(PROJECT_ROOT, 'tmp', 'other.db')));
-    assert.equal(path.resolve(filePathFromUrl(relative.databaseUrl)), relative.dbPath, 'the URL points back at the same file');
-
-    const absolutePath = path.join(PROJECT_ROOT, '..', 'blip data #2', 'blip.db');
-    const absolute = loadConfig({ DB_PATH: absolutePath });
-    assert.equal(path.resolve(filePathFromUrl(absolute.databaseUrl)), path.resolve(absolutePath));
-    if (process.platform === 'win32') assert.match(absolute.databaseUrl, /^file:\/\/\/[A-Z]:\//, 'the drive letter is kept');
-    assert.equal(describeDatabaseUrl(absolute.databaseUrl), path.resolve(absolutePath));
+  it('picks the database by environment, so data never mixes, and MONGODB_DB always wins', () => {
+    assert.equal(defaultDatabaseName({}), 'blip_dev');
+    assert.equal(defaultDatabaseName({ VERCEL_ENV: 'production' }), 'blip_dev', 'VERCEL_ENV alone is not Vercel');
+    assert.equal(defaultDatabaseName({ VERCEL: '1', VERCEL_ENV: 'production' }), 'blip');
+    assert.equal(defaultDatabaseName({ VERCEL: '1', VERCEL_ENV: ' production ' }), 'blip');
+    assert.equal(defaultDatabaseName({ VERCEL: '1', VERCEL_ENV: 'preview' }), 'blip_preview');
+    for (const env of [{ VERCEL: '1' }, { VERCEL: '1', VERCEL_ENV: 'development' }, { VERCEL: '1', VERCEL_ENV: 'Production' }, { VERCEL: '0', VERCEL_ENV: 'production' }]) {
+      assert.equal(defaultDatabaseName(env), 'blip_dev', JSON.stringify(env));
+    }
+    const vercel = { VERCEL: '1', MONGODB_URI: URI };
+    assert.equal(loadConfig({ ...vercel, VERCEL_ENV: 'production' }).mongodbDb, 'blip');
+    assert.equal(loadConfig({ ...vercel, VERCEL_ENV: 'preview' }).mongodbDb, 'blip_preview');
+    assert.equal(loadConfig({ ...vercel, VERCEL_ENV: 'development' }).mongodbDb, 'blip_dev');
+    assert.equal(loadConfig({ MONGODB_URI: URI }).mongodbDb, 'blip_dev', 'a local run');
+    assert.equal(loadConfig({ ...vercel, VERCEL_ENV: 'production', MONGODB_DB: 'elsewhere' }).mongodbDb, 'elsewhere', 'MONGODB_DB always wins');
+    assert.equal(loadConfig({ MONGODB_URI: URI, MONGODB_DB: 'blip_ci_local' }).mongodbDb, 'blip_ci_local');
   });
 
-  it('prefers TURSO_DATABASE_URL, then DATABASE_URL, then LIBSQL_URL, each with its own token', () => {
-    const all = {
-      TURSO_DATABASE_URL: 'libsql://blip-turso.example.io', TURSO_AUTH_TOKEN: secret,
-      DATABASE_URL: 'libsql://blip-db.example.io', DATABASE_AUTH_TOKEN: 'db-token',
-      LIBSQL_URL: 'https://blip-libsql.example.io', LIBSQL_AUTH_TOKEN: 'libsql-token',
-      DB_PATH: './data/ignored.db',
-    };
-    assert.deepEqual(pick(loadConfig(all)), { databaseUrl: 'libsql://blip-turso.example.io', databaseAuthToken: secret });
-    assert.deepEqual(pick(loadConfig({ ...all, TURSO_DATABASE_URL: ' ' })), { databaseUrl: 'libsql://blip-db.example.io', databaseAuthToken: 'db-token' });
-    assert.deepEqual(pick(loadConfig({ LIBSQL_URL: all.LIBSQL_URL, LIBSQL_AUTH_TOKEN: 'libsql-token' })), { databaseUrl: all.LIBSQL_URL, databaseAuthToken: 'libsql-token' });
-    assert.deepEqual(pick(loadConfig({ TURSO_DATABASE_URL: 'libsql://x.example.io' })), { databaseUrl: 'libsql://x.example.io', databaseAuthToken: null });
-    // An explicit URL survives resolveConfig (createApp), and dbPath alone never overrides it.
-    assert.deepEqual(pick(resolveConfig(loadConfig(all))), { databaseUrl: 'libsql://blip-turso.example.io', databaseAuthToken: secret });
+  it("refuses a database name MongoDB would refuse, and MongoDB's own databases", () => {
+    for (const name of ['with space', 'dotted.name', 'a/b', 'x'.repeat(64), 'admin', 'local', 'config', 'Admin']) {
+      assert.throws(() => loadConfig({ MONGODB_DB: name }), /Invalid MONGODB_DB/, name);
+      assert.throws(() => resolveConfig({ mongodbDb: name }), /Invalid MONGODB_DB/, name);
+    }
+    assert.throws(() => loadConfig({ MONGODB_DB: 'dotted.name' }), (err) => err.message.startsWith('Invalid MONGODB_DB "dotted.name": '), 'a plain name is quoted');
+    assert.equal(loadConfig({ MONGODB_DB: 'x'.repeat(63) }).mongodbDb, 'x'.repeat(63));
   });
 
-  it('rejects URLs libSQL cannot open without printing them', () => {
-    const postgres = `postgres://user:${secret}@db.example.com/blip`;
-    assert.throws(() => loadConfig({ DATABASE_URL: postgres }), (err) => {
-      assert.match(err.message, /Invalid DATABASE_URL: "postgres:" URLs are not supported/);
-      assert.ok(!err.message.includes(secret), 'the URL (and its password) stays out of the message');
-      return true;
-    });
-    assert.throws(() => loadConfig({ TURSO_DATABASE_URL: 'not a url' }), /Invalid TURSO_DATABASE_URL/);
+  it('never prints a value that could hold credentials, whichever variable it was pasted into', () => {
+    for (const [env, name] of [
+      [{ MONGODB_DB: URI }, 'MONGODB_DB'],
+      [{ MONGODB_URI: URI, MONGODB_DB: URI }, 'MONGODB_DB'],
+      [{ MONGODB_DB: 'mongodb://127.0.0.1:27017' }, 'MONGODB_DB'],
+      [{ BASE_URL: URI }, 'BASE_URL'],
+      [{ BASE_URL: `https://blip-user:${secret}@blip.example.com` }, 'BASE_URL'],
+      [{ BASE_URL: `blip-user:${secret}@blip.example.com` }, 'BASE_URL'],
+      [{ PORT: URI }, 'PORT'],
+      [{ STREAM_POLL_MS: URI }, 'STREAM_POLL_MS'],
+      [{ STREAM_MAX_MS: URI }, 'STREAM_MAX_MS'],
+      [{ MONGODB_DB: `blip-user:${secret}@cluster0` }, 'MONGODB_DB'],
+    ]) {
+      for (const load of [() => loadConfig(env), () => loadConfig({ VERCEL: '1', VERCEL_ENV: 'production', ...env })]) {
+        assert.throws(load, (err) => {
+          assert.ok(err.message.startsWith(`Invalid ${name}: `), err.message);
+          for (const leak of [secret, 'blip-user', 'cluster0']) assert.ok(!err.message.includes(leak), `${leak} stays out of: ${err.message}`);
+          assertPlainCopy(err.message, 'a configuration error');
+          return true;
+        });
+      }
+    }
+    const pasted = (err) => /^Invalid MONGODB_DB: it holds a connection string, which belongs in MONGODB_URI\. MONGODB_DB is only the name of the database, such as blip\.$/.test(err.message);
+    assert.throws(() => loadConfig({ MONGODB_DB: URI }), pasted);
+    assert.throws(() => resolveConfig({ mongodbDb: URI }), pasted);
+    assert.throws(() => loadConfig({ BASE_URL: 'ftp://blip.example.com' }), (err) => err.message.startsWith('Invalid BASE_URL "ftp://blip.example.com": '), 'a value without credentials is still quoted');
+    assert.throws(() => loadConfig({ PORT: 'abc' }), (err) => err.message.startsWith('Invalid PORT "abc": '));
   });
 
-  it('describes remote databases without credentials or tokens', () => {
-    assert.equal(describeDatabaseUrl(`libsql://blip-me.turso.io?authToken=${secret}`), 'libsql://blip-me.turso.io');
-    assert.equal(describeDatabaseUrl(`https://user:${secret}@db.example.io/path`), 'https://db.example.io');
-    assert.equal(describeDatabaseUrl(':memory:'), 'in memory');
+  it('keeps separate credentials for a connection string without its own', () => {
+    const c = loadConfig({ MONGODB_URI: 'mongodb+srv://cluster0.example.mongodb.net', MONGODB_USERNAME: 'blip-user', MONGODB_PASSWORD: secret });
+    assert.equal(c.mongodbUsername, 'blip-user');
+    assert.equal(c.mongodbPassword, secret);
+    const resolved = resolveConfig(c);
+    assert.equal(resolved.mongodbUsername, 'blip-user');
+    assert.equal(resolved.mongodbPassword, secret);
+    assert.equal(uriHasCredentials(URI), true);
+    assert.equal(uriHasCredentials('mongodb+srv://cluster0.example.mongodb.net/?appName=blip'), false);
+  });
+
+  it('wants both separate credentials, unless the connection string has its own', () => {
+    const bare = 'mongodb+srv://cluster0.example.mongodb.net';
+    for (const [env, message] of [
+      [{ MONGODB_URI: bare, MONGODB_USERNAME: 'blip-user' }, /MONGODB_USERNAME is set but MONGODB_PASSWORD is not/],
+      [{ MONGODB_URI: bare, MONGODB_PASSWORD: secret }, /MONGODB_PASSWORD is set but MONGODB_USERNAME is not/],
+    ]) {
+      assert.throws(() => loadConfig(env), (err) => message.test(err.message) && !err.message.includes(secret));
+    }
+    assert.doesNotThrow(() => loadConfig({ MONGODB_URI: URI, MONGODB_USERNAME: 'ignored' }), 'the connection string has credentials, so the variables do not matter');
+    assert.throws(() => resolveConfig({ mongodbUri: bare, mongodbPassword: secret }), /MONGODB_PASSWORD is set but MONGODB_USERNAME is not/);
+  });
+
+  it('rejects anything but a MongoDB connection string, naming at most its scheme', () => {
+    const cases = [
+      [`postgres://user:${secret}@db.example.com/blip`, /^Invalid MONGODB_URI: "postgres:\/\/" connection strings are not supported\. Blip needs a MongoDB connection string, which starts with mongodb\+srv:\/\/ or mongodb:\/\/\.$/],
+      [`libsql://blip-${secret}.turso.io`, /^Invalid MONGODB_URI: "libsql:\/\/" connection strings are not supported/],
+      ['file:///tmp/blip.db', /"file:\/\/" connection strings are not supported/],
+      ['not a url', /^Invalid MONGODB_URI: expected a MongoDB connection string, which starts with mongodb\+srv:\/\/ or mongodb:\/\/\.$/],
+      // Pasted without its scheme: the user name before the colon is not a scheme, and is never printed.
+      [`blip-user:${secret}@cluster0.example.mongodb.net/?retryWrites=true`, /^Invalid MONGODB_URI: expected a MongoDB connection string/],
+      [`mongodb:/blip-user:${secret}@cluster0.example.mongodb.net`, /^Invalid MONGODB_URI: expected a MongoDB connection string/],
+      [`"${URI}"`, /^Invalid MONGODB_URI: remove the quotes around the connection string\.$/],
+      [`mongodb+srv://blip-user:<db_password>@cluster0.example.mongodb.net/?appName=Cluster0`, /still holds the <db_password> placeholder from Atlas/],
+    ];
+    for (const [value, expected] of cases) {
+      assert.throws(() => loadConfig({ MONGODB_URI: value }), (err) => {
+        assert.match(err.message, expected, value);
+        for (const leak of [secret, 'blip-user', 'cluster0', 'turso.io', 'tmp/blip']) assert.ok(!err.message.includes(leak), `${leak} stays out of: ${err.message}`);
+        assertPlainCopy(err.message, 'a configuration error');
+        return true;
+      });
+      assert.throws(() => loadConfig({ VERCEL: '1', MONGODB_URI: value }), (err) => expected.test(err.message), 'the same on Vercel');
+    }
+    assert.throws(() => resolveConfig({ mongodbUri: 'file:/tmp/blip.db' }), (err) => err.message.startsWith('Invalid mongodbUri: '));
+  });
+
+  it('accepts both schemes, and lowercases one written in capitals', () => {
+    assert.equal(loadConfig({ MONGODB_URI: 'MongoDB+SRV://cluster0.example.mongodb.net/?appName=Blip' }).mongodbUri, 'mongodb+srv://cluster0.example.mongodb.net/?appName=Blip');
+    assert.equal(loadConfig({ MONGODB_URI: 'MONGODB://127.0.0.1:27017/' }).mongodbUri, 'mongodb://127.0.0.1:27017/');
+    assert.equal(loadConfig({ MONGODB_URI: `mongodb+srv://Blip-User:${secret}@cluster0.example.mongodb.net` }).mongodbUri, `mongodb+srv://Blip-User:${secret}@cluster0.example.mongodb.net`, 'only the scheme changes');
+  });
+
+  it('describes a connection string without credentials or options', () => {
+    assert.equal(describeDatabaseUrl(URI), 'mongodb+srv://cluster0.example.mongodb.net');
+    assert.equal(describeDatabaseUrl(`mongodb://u:${secret}@a.example.net:27017,b.example.net:27018/blip?replicaSet=rs0&tls=true`), 'mongodb://a.example.net:27017,b.example.net:27018');
+    assert.equal(describeDatabaseUrl('mongodb://127.0.0.1:27017'), 'mongodb://127.0.0.1:27017');
+    assert.equal(describeDatabaseUrl(`mongodb://user:pa@ss/word${secret}@host.example.net/x`), 'mongodb://host.example.net', 'even with an unencoded @ or / in the password');
+    assert.equal(describeDatabaseUrl(null), '(none)');
+    assert.equal(describeDatabaseUrl('whatever'), 'a remote database');
+  });
+
+  it('masks the connection string and every credential in a log line', () => {
+    const encoded = 'p%40ss%2Fword';
+    const config = resolveConfig({ mongodbUri: `mongodb+srv://blip-user:${encoded}@cluster0.example.mongodb.net`, mongodbUsername: 'other-user', mongodbPassword: 'other-password' });
+    const line = redactSecrets(
+      `failed: ${config.mongodbUri} and mongodb://x:y@z.example.net/db for blip-user, ${encoded}, p@ss/word, other-user, other-password`,
+      config,
+    );
+    for (const leak of [encoded, 'p@ss/word', 'blip-user', 'other-user', 'other-password', 'x:y@']) assert.ok(!line.includes(leak), `${leak} in: ${line}`);
+    assert.ok(line.includes('z.example.net'), line);
+    assert.equal(redactSecrets('nothing to hide', config), 'nothing to hide');
+    assert.equal(redactSecrets('nothing to hide', null), 'nothing to hide');
+  });
+
+  it("masks credentials the driver quotes from a string it can't parse", () => {
+    // The driver's MongoParseError says "Username contains unescaped characters <user>" for a user name
+    // with a '/', which no simple user:password pattern finds.
+    const config = resolveConfig({ mongodbUri: 'mongodb://team/blip:pass/word@cluster0.example.mongodb.net/' });
+    const line = redactSecrets('Username contains unescaped characters team/blip, then pass/word', config);
+    assert.ok(!line.includes('team/blip') && !line.includes('pass/word'), line);
+    const unencodedAt = resolveConfig({ mongodbUri: 'mongodb+srv://blip-user:p@ss@cluster0.example.mongodb.net/' });
+    const atLine = redactSecrets('auth for blip-user with p@ss failed', unencodedAt);
+    assert.ok(!atLine.includes('blip-user') && !atLine.includes('p@ss'), atLine);
+  });
+
+  it('describes a database failure with where it happened and what to check, never a credential', () => {
+    const config = resolveConfig({ mongodbUri: `mongodb+srv://blip-user:${secret}@cluster0.example.mongodb.net/?appName=Blip`, mongodbDb: 'blip' });
+    const authFailed = Object.assign(new Error(`bad auth : authentication failed for blip-user (${config.mongodbUri})`), { name: 'MongoServerError', code: 8000 });
+    const line = describeDatabaseFailure(authFailed, config);
+    assert.match(line, /^\(mongodb\+srv:\/\/cluster0\.example\.mongodb\.net, database blip\): bad auth : authentication failed for \[redacted\]/);
+    assert.match(line, /The cluster refused the user name or password/);
+    assert.ok(!line.includes(secret) && !line.includes('blip-user'), line);
+    assertPlainCopy(line, 'a database failure log line');
+  });
+
+  it('says what to check for the failures people hit while setting up', () => {
+    const named = (name, message, extra = {}) => Object.assign(new Error(message), { name, ...extra });
+    const hints = [
+      [named('MongoServerError', 'Authentication failed.', { code: 18 }), /refused the user name or password/],
+      [named('MongoServerError', 'bad auth : authentication failed', { code: 8000 }), /refused the user name or password/],
+      [named('MongoServerError', 'user is not allowed to do action [createIndexes] on [blip.links]', { code: 8000 }), /readWrite role/],
+      [named('MongoServerError', 'not authorized on blip to execute command', { code: 13 }), /readWrite role/],
+      [Object.assign(new Error('querySrv ENOTFOUND _mongodb._tcp.cluster0.nope.mongodb.net'), { code: 'ENOTFOUND' }), /host name was not found/],
+      [named('MongoServerSelectionError', 'Server selection timed out after 5000 ms'), /IP Access List .* 0\.0\.0\.0\/0/],
+      [named('MongoServerSelectionError', 'connect ECONNREFUSED 127.0.0.1:9', { cause: named('MongoNetworkError', 'connect ECONNREFUSED') }), /IP Access List/],
+      [named('TimeoutError', 'Opening the database took longer than 15 s.'), /No server answered in time/],
+      [named('MongoParseError', 'Password contains unescaped characters'), /percent-encode special characters/],
+      [new Error('wrapped', { cause: named('MongoServerError', 'bad auth : authentication failed', { code: 8000 }) }), /refused the user name or password/],
+    ];
+    for (const [err, expected] of hints) {
+      const hint = databaseFailureHint(err);
+      assert.match(hint ?? '', expected, err.message);
+      assertPlainCopy(hint, 'a database hint');
+    }
+    for (const err of [new Error('boom'), named('MongoServerError', 'E11000 duplicate key error', { code: 11000 }), null, undefined]) {
+      assert.equal(databaseFailureHint(err), null, String(err?.message ?? err));
+    }
   });
 });
 
-const pick = ({ databaseUrl, databaseAuthToken }) => ({ databaseUrl, databaseAuthToken });
-
 describe('config on Vercel', () => {
-  const secret = 'eyJhbGciOiJFZERTQSJ9.dmVyY2Vs';
+  const secret = 'p4ssw0rd-not-for-logs';
   const VERCEL = {
     VERCEL: '1',
     NODE_ENV: 'production',
     VERCEL_PROJECT_PRODUCTION_URL: 'blip.example.app',
     VERCEL_BRANCH_URL: 'blip-git-feature-team.vercel.app',
     VERCEL_URL: 'blip-abc123-team.vercel.app',
-    TURSO_DATABASE_URL: 'libsql://blip-team.turso.io',
-    TURSO_AUTH_TOKEN: secret,
+    MONGODB_URI: `mongodb+srv://blip-user:${secret}@cluster0.example.mongodb.net`,
   };
 
   it('stays off without VERCEL, so local runs keep their defaults', () => {
@@ -150,7 +284,6 @@ describe('config on Vercel', () => {
     assert.equal(c.onVercel, false);
     assert.equal(c.streamPollMs, DEFAULT_STREAM_POLL_MS);
     assert.equal(c.streamMaxMs, 0, 'local streams never end on their own');
-    assert.equal(c.databaseProblem, null);
     assert.equal(isVercel({ VERCEL: '0' }), false);
     assert.equal(isVercel({ VERCEL: '1' }), true);
   });
@@ -162,7 +295,7 @@ describe('config on Vercel', () => {
     assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'preview' }).baseUrl, 'https://blip-git-feature-team.vercel.app');
     assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'preview', VERCEL_BRANCH_URL: '' }).baseUrl, 'https://blip-abc123-team.vercel.app');
     assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'production', VERCEL_PROJECT_PRODUCTION_URL: '' }).baseUrl, 'https://blip-abc123-team.vercel.app');
-    assert.equal(loadConfig({ VERCEL: '1', VERCEL_ENV: 'development', VERCEL_URL: 'localhost:3972', TURSO_DATABASE_URL: 'libsql://x.turso.io' }).baseUrl, 'http://localhost:3972');
+    assert.equal(loadConfig({ VERCEL: '1', VERCEL_ENV: 'development', VERCEL_URL: 'localhost:3972', MONGODB_URI: VERCEL.MONGODB_URI }).baseUrl, 'http://localhost:3972');
     assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'production', BASE_URL: 'https://go.example.com/' }).baseUrl, 'https://go.example.com', 'BASE_URL still wins');
   });
 
@@ -183,40 +316,33 @@ describe('config on Vercel', () => {
     // resolveConfig keeps all of it (createApp runs every config through it).
     const resolved = resolveConfig(c);
     assert.deepEqual(
-      [resolved.onVercel, resolved.trustProxy, resolved.allowDemoTraffic, resolved.streamMaxMs, resolved.baseUrl],
-      [true, 1, true, VERCEL_STREAM_MAX_MS, 'https://blip.example.app'],
+      [resolved.onVercel, resolved.trustProxy, resolved.allowDemoTraffic, resolved.streamMaxMs, resolved.baseUrl, resolved.mongodbDb],
+      [true, 1, true, VERCEL_STREAM_MAX_MS, 'https://blip.example.app', 'blip'],
     );
   });
 
-  it('uses the Turso variables and never falls back to a file', () => {
-    assert.deepEqual(pick(loadConfig(VERCEL)), { databaseUrl: 'libsql://blip-team.turso.io', databaseAuthToken: secret });
-    const none = loadConfig({ VERCEL: '1', DB_PATH: './data/blip.db' });
-    assert.equal(none.databaseUrl, null, 'DB_PATH is not used on Vercel');
+  it('uses MONGODB_URI, in a database that follows the deployment', () => {
+    const production = loadConfig({ ...VERCEL, VERCEL_ENV: 'production' });
+    assert.equal(production.mongodbUri, VERCEL.MONGODB_URI);
+    assert.equal(production.mongodbDb, 'blip');
+    assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'preview' }).mongodbDb, 'blip_preview');
+    assert.equal(loadConfig({ ...VERCEL, VERCEL_ENV: 'development' }).mongodbDb, 'blip_dev');
+    const none = loadConfig({ VERCEL: '1' });
+    assert.equal(none.mongodbUri, null);
     assert.equal(none.databaseProblem, VERCEL_NO_DATABASE_PROBLEM);
     const resolved = resolveConfig(none);
-    assert.equal(resolved.databaseUrl, null, 'resolveConfig keeps "no database"');
+    assert.equal(resolved.mongodbUri, null, 'resolveConfig keeps "no database"');
     assert.equal(resolved.databaseProblem, VERCEL_NO_DATABASE_PROBLEM);
   });
 
-  it('skips a database URL Blip cannot use instead of crashing, and says which one', () => {
-    const postgres = `postgres://user:${secret}@db.example.com/blip`;
-    const c = loadConfig({ VERCEL: '1', DATABASE_URL: postgres });
-    assert.equal(c.databaseUrl, null);
-    assert.match(c.databaseProblem, /Invalid DATABASE_URL: "postgres:" URLs are not supported/);
-    assert.ok(c.databaseProblem.endsWith(VERCEL_NO_DATABASE_PROBLEM));
-    assert.ok(!c.databaseProblem.includes(secret));
-    // A usable URL further down the list still wins.
-    assert.equal(loadConfig({ VERCEL: '1', DATABASE_URL: postgres, LIBSQL_URL: 'libsql://ok.turso.io' }).databaseUrl, 'libsql://ok.turso.io');
-  });
-
-  it('refuses a local database (file: or :memory:), which a deployed function cannot use', () => {
-    for (const [value, what] of [['file:/tmp/blip.db', 'a file: URL'], ['file:./data/blip.db', 'a file: URL'], [':memory:', ':memory:']]) {
-      const c = loadConfig({ VERCEL: '1', TURSO_DATABASE_URL: value });
-      assert.equal(c.databaseUrl, null, value);
-      assert.ok(c.databaseProblem.startsWith(`Invalid TURSO_DATABASE_URL: a local database (${what}) can't be used on Vercel.`), c.databaseProblem);
-      assert.ok(c.databaseProblem.endsWith(VERCEL_NO_DATABASE_PROBLEM));
+  it('treats a connection string Blip cannot use as a setting to fix, as it does locally', () => {
+    // createVercelApp turns this error into 503 `misconfigured` (test/vercel.test.js).
+    for (const [value, scheme] of [[`postgres://user:${secret}@db.example.com/blip`, 'postgres'], ['file:///tmp/blip.db', 'file'], [`libsql://blip-${secret}.turso.io`, 'libsql']]) {
+      assert.throws(() => loadConfig({ VERCEL: '1', VERCEL_ENV: 'production', MONGODB_URI: value }), (err) => {
+        assert.ok(err.message.startsWith(`Invalid MONGODB_URI: "${scheme}://" connection strings are not supported.`), err.message);
+        assert.ok(!err.message.includes(secret));
+        return true;
+      });
     }
-    // Locally the same URL is fine.
-    assert.equal(loadConfig({ TURSO_DATABASE_URL: 'file:/tmp/blip.db' }).databaseUrl, 'file:/tmp/blip.db');
   });
 });

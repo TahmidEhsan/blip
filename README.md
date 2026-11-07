@@ -4,7 +4,7 @@
 
 Blip is a self-hosted URL shortener with a comic-book look. On top of the usual "long link in, short link out", every link can have a memorable word slug, a quirky vanity domain, a teaser page before the redirect, a live analytics dashboard with a world map, a self-destruct timer, and a styled QR code.
 
-It's a single Node.js app: Express 5, SQLite through libSQL (a local file by default, or a hosted Turso database), and a vanilla HTML/CSS/JS frontend with no build step. It runs on your machine with no account, or on Vercel with a Turso database (see [Deploy to Vercel](#deploy-to-vercel)).
+It's a single Node.js app: Express 5, MongoDB through the official `mongodb` driver, and a vanilla HTML/CSS/JS frontend with no build step. The data lives in a MongoDB database: a free MongoDB Atlas cluster works, as does MongoDB 6.0 or newer on your own machine. It runs on your machine, or on Vercel with MongoDB Atlas (see [Deploy to Vercel](#deploy-to-vercel)).
 
 ---
 
@@ -70,7 +70,7 @@ A stopped link can always come back. **Bring back** opens its self-destruct sett
 
 A dead link answers **410** with a "KA-BOOM!" self-destructed page whose wording matches the reason: clicks, time or manual.
 
-Click consumption is a single atomic SQL `UPDATE`, so two visitors racing for the last click can't both get through. Link-preview bots (Slack, WhatsApp, Discord and friends) get a neutral preview page that never reveals the destination. They never use up a limited link.
+Using up a click is one atomic MongoDB update that only succeeds while the link still has clicks left, so two visitors racing for the last click can't both get through, even when different server instances handle them. Link-preview bots (Slack, WhatsApp, Discord and friends) get a neutral preview page that never reveals the destination. They never use up a limited link.
 
 ### 6. Interactive QR codes
 Each link has a QR studio (`/qr.html#<slug>`). It offers:
@@ -97,14 +97,23 @@ The dialog is on the result panel, on every row of My links, on the live dashboa
 
 ## Quick start
 
-Requires **Node.js 22.13 or newer** (`engines` in `package.json` says the same). The repo's `.nvmrc` asks for Node 22, so `nvm use` picks a suitable version. Local development needs no database server and no account.
+Requires **Node.js 22.13 or newer** (`engines` in `package.json` says the same) and a **MongoDB database**: a free MongoDB Atlas cluster, or MongoDB 6.0 or newer running on your machine. The repo's `.nvmrc` asks for Node 22, so `nvm use` picks a suitable version.
 
-```bash
-npm install
-npm run dev        # → http://localhost:3030 (restarts on file changes)
-```
+1. **Get a connection string.** In Atlas, open your cluster's **Connect** dialog, choose **Drivers** and copy the `mongodb+srv://...` string, putting your database user's password where it says `<db_password>` (percent-encode special characters in it: `@` is `%40`, `:` is `%3A`, `/` is `%2F`). Under **Network Access**, add your current IP address. For MongoDB on your own machine the string is `mongodb://127.0.0.1:27017`.
+2. **Put it in a file named `.env`** in the project folder (Git ignores it):
 
-`npm start` runs the server without the file watcher. The SQLite database is created at `./data/blip.db` on first run (see [Where the data lives](#where-the-data-lives) to use Turso instead). The fonts, charts, map data and QR engine are served from `node_modules` and the icons from the bundled sprite, so Blip works offline and needs no CDN.
+   ```bash
+   MONGODB_URI=mongodb+srv://blip-dev:your-password@cluster0.example.mongodb.net/?retryWrites=true&w=majority
+   ```
+
+3. **Install and run:**
+
+   ```bash
+   npm install
+   npm run dev        # → http://localhost:3030 (restarts on file changes)
+   ```
+
+`npm start` runs the server without the file watcher. A local run uses the database `blip_dev` on that cluster (`MONGODB_DB` picks another), and Blip creates its collections and indexes on the first start. Without `MONGODB_URI`, `npm start` stops with a message saying to put it in `.env`; when the database can't be opened, it says what to check (see [Troubleshooting](#troubleshooting)). Either way it exits with code 1. The fonts, charts, map data and QR engine are served from `node_modules` and the icons from the bundled sprite, so the pages need no CDN.
 
 | Script | What it does |
 |---|---|
@@ -141,11 +150,11 @@ The first release used gradient theme names. The comic redesign renamed them, an
 - Teaser themes: `aurora` became `hero`, `sunset` became `caption`, `ocean` became `sky`, `neon` became `noir` and `candy` became `paper`.
 - QR presets: `aurora` became `hero`, `sunset` became `pop`, `ocean` became `sky`, `neon` became `noir`, `mono` became `ink`, `candy` became `caption` and `forest` became `press`.
 
-On first start, a one-time database migration (schema version 2) rewrites stored theme ids, and QR styles saved under an old preset get the new preset's flat look (their caption and any logo you picked stay). The API still accepts the old ids and saves them under the new names, so older clients and saved browser state keep working.
+The API still accepts the old ids and saves them under the new names. An old id that turns up in stored data is served under its new name, and a QR style saved under an old preset gets the new preset's flat look (its caption and any logo you picked stay). So older clients and saved browser state keep working.
 
-### Upgrading from the node:sqlite builds
+### Moving to MongoDB
 
-Earlier builds opened the database with Node's built-in `node:sqlite`. Blip now talks to it through libSQL (`@libsql/client`), which reads the very same SQLite file, so an existing `./data/blip.db` (the default `DB_PATH`) keeps all its links, clicks and the visitor-hash salt. The first start records the schema version in the `meta` table (the old builds kept it in `PRAGMA user_version`, which is read once and left alone). If you copy the database somewhere while a server is still running, copy `blip.db-wal` and `blip.db-shm` along with `blip.db`: recent writes can still be in the `-wal` file.
+Earlier builds kept everything in a database file, `./data/blip.db`. This build stores everything in MongoDB and never opens that file: it stays on disk untouched, and nothing in it is copied over. Short links made before the switch answer 404 until you create them again, and **My links** drops them the first time it loads, because the server no longer knows them. Blip reads no database settings other than the `MONGODB_*` variables below, so any left over from an earlier setup can be removed.
 
 ## Configuration
 
@@ -158,11 +167,9 @@ All settings are environment variables.
 | `BASE_URL` | `http://localhost:${PORT}` (on Vercel, the deployment's public URL) | The public URL that actually serves links today (no trailing slash) |
 | `DOMAINS` | `blip.to,cat.ly,go.to,p.wrk` | Vanity domains offered in the UI (comma-separated) |
 | `LIVE_DOMAINS` | *(empty)* | The subset of `DOMAINS` whose DNS really points at this server |
-| `TURSO_DATABASE_URL` | *(empty)* | A hosted libSQL database such as Turso (`libsql://...`). When set, it is used instead of `DB_PATH` |
-| `TURSO_AUTH_TOKEN` | *(empty)* | The token for `TURSO_DATABASE_URL` |
-| `DATABASE_URL`, `DATABASE_AUTH_TOKEN` | *(empty)* | Used when `TURSO_DATABASE_URL` is unset. Must be a libSQL URL (`libsql:`, `https:`, `wss:` or `file:`); any other kind, such as `postgres:`, stops Blip with an error |
-| `LIBSQL_URL`, `LIBSQL_AUTH_TOKEN` | *(empty)* | Third choice, same rules |
-| `DB_PATH` | `./data/blip.db` | Local SQLite file used when none of the URLs above is set (relative to the project root), or `:memory:`. Not used on Vercel |
+| `MONGODB_URI` | *(required)* | The connection string of your MongoDB cluster: `mongodb+srv://...` (Atlas) or `mongodb://...`. Anything else (another kind of URL, quotes around it, Atlas's `<db_password>` placeholder still in it) stops Blip with an error that names the variable and at most the scheme, never the string. Without it a local run exits, and Vercel answers `503 database_not_configured`; an unusable one there answers `503 misconfigured` |
+| `MONGODB_DB` | `blip` on Vercel Production, `blip_preview` on Vercel Preview, `blip_dev` everywhere else | The database on that cluster. The defaults keep production, previews and local runs apart (see [Where the data lives](#where-the-data-lives)). MongoDB's own `admin`, `local` and `config` are refused, and so is a connection string pasted here by mistake (without printing it) |
+| `MONGODB_USERNAME`, `MONGODB_PASSWORD` | *(empty)* | The database user, for a connection string without a user name and password of its own (when it has them, they win and these are ignored). Set both or neither |
 | `IP_HASH_SALT` | *(auto)* | Salt for visitor hashes; if unset, 32 random bytes are generated once and stored in the database |
 | `ALLOW_DEMO_TRAFFIC` | `true` unless `NODE_ENV=production` (always `true` on Vercel) | Enables the "Simulate traffic" endpoints. Set it to `false` to turn them off |
 | `TRUST_PROXY` | `false` (`1` on Vercel) | Express `trust proxy` setting. Behind a reverse proxy or CDN, set it to the number of proxies in front of Blip (`1` for a single one) or to the proxy's address/subnet (`loopback`, or a list such as `10.0.0.0/8`) so client IPs and rate limits are correct. **Avoid `true`**: it trusts the client-supplied left-most `X-Forwarded-For` entry, which lets anyone bypass the per-IP rate limits and fake visitor counts (Blip logs a warning at startup) |
@@ -177,52 +184,88 @@ Example:
 PORT=8080 BASE_URL=https://blip.example.com DOMAINS=cat.ly,go.to LIVE_DOMAINS=cat.ly TRUST_PROXY=1 npm start
 ```
 
-`npm start` and `npm run dev` also read these settings from a `.env` file in the project folder when one exists. Variables already set in your shell take priority. Git ignores `.env`, and Vercel never reads it: set values for the live site in the project's environment variables.
+`npm start` and `npm run dev` also read these settings from a `.env` file in the project folder when one exists (one `NAME=value` per line, as in [Quick start](#quick-start)). Variables already set in your shell take priority. Git ignores every `.env*` file, a `.env.example` included, so the repo ships none. `.vercelignore` keeps them and `data/` out of deployments made with the Vercel CLI from this folder: the CLI doesn't use `.gitignore`, and its own list skips only `.env.local` and `.env.*.local`, so without that file `vercel deploy` would upload `.env`. The deployed app never reads `.env`: set values for the live site in the project's environment variables. `npm test` never reads it either.
 
 ## Where the data lives
 
-- **On your machine (the default):** a SQLite file at `DB_PATH`, `./data/blip.db` unless you change it. The folder and file are created on first run, and nothing else needs installing. Absolute and relative paths both work, Windows drive letters included.
-- **On Turso:** create a database (on Vercel, add Turso from the Marketplace, which sets `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` for you) and Blip uses it instead of the file. It creates its tables on the first request, and every start-up step is safe to repeat and safe when several server instances start at once.
-- **On Vercel without a database:** there is no file to fall back to, so Blip keeps serving its pages and answers every `/api` request with `503 database_not_configured` until Turso is connected (see [Deploy to Vercel](#deploy-to-vercel)).
+All of Blip's data lives in one database on the MongoDB cluster at `MONGODB_URI`. Which database depends on where Blip runs, so the environments never share data:
 
-Blip picks the first of `TURSO_DATABASE_URL`, `DATABASE_URL` and `LIBSQL_URL` that is set, each with its own token variable, and falls back to `DB_PATH`. The startup log names the database without its token or password. If the database can't be reached, `npm start` stops with a message saying so; a server that is already running answers `503` and tries again on the next request. A request to a database server that gets no answer within 8 seconds is given up, so a stalled database means a quick `503` (for a visitor, the "can't reach its database" page) rather than a request that hangs.
+| Where Blip runs | Database (unless `MONGODB_DB` names another) |
+|---|---|
+| Vercel, Production | `blip` |
+| Vercel, Preview | `blip_preview` |
+| Your machine, `vercel dev`, Vercel's Development environment | `blip_dev` |
+
+Each database holds five collections: `links`, `clicks`, `visitors` (one document per link and visitor hash, which is what decides the unique-visitor count), `counters` (the link and click id sequences) and `meta` (the visitor-hash salt, the schema version, and a counter that tells live dashboards to recount after simulated clicks are cleared). The first start against an empty database creates the indexes; later starts only read the schema version, the index lists and the salt, and create any index that has gone missing (after a collection was dropped in Atlas, for example). Every start-up step is safe to repeat and safe when several server instances start at once. If the link or click ids ever fall behind the stored documents (the `counters` collection was emptied, or documents were copied in without it), the next insert moves them past the highest stored id and carries on.
+
+The `./data/blip.db` file of earlier builds stays on disk, unused (see [Moving to MongoDB](#moving-to-mongodb)).
+
+If the database can't be reached, `npm start` stops with a message saying so; a server that is already running answers `503` and tries again on the next request. Every database operation a request waits for is given up after 8 seconds (5 to find a server), and on Vercel the start-up that a new instance runs inside its first request is given up after 15, so a stalled database means a quick `503` (for a visitor, the "can't reach its database" page) rather than a request that hangs. The logs name the cluster's hosts and the database, never the user name or password.
 
 ## Deploy to Vercel
 
-Blip runs on Vercel as one Express function on Fluid compute, with its data in Turso and its pages, scripts, fonts and vendor files on Vercel's CDN. The repo carries everything Vercel needs: `server.js` (the entry Vercel detects; it exports the app and never listens), `vercel.json` (the Express preset, `npm run build` as the build command, Fluid compute with request cancellation and a 300 s limit for the function, and the same security headers the app sends) and `scripts/build-vendor.mjs`.
+Blip runs on Vercel as one Express function on Fluid compute, with its data in MongoDB Atlas and its pages, scripts, fonts and vendor files on Vercel's CDN. The repo carries everything Vercel needs: `server.js` (the entry Vercel detects; it exports the app and never listens), `vercel.json` (the Express preset, `npm run build` as the build command, Fluid compute with request cancellation and a 300 s limit for the function, and the same security headers the app sends) and `scripts/build-vendor.mjs`.
 
 1. **Import the repo** into a Vercel project. `vercel.json` picks the Express preset, so a project created with the "Other" preset needs no settings changes. Node 22 or newer works; with `engines` at `>=22.13` Vercel builds on its newest Node (24 today).
-2. **Add Turso from the Vercel Marketplace** (the project's **Storage** tab), create a database and connect it to this project for **Production** only. That sets `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. Leave the environment variable prefix empty: Blip reads exactly those two names. Create the database in the region closest to the function's region (`aws-us-east-1` for Vercel's default, `iad1`; the project's **Settings > Functions** shows it): a visit makes two round trips to the database before its redirect, so a database on another continent adds a few hundred milliseconds to every click.
-3. **Give previews their own database.** Create a second Turso database and connect it for **Preview** (and Development, if you use `vercel env pull`). Blip updates its tables on the first request a new deployment gets, so with one shared database a preview of a branch that changes the schema would change the production data before the branch is merged, and whatever you try on a preview (simulated traffic, deleting links) would land on real links.
-4. **Redeploy.** Environment variables only reach deployments made after they were added. Blip creates its tables on the first request.
-5. **Check it:** `/api/health` answers `{ "ok": true }`. Then create a link, open it, and open its live dashboard.
+2. **Put the cluster where the function runs.** Unless the project's **Settings > Functions** says otherwise, the function runs in `iad1` (Washington, D.C.), so create the Atlas cluster on AWS in `us-east-1` (N. Virginia). A visit waits for two database round trips before its redirect (find the link, use up a click) and its click row adds three more after it, so a cluster on another continent adds a few hundred milliseconds to every click. For scale, from a laptop to an Atlas cluster over the internet, a counted visit took about 150 ms when it waited for its row (all five round trips) and about 75 ms with Vercel's settings (two), against about 10 ms with MongoDB on the same machine.
+3. **Create a database user just for Blip.** In Atlas, under **Database Access**, add a user with password authentication and a long generated password, and under its privileges choose **Specific Privileges**: `readWrite` on the database `blip` and on `blip_preview` (and `blip_dev` if you also run Blip locally with this user), nothing else. Don't use your Atlas account's password or an admin user. Stronger still: one user with `readWrite` on `blip` for Production and another with `readWrite` on `blip_preview` for Preview, so a preview can't touch production data even if a setting is wrong.
+4. **Allow Vercel to connect.** Under **Network Access**, add `0.0.0.0/0` (**Allow access from anywhere**). Vercel functions have no fixed outbound IP addresses (they change between instances and deployments), so any narrower list blocks them at random. The tradeoff: anyone on the internet can now reach the cluster's sign-in, and what protects the data is the user name and password alone (Atlas always uses TLS, so they never cross the network in the clear). That is why step 3 matters: a dedicated user, a strong password used nowhere else, and access to the Blip databases only. If the password ever leaks, change it in Atlas and in Vercel, then redeploy. On a Pro or Enterprise plan, Vercel's Static IPs give the function fixed outbound addresses to list here instead.
+5. **Add `MONGODB_URI` to Vercel.** In the project's **Settings > Environment Variables**, add `MONGODB_URI` for **Production** and for **Preview** (each with its own user, if you made two), with the connection string as its value: the real password in place of `<db_password>`, percent-encoded, and no quotes around it. Mark it **Sensitive**. Blip picks the database from the environment (`blip` for Production, `blip_preview` for Preview), so `MONGODB_DB` is only needed for other names. A connection string without a user name and password works too, with `MONGODB_USERNAME` and `MONGODB_PASSWORD` next to it. Blip reads no other database variables, so any left from an earlier setup can be deleted.
+6. **Redeploy.** Environment variables only reach deployments made after they were added. The first request to a new instance opens the database, and the first one ever creates the indexes.
+7. **Check it:** `/api/health` answers `{ "ok": true }` once the database is open (it waits for it, so this proves the connection). Then create a link, open it, and open its live dashboard. If anything answers `503`, the function's log says why (see [Troubleshooting](#troubleshooting)).
 
 **Custom domains.** In production `BASE_URL` follows `VERCEL_PROJECT_PRODUCTION_URL`, which Vercel sets to the project's *shortest* production domain. As soon as you add a custom domain, set `BASE_URL` for Production (for example `https://blip.example.com`) and redeploy, so that adding a short vanity domain later can't change the domain every new link gets (see [Making a vanity domain live](#making-a-vanity-domain-live)). Blip recognises Vercel by its `VERCEL` variable, which Vercel only sets while **Automatically expose System Environment Variables** (Settings > Environment Variables) is on. It is on by default, and Blip logs a warning when the variable is missing.
 
-Until the database is connected, the deployment still serves its pages, every `/api` request answers `503` with `{ "error": { "code": "database_not_configured" } }` (the home page shows its message), short links show a short "not connected yet" page, and the function logs one line saying what is missing. A database URL Blip can't use (such as a `postgres://` `DATABASE_URL` from another integration, or a `file:` URL, which a deployed function can't open) is skipped the same way instead of crashing the function, and an invalid setting such as a malformed `BASE_URL` answers `503 misconfigured`.
+Until `MONGODB_URI` is set, the deployment still serves its pages, every `/api` request answers `503` with `{ "error": { "code": "database_not_configured", "message": "Blip is not connected to its database yet. Add MONGODB_URI to this project's environment variables in Vercel and redeploy." } }` (the home page shows that message), short links show a short "not connected yet" page saying the same, and the function logs one line saying what is missing. A `MONGODB_URI` Blip can't use (not a `mongodb+srv://` or `mongodb://` string, wrapped in quotes, or still holding Atlas's `<db_password>` placeholder) answers `503 misconfigured` instead of crashing the function, as does any other invalid setting such as a malformed `BASE_URL`. Visitors only see "Blip is not set up correctly yet"; the log line names the variable and what is wrong with it, and quotes its value only when it can't hold a user name or password (never a connection string).
 
 **What changes on Vercel** (any variable you set yourself still wins):
 
 | Setting | On Vercel |
 |---|---|
 | `BASE_URL` | Optional at first. Production uses the project's shortest production domain (`VERCEL_PROJECT_PRODUCTION_URL`); previews use their branch URL (`VERCEL_BRANCH_URL`, else `VERCEL_URL`). Set it for Production once the project has a custom domain, or when links should carry another domain |
+| `MONGODB_DB` | `blip` in Production and `blip_preview` in Preview (from `VERCEL_ENV`), so a preview never changes production data; `blip_dev` in Vercel's Development environment |
 | `TRUST_PROXY` | `1`: Vercel's edge is the one proxy in front of the function, so visitor counts and rate limits use the client address it forwards |
 | `ALLOW_DEMO_TRAFFIC` | `true`, so **Simulate traffic** can fill the map for a demo. To turn it off, add `ALLOW_DEMO_TRAFFIC=false` in the project's environment variables and redeploy |
 | `STREAM_MAX_MS` | `250000`: a live stream ends after about four minutes, before Vercel's 300 s function limit cuts it, and the dashboard reconnects |
-| `DB_PATH` | Not used: the filesystem is read-only, and every instance would have its own copy |
+| Database connection | Opened by the first request an instance gets, never while the function loads: Vercel can suspend an instance whenever no request is running on it, so start-up work always runs inside a request. Each instance keeps a pool of at most 10 connections and closes one after 5 seconds without use. The pool is handed to `attachDatabasePool` from `@vercel/functions`, which keeps the instance running for about 5 seconds past the last connection it handed out, so its pooled connections are closed before it is suspended (one whose query ran longer than about 100 ms can still be open then). The driver's monitoring connections, one to each server of the cluster, stay open while an instance is suspended |
+| Click rows | A visit answers as soon as its click is used up. Its click row is stored after the response, and `waitUntil` from `@vercel/functions` keeps the function running until the row is written, so a visit never waits for analytics. On your own server the visit waits for the row instead (at most 1.5 seconds), which keeps local stats and the tests exact the moment a visit returns |
 | Location | Read only from Vercel's `x-vercel-ip-*` headers (another CDN's header could only come from the visitor). The offline `fast-geoip` database is never loaded or bundled |
 
 **What is per instance.** Vercel can run several instances of the function at once, each with its own memory:
 
 - Rate limits (20 links created, 30 simulations and 120 lookups per client per minute) and the live-stream caps (10 per link, 20 per client) are counted per instance, so the effective ceiling can be a few times higher.
+- Each instance has its own MongoDB client: up to 10 pooled connections plus the driver's monitoring connection to each server of the cluster. Together they count toward the cluster's connection limit (500 on Atlas's free tier), so a busy deployment with many instances can reach it.
 - `vercel.json` switches on request cancellation for the function, so closing or reloading a dashboard ends its stream at once, as it does locally. If a disconnect is ever missed, a client at its cap that opens another dashboard ends its own oldest stream (one at least 30 seconds old) instead of being refused.
 - Live dashboards work across instances. Every open stream asks the database for new clicks and status changes every 2 seconds (`STREAM_POLL_MS`), so a visit handled by any instance shows up within about 2 seconds, and at once when it lands on the dashboard's own instance. Simulated traffic is stored in one go and played back on the dashboard about 120 ms apart. A stream ends after `STREAM_MAX_MS` and the dashboard reconnects on its own, so the Live caption says "Reconnecting" for a second or two every few minutes.
+- Everything else lives in the database and is shared: links, clicks, the visitor-hash salt (each instance reads it once), and the counters that hand out link and click ids.
 
 **Static and vendor files.** Vercel's CDN serves `public/` itself, and `express.static` never runs there. `npm run build` copies every `/vendor/...` file the pages load into `public/vendor/` at the same URL: it scans the pages, views, styles and scripts for `/vendor/` references, follows the font stylesheets to their font files, and fails the build when a reference has no source. `public/vendor/` is committed, because Vercel lists a clean checkout's static files before it runs the build. `.vercel/` is gitignored. The function owns `/` on Vercel, so it serves `index.html` itself, before the database gate. `/dashboard` and `/qr` are rewritten to their `.html` pages, as the local server does.
 
 **Function settings.** `vercel.json` sets `maxDuration` (300 s) and `supportsCancellation` under the key `{index,server}.js`. Vercel's Express preset builds the app under the name `index.js`, whatever the entry file is called, and only applies `functions` settings whose key matches that name (a plain `server.js` key is accepted but ignored), so the pattern names both.
 
-**Trying it locally.** `npx vercel build` writes the output Vercel would deploy to `.vercel/output` (one function of about 3 MB, plus the static files), and `npx vercel dev` runs it. `vercel dev` does not set `VERCEL`, so Blip behaves like a local run there (and logs a warning saying so): set `TURSO_DATABASE_URL` (a `file:` URL works) or `DB_PATH` in the shell to pick the database, and add `VERCEL=1` to try the Vercel defaults (those need a `libsql://` or `https://` database, as a deployment does).
+**What the function bundles.** `server.js`, `server/**` (views included), `public/index.html` and the packages they import: the `mongodb` driver (most of the bundle) with its plain JavaScript dependencies (`bson`, `mongodb-connection-string-url`, `@mongodb-js/saslprep`), Express, `ua-parser-js`, `i18n-iso-countries` (English names only) and `@vercel/functions`. The driver's optional add-ons (`kerberos`, `snappy`, `@mongodb-js/zstd`, client-side encryption, the AWS and GCP credential providers and `socks`) are not installed and never loaded: the driver only asks for each one inside the feature that needs it (Kerberos sign-in, snappy compression, a SOCKS proxy and so on), which Blip doesn't use. So keep `compressors=snappy` out of the connection string. `fast-geoip` stays out of the bundle, as before.
+
+**Trying it locally.** `npx vercel build` writes the output Vercel would deploy to `.vercel/output` (one function of a few MB, plus the static files), and `npx vercel dev` runs it. `vercel dev` does not set `VERCEL`, so Blip behaves like a local run there (and logs a warning saying so): it needs `MONGODB_URI` in the shell, uses `blip_dev`, and stores click rows before answering. Add `VERCEL=1` to try the Vercel defaults; without `VERCEL_ENV=production` or `preview` the database is still `blip_dev`, never a deployment's.
+
+## Troubleshooting
+
+Blip writes one line per problem to its log, starting with `[blip]`, and never prints the user name or password of a connection string. On your machine the log is the terminal running `npm start` (which prints the same lines and exits with code 1 instead of serving 503s). On Vercel, open the project's **Logs** tab (or a deployment's runtime logs) and search for `[blip]`. A database problem reads like this, with the cluster's hosts, the database, the driver's message and then what to check:
+
+```text
+[blip] could not open the database (mongodb+srv://cluster0.example.mongodb.net, database blip): bad auth : authentication failed. The cluster refused the user name or password: compare MONGODB_URI (or MONGODB_USERNAME and MONGODB_PASSWORD) with the database user under Database Access in Atlas.
+```
+
+| The line says | What to do |
+|---|---|
+| `No database is configured.` | `MONGODB_URI` isn't set where Blip runs. On Vercel, add it for that environment (Production or Preview) and redeploy; on your machine, put it in `.env` |
+| `Invalid MONGODB_URI: ...` | The value isn't a MongoDB connection string; the line says why (another kind of URL, quotes around it, the `<db_password>` placeholder still in it). Vercel answers `503 misconfigured` until the variable is fixed and the project redeployed |
+| `Invalid MONGODB_DB: it holds a connection string` | The connection string went into `MONGODB_DB`. Move it to `MONGODB_URI`, and give `MONGODB_DB` a database name such as `blip` (or remove it to use the default). If the logs ever showed a password, change it in Atlas |
+| `bad auth : authentication failed` or `Authentication failed.` | A wrong user name or password, or special characters in the password that aren't percent-encoded (`@` is `%40`, `:` is `%3A`, `/` is `%2F`). Check the user under **Database Access**, or give it a new password and update the variable |
+| `Server selection timed out`, `connection ... closed`, `connect ETIMEDOUT` | No server let the connection in. Almost always the IP Access List: on Vercel, `0.0.0.0/0` must be listed under **Network Access**; on your machine, your current IP address. It also happens while a cluster is paused, being created or out of connections |
+| `querySrv ENOTFOUND _mongodb._tcp...` | The cluster's host name in `MONGODB_URI` has a typo (or the machine is offline) |
+| `user is not allowed to do action [...] on [blip.links]` | The user lacks `readWrite` on that database. Compare the database named in the line with the user's privileges |
+| `database request failed (...)` | The database stopped answering after start-up (a failover, a network blip, a cluster at its limits). Visitors get the `503` "can't reach its database" page with `Retry-After: 5`, and the next request tries again |
+| `recording a visit to /<slug> is slow` | A click row took more than 1.5 seconds to store. The visitor got their page anyway (on Vercel without waiting for it at all); it points at a slow or distant cluster |
 
 ## Making a vanity domain live
 
@@ -254,16 +297,19 @@ SPEC.md             functional contract: config, database, API, views, behaviour
 server.js           Vercel entry: imports express (how Vercel detects the app) and exports the app; never listens
 vercel.json         Vercel settings: Express preset, npm run build, rewrites for /dashboard and /qr, security headers
 server/
-  index.js          local entry: loadConfig() → createApp() → await ready → listen; graceful SIGINT/SIGTERM shutdown
-  vercel.js         createVercelApp(env): the app for a Vercel function (never throws, never listens)
-  app.js            createApp({ config, now, random, geoLookup, rateLimits, streamLimits, unavailable }) → { app, db, ready, close, endStreams }
+  index.js          local entry: loadConfig() → createApp() → await ready → listen; graceful SIGINT/SIGTERM shutdown;
+                    exits with code 1 and one clear line when MONGODB_URI is missing or invalid or the database can't be opened
+  vercel.js         createVercelApp(env): the app for a Vercel function (never throws, never listens): database opened by the
+                    first request, a 10-connection pool handed to attachDatabasePool, click rows kept alive with waitUntil
+  app.js            createApp({ config, now, random, geoLookup, rateLimits, streamLimits, unavailable, mongoClientOptions,
+                    onDatabaseClient, waitUntil, deferClickWrites, connectOnFirstRequest }) → { app, db, ready, close, endStreams }
                     security headers (strict CSP), /vendor/* from node_modules, static files, wait for the database
-                    (or 503 when there is none), /api, /:slug, errors
+                    (or 503 when there is none), /api, /:slug, errors; log lines with credentials masked
   vendor.js         the /vendor URLs and the node_modules files behind them (read by app.js and the vendor build)
-  config.js         env parsing + normalisation (database URL: Turso or other libSQL URL, else DB_PATH as a file: URL; Vercel defaults)
-  db.js             @libsql/client wrapper (execute/all/get/run/batch), migrations, async query helpers (consumeVisitAndRecordClick, insertClick),
-                    an 8 s limit on every round trip to a server, isDatabaseUnavailable (which failures become a 503)
-                    servers through @libsql/client/web (plain JavaScript); the native driver loads only for local files
+  config.js         env parsing + normalisation (MONGODB_URI checked, the database picked by environment, Vercel defaults)
+  db.js             the MongoDB layer on the official driver: one client per app, indexes, the guarded consume, click rows,
+                    id sequences, the delete cascade, time limits, isDatabaseUnavailable (which failures become a 503) and
+                    databaseFailureHint (what to check, in the log)
   themes.js         teaser theme and QR preset ids, and the first-release ids they replaced
   slugs.js words.js slug normalisation/validation, word & random slugs, suggestions
   urls.js           destination URL validation (http/https only, no credentials, no redirect loops)
@@ -272,7 +318,7 @@ server/
   qrstyle.js        qrStyle whitelist validation
   analytics.js      UA parsing, bot detection, visitor hashing, ClickEvent + StatsDTO builder
   geo.js            CDN country headers → optional offline fast-geoip (150 ms cap, private IPs skipped; on Vercel only x-vercel-ip-*)
-  simulate.js       synthetic demo clicks (data/cities.js), stored in one batch
+  simulate.js       synthetic demo clicks (data/cities.js), stored in one insert
   live.js           live dashboard streams: SSE fed by polling the database, so every instance's clicks reach every dashboard
   bus.js            in-process wake-ups (link:<id>): streams on the same instance poll at once instead of at their next tick
   render.js         escaping-only HTML templates ({{text:}}, {{attr:}}, {{json:}})
@@ -290,6 +336,10 @@ scripts/
   build-icons.mjs   icon sprite builder (npm run icons)
   build-vendor.mjs  copies the /vendor files the pages use into public/vendor for Vercel (npm run build)
 test/               node:test suites (HTTP tests run against app.listen(0) with an injected clock)
+  run.mjs           npm test: one in-process MongoDB for the whole run, then every suite
+  mongo-server.js   that MongoDB (mongodb-memory-server-core, a one-member replica set on 127.0.0.1)
+  helpers.js        startServer() and friends: a fresh database per app, local connection strings only
+  tcp-proxy.js      a TCP proxy that resets or stalls connections, for the failure tests
 ```
 
 **Vendor routes** (served straight from `node_modules`, because the CSP only allows `'self'`): `/vendor/fonts/bangers/` and `/vendor/fonts/comic-neue/` (Fontsource packages; pages load `latin-400.css`, plus `latin-700.css` for Comic Neue), `/vendor/d3.min.js`, `/vendor/topojson-client.min.js`, `/vendor/countries-110m.json` and `/vendor/qr-code-styling.js`. They come before the static site, so a local run serves the installed versions even after a build. On Vercel the same URLs are the static copies `npm run build` makes in `public/vendor/`.
@@ -299,13 +349,18 @@ test/               node:test suites (HTTP tests run against app.listen(0) with 
 1. Look up the link. An unknown slug gets a 404 page.
 2. If the link is expired or destroyed, log a "blocked" attempt and answer 410.
 3. A link-preview bot on a limited link gets the preview page (200), and nothing is consumed.
-4. Otherwise, consume one click atomically and store the click in the same write: device/browser/OS, referrer host, coarse location and visitor hash. If the link was deleted a moment earlier (on any instance), the visitor gets the 404 page.
-5. Wake the live dashboards open on this server instance. Every dashboard reads the click (and any status change) from the database: at once on this instance, at its next poll (every 2 seconds) on any other.
-6. Answer with a 302 redirect or the teaser page.
+4. Otherwise, use up one click with one atomic update that only succeeds while the link is active and has clicks left. If the link was deleted a moment earlier (on any instance), the visitor gets the 404 page.
+5. Store the click row: device/browser/OS, referrer host, coarse location and visitor hash. Its id and its first-visit check go together, then the insert, then a check that the link still exists. On a server the visit waits for this (at most 1.5 seconds); on Vercel it answers first and the row is stored after the response.
+6. Wake the live dashboards open on this server instance. Every dashboard reads the click (and any status change) from the database: at once on this instance, at its next poll (every 2 seconds) on any other.
+7. Answer with a 302 redirect or the teaser page.
 
 `HEAD` requests get the same status codes but are never recorded or counted. Because they never use up a click, a `HEAD` to a click-limited link answers `302` without a `Location` header, so it can't be used to peek at a "burn after reading" destination.
 
-A visit makes at most two database round trips: the lookup, then one write batch that consumes the click and stores its row together, so a visit is never counted without its row, even when the request is cancelled halfway. Recording a visit that consumes nothing (a blocked attempt or a bot) can never break it: if that write fails (for example the link is deleted while its location is being looked up), the error is logged and the visitor still gets their page, and a write that takes longer than 1.5 seconds is left to finish on its own. Live dashboards never rescan a link's history on a visit either: each stream counts its totals once when it connects, together with the newest click id it covers, then adds the clicks it reads after that id, in id order. A poll reads only the rows stored since the previous one (from every link) plus the link itself, in one round trip. When simulated clicks are cleared, a counter in the `meta` table moves and every open stream recounts once, so the totals stay exact. The stats endpoint reads everything it needs in one batch, so a hosted database answers it in one round trip. It also returns the newest click id it covered, so the dashboard never counts a live click twice when the click reaches its stream after a refresh already included it.
+A counted visit sends six database commands in five round trips, one after the other: the lookup, the consume, the row's id and visitor together, the insert and the existence check. On Vercel only the first two come before the answer. Using up a click and storing its row are two separate writes, and the click is used up first: a crash between them loses one analytics row and can never let an extra visitor through. A visitor whose click was used up always gets through, even when the row's write fails or takes more than 1.5 seconds (both are logged), and recording a visit that uses up nothing (a blocked attempt or a bot) can never break it either.
+
+Live dashboards never rescan a link's history on a visit. Each stream counts its totals once when it connects, in one aggregation, then every poll is one aggregation that reads the link and only its rows the stream hasn't seen. Click ids are handed out before their rows are stored, so a slow row can land behind newer ones: each poll also looks up to 512 ids back, skipping the ones it has seen without reading them, so a late click is still sent and counted once. When simulated clicks are cleared, a counter in `meta` moves and every open stream recounts once, so the totals stay exact. Very rarely a `status` event (the click count changed) arrives one poll before the `click` event of the same visit.
+
+The stats endpoint is one aggregation, given up after 7 seconds of database time: **All time** on a link of about 400,000 clicks whose details are all different is near that limit, and would answer `503` above it. Stats also return the highest click id stored when they were read (`throughClickId`), so the dashboard never counts a live click twice when the click reaches its stream after a refresh already included it. A click whose row was still on its way can land below that id, and the refetch the dashboard makes after every live click (1.5 seconds later) counts it. If deleting a link fails after the link itself is gone, its rows stay behind where nothing can see them.
 
 **API:** see `SPEC.md` §5 for the full contract. In short:
 
@@ -339,29 +394,34 @@ A visit makes at most two database round trips: the lookup, then one write batch
 npm test
 ```
 
-The suites use the built-in `node:test` runner and `assert/strict`, with no extra dependencies. HTTP tests start an isolated app on an ephemeral port with an in-memory database and a mutable injected clock, so expiry and time-bucket tests are instant and deterministic. They cover:
+The suites use the built-in `node:test` runner and `assert/strict`; the one test dependency is `mongodb-memory-server-core`. `npm test` runs `test/run.mjs`, which starts one MongoDB 8.0 server for the whole run (a replica set of one member, so writes behave as on Atlas, listening on 127.0.0.1 only) and then every suite with `node --test`, each suite in its own process and each app in a fresh database that is dropped afterwards. A run always ends: a suite's process exits once its tests are done even if something it opened is still running, and a suite or test that hangs fails after two minutes. The first run on a machine downloads that server once (an archive of about 760 MB; the `mongod` binary is kept in `~/.cache/mongodb-binaries`), and nothing is downloaded at `npm install`. The tests never reach a real cluster: `npm test` doesn't read `.env`, removes every `MONGODB_*` variable before the suites start, and the helpers refuse any connection string that could reach another machine (a user name in it, an `+srv` name, or any host of its seed list off 127.0.0.1, `[::1]` and localhost). HTTP tests start an isolated app on an ephemeral port with a mutable injected clock, so expiry and time-bucket tests are instant and deterministic. There are 306 tests in 80 suites. They cover:
 
 - slug rules and suggestions, URL validation and domain ideas
 - the template escaping, including XSS attempts
 - create/update/delete validation, token auth (401/403/404) and the batch endpoint
-- the comic theme and preset ids, the old ids still accepted on input, and the one-time migration of stored ids
+- the comic theme and preset ids, the old ids still accepted on input, and old ids found in storage served under the new ones
 - 302/410/404 responses, teaser pages, bot previews and `HEAD` handling (including that `HEAD` never reveals a click-limited target)
 - expiry by time and by clicks, 30 concurrent visitors racing for 3 clicks, destroy/revive, and limits changed by `PATCH` (with the matching live `status` events)
 - analytics failures (a throwing geo provider, a link deleted while a blocked attempt is recorded) never breaking the visit, and a link deleted mid-visit answering 404 instead of "self-destructed"
-- database failures after start-up (a server error, a network failure) answering `503` with the "can't reach its database" page or JSON, while any other error stays a `500`
+- database failures after start-up (a failover, a network failure, a server that can't be found) answering `503` with the "can't reach its database" page or JSON, logged with the cluster and the database, while any other error stays a `500`
 - stats totals (including the bot and blocked overlap behind the "Bots & blocked" count), buckets (including time zones) and top-8 + "Other" breakdowns, simulated traffic (stored before the response, played back about 120 ms apart), the SSE stream, its running totals (including after simulated clicks are cleared), the status events for every click-count change, and its per-link/per-client connection caps (and a client's own stale streams making room, never another client's)
 - **All time** stats over long spans: clicks years apart all count, and the chart switches to weeks (starting Monday) after a year and to calendar months after 520 weeks, aligned to time zones east and west of UTC
 - redirect-loop protection (base host, vanity domains, loopback and listen addresses on Blip's port)
-- the data layer: `DB_PATH` as an absolute (Windows drive letter) or relative path, the priority of the database URL variables, reopening a file database, opening a database written by the `node:sqlite` build with its data still in the `-wal` file, deleting a link's clicks with foreign keys switched off, migrations that change nothing the second time and that two instances can run at once, requests waiting for a database that is still starting, and `503` for one that can't be opened
+- the data layer on MongoDB: 30 racing visits for 3 clicks consuming exactly 3 (on one instance and across two), one visitor's racing first visits counted unique once, id sequences that never hand out an id twice and that catch up when their counter falls behind the stored documents (a create then still gets its free slug, and only a taken slug is a `409`), the delete cascade whichever way it races an arriving click, index creation that changes nothing the second time and that several instances can run at once, the indexes of a dropped collection created again on the next start, every query on an index (checked with `explain`), the commands a visit, a stats request and a stream poll cost, a warm start that only reads, credentials in the connection string or in their own variables, requests waiting for a database that is still starting, and `503` for one that can't be opened
+- a database that stops answering: a visit, the stats and every other API request that waits for it (a create, slug checks and suggestions, My links, saving, destroying, bringing back or deleting a link, simulating traffic and clearing it) answer `503` within their limit
+- failures through a TCP proxy in front of the test server: reset connections and a server that stops answering get a prompt `503` (logged without credentials) and the app recovers; a start-up that takes too long is given up and retried; credentials the server refuses; a live stream that ends after three failed polls; late clicks that land behind newer ones sent and counted once; a recount after cleared clicks that fails once and is tried again, so the cleared clicks are never counted back; the snapshot and every poll reading the clear counter before the clicks
+- click rows: off Vercel a visit waits for its row at most 1.5 seconds, and with Vercel's settings it answers once its click is used up while the row is stored after the response (handed to `waitUntil`), a consume that hangs still holds the visit, and a failing or slow row is logged
+- configuration: the database picked by environment, `MONGODB_URI` checked without its value (or a user name) in any message, a connection string pasted into `MONGODB_DB`, `BASE_URL`, `PORT` or a stream setting never printed either, half-set credentials, MongoDB's own database names refused, credentials masked in every log line, and what the log suggests for each kind of failure
+- `npm start` (`server/index.js`): without `MONGODB_URI` it says to put it in `.env` and exits with 1, a bad setting names the variable and the scheme only, a connection string in `MONGODB_DB` is named without being printed, refused credentials say what to check without printing them, and a good database starts the server; none of them prints a stack trace
+- the old backend: nothing in `server/`, the pages and their scripts, `README.md` or `SPEC.md` mentions it, and it is no dependency
 - links surviving a `PORT`/`BASE_URL` change
 - rate limiting (per-route budgets, `TRUST_PROXY` hop counts, IPv6 /64 grouping, the client cap) and security headers
 - the Bangers and Comic Neue font routes, and that the first release's icon library and font routes now answer 404
 - copy rules: API error messages, trivia facts, domain idea notes and every rendered view are free of em dashes and emoji, and the views only load assets that exist
 - the design audit: `test/design-audit.test.js` runs `scripts/audit-design.mjs` and requires 0 findings, and unit-tests its CSS rules (such as disabled or unselected controls faded with opacity)
 - shutdown: closing the app closes the database, even if it was already closed or is still starting up
-- live streams across instances: two apps sharing one database file, where a visit, simulated clicks, a cleared simulation, a limit change and a deletion handled by one reach the other's dashboard by polling alone, and a stream that ends cleanly after `STREAM_MAX_MS`
-- a remote database over HTTP: a small Hrana server in `test/hrana-shim.js` (backed by `node:sqlite`) stands in for Turso, so create, visit (two round trips), the race for the last click, stats, the live stream and duplicate slugs run through the same HTTP client as production; then `503` while it answers errors or stops answering, a slow analytics write held to its budget, the start-up deadline, and a warm start that only reads
-- Vercel: `server.js` imports express, exports the app and never listens; `vercel.json` (Fluid compute, request cancellation, the 300 s limit) and its security headers; the Vercel defaults (base URL per environment, `TRUST_PROXY=1`, demo traffic, stream time limit, no file fallback); `503 database_not_configured` JSON and the "not connected yet" page without a database, `503 misconfigured` for an invalid setting, a `file:` URL refused, and a full create, visit and stats round trip against the HTTP stand-in with its token; Vercel's geo headers, with other CDNs' headers ignored and `fast-geoip` never imported
+- live streams across instances: two apps sharing one database, where a visit, simulated clicks, a cleared simulation, a limit change and a deletion handled by one reach the other's dashboard by polling alone, and a stream that ends cleanly after `STREAM_MAX_MS`
+- Vercel: `server.js` imports express, exports the app and never listens, and importing it loads none of the driver's optional packages (none of them is installed), nor `@vercel/oidc` or `fast-geoip`; `vercel.json` (Fluid compute, request cancellation, the 300 s limit) and its security headers; the Vercel defaults (base URL per environment, the database per environment, `TRUST_PROXY=1`, demo traffic, stream time limit); `503 database_not_configured` JSON and the "not connected yet" page without a database, `503 misconfigured` for an unusable `MONGODB_URI`, a connection string in `MONGODB_DB` (logged without it) or another invalid setting; the database opened by the first request, in a pool of 10 handed to `attachDatabasePool`, and a pool Vercel can't take logged without failing a request; and a full create, visit and stats round trip with each click row handed to `waitUntil`; with the real `@vercel/functions` and a request context like Vercel's, every connection checkout keeping its own request alive, and a live stream's polls keeping the stream's request alive whichever visit or `PATCH` woke them; `.vercelignore` keeping `.env*` and `data/` out of CLI deployments; Vercel's geo headers, with other CDNs' headers ignored and `fast-geoip` never imported
 - the vendor build: every `/vendor/` URL the pages use is copied byte for byte, with the font files behind each font stylesheet, and an unknown one fails the build
 
-`npm test` runs `node --test "test/*.test.js"`, so each suite gets its own process (`test/helpers.js` is shared setup, not a suite). Run a single suite with, for example, `node --test test/redirect.test.js`.
+Each suite runs in its own process (`test/helpers.js` is shared setup, not a suite). Run some of them with, for example, `npm test -- test/redirect.test.js` (options such as `--test-name-pattern` go on to `node --test` too, and without a suite file every suite runs), or one on its own with `node --test test/redirect.test.js`, which starts a MongoDB server of its own.

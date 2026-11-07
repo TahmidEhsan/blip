@@ -2,13 +2,19 @@
 //
 // On Vercel, Blip runs as several stateless instances and a visit can land on any of them, so a stream
 // never waits for in-process events to learn about clicks. When it opens it reads one snapshot (the
-// `hello` totals and the highest click id stored), then polls every `streamPollMs` for the link's clicks
-// stored since and for the link row. New clicks go out in id order with running totals, a burst (such
-// as simulated traffic) spread a little apart so the dashboard can animate it, and a `status` event goes
-// out whenever the link's status or click count changes. The in-process bus (server/bus.js) only wakes
-// the streams open on this instance, so a visit handled here shows up at once instead of at the next
-// poll. With `streamMaxMs` set (Vercel ends functions after 300 s) the stream ends cleanly on time and
-// the dashboard's client reconnects, getting a fresh `hello`.
+// `hello` totals and the link's newest click ids), then polls every `streamPollMs` for the link's clicks
+// it has not seen and for the link itself. New clicks go out with running totals, a burst (such as
+// simulated traffic) spread a little apart so the dashboard can animate it, and a `status` event goes out
+// whenever the link's status or click count changes. The in-process bus (server/bus.js) only wakes the
+// streams open on this instance, so a visit handled here shows up at once instead of at the next poll.
+// With `streamMaxMs` set (Vercel ends functions after 300 s) the stream ends cleanly on time and the
+// dashboard's client reconnects, getting a fresh `hello`.
+//
+// Click ids are allocated before the insert commits, so a slow insert can land BEHIND the newest id a
+// stream has read. Each poll therefore re-reads STREAM_OVERLAP_IDS ids below its cursor, leaving out the
+// ones it already accounted for (`seen`, which never holds more than that many), so a late click is
+// still sent, once, and the others cost no document reads.
+import { AsyncResource } from 'node:async_hooks';
 import { clickEventFromRow, isCountedClick, liveStreamPoll, liveStreamSnapshot, liveTotalsThrough } from './analytics.js';
 import { linkChannel } from './bus.js';
 import { statusPayload } from './links.js';
@@ -20,6 +26,12 @@ export const STREAM_STAGGER_MS = 120;
 export const STREAM_BURST_MAX_MS = 6_000;
 /** Most clicks read by one poll; a longer backlog is read by the polls that follow straight away. */
 export const STREAM_POLL_LIMIT = 200;
+/**
+ * How far below its cursor a poll looks for clicks that landed late. Counted in ids of all links: an
+ * insert gives up within about 20 s (the socket timeout, one retry, server selection), so this covers
+ * about 25 clicks per second across the whole app.
+ */
+export const STREAM_OVERLAP_IDS = 512;
 /** After this many failed polls in a row the stream ends (the dashboard reconnects with backoff). */
 const MAX_POLL_FAILURES = 3;
 
@@ -31,7 +43,7 @@ const statusKey = (payload) => JSON.stringify(payload);
  * @param {object} ctx the app context: db, bus, config (streamPollMs, streamMaxMs), now, streams, redact
  * @param {import('express').Request} req
  * @param {import('express').Response} res
- * @param {object} link the link's row
+ * @param {object} link the link
  * @param {{ onOpen?: (stream: { end: () => void }) => void, onClose?: () => void }} [hooks] `onOpen` gets the
  *   stream's handle as soon as it is registered (calling `end()` on it ends the stream); `onClose` runs
  *   once, when the stream ends for any reason
@@ -53,13 +65,19 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
   let polling = false;
   let wakeRequested = false;
   let failures = 0;
-  let cursor = 0; // highest click id this stream has accounted for
-  let totals = null; // running all-time { clicks, uniqueVisitors } as of `cursor`
+  let cursor = 0; // highest click id of this link this stream has accounted for
+  const seen = new Set(); // ids within STREAM_OVERLAP_IDS below the cursor it has accounted for
+  let totals = null; // running all-time { clicks, uniqueVisitors } of what it has accounted for
   let epoch = null; // CLICKS_EPOCH_KEY as of the last read
   let lastStatus = null;
   let pollTimer = null;
   let pauseTimer = null;
   let pauseDone = null;
+  // Polls run in this stream's own request context, whichever request wakes them (a visit or a PATCH on
+  // this instance calls onWake from inside its own handler). On Vercel that context decides which
+  // invocation a poll's connection checkout keeps alive (attachDatabasePool) and which request its log
+  // lines belong to.
+  const pollInStream = AsyncResource.bind(run);
 
   const write = (chunk) => {
     if (!closed && !res.writableEnded && !res.destroyed) res.write(chunk);
@@ -97,7 +115,7 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
 
   function schedule(ms) {
     clearTimeout(pollTimer);
-    pollTimer = setTimeout(run, ms);
+    pollTimer = setTimeout(pollInStream, ms);
     pollTimer.unref?.();
   }
 
@@ -117,6 +135,15 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
       }, ms);
       pauseTimer.unref?.();
     });
+  }
+
+  /** Mark click ids as accounted for: the cursor follows the newest, and `seen` keeps only the overlap window. */
+  function accountFor(ids) {
+    for (const id of ids) {
+      seen.add(id);
+      if (id > cursor) cursor = id;
+    }
+    for (const id of seen) if (id <= cursor - STREAM_OVERLAP_IDS) seen.delete(id);
   }
 
   async function run() {
@@ -143,7 +170,7 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
 
   /** @returns {Promise<boolean>} true when more stored clicks are waiting to be read */
   async function pollOnce() {
-    const snap = await liveStreamPoll(db, link.id, cursor, STREAM_POLL_LIMIT);
+    const snap = await liveStreamPoll(db, link.id, { afterId: cursor - STREAM_OVERLAP_IDS, exclude: [...seen], limit: STREAM_POLL_LIMIT });
     if (closed) return false;
     if (!snap.link) {
       // Deleted. The dashboard reconnects, gets a 404 and stops.
@@ -151,15 +178,16 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
       return false;
     }
     if (snap.epoch !== epoch) {
-      // Clicks were deleted (Clear simulated) somewhere: recount what this stream has counted so far.
-      epoch = snap.epoch;
-      totals = await liveTotalsThrough(db, link.id, cursor);
+      // Clicks were deleted (Clear simulated) somewhere: recount what this stream has accounted for so far.
+      // The epoch is stored only once the recount succeeds, so a failed one is tried again by the next poll
+      // (a failure rejects before accountFor(), so this poll's rows are read again too).
+      const recount = await liveTotalsThrough(db, link.id, { floor: cursor - STREAM_OVERLAP_IDS, seen: [...seen] });
       if (closed) return false;
+      totals = recount;
+      epoch = snap.epoch;
     }
     const { rows } = snap;
-    const more = rows.length >= STREAM_POLL_LIMIT;
-    // Rows of other links up to throughId are skipped for good; a full page resumes after its last row.
-    cursor = more ? rows[rows.length - 1].id : Math.max(cursor, snap.throughId, rows[rows.length - 1]?.id ?? 0);
+    accountFor(rows.map((row) => row.id));
 
     const events = rows.map((row) => {
       if (isCountedClick(row)) {
@@ -181,7 +209,7 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
       lastStatus = key;
       send('status', status);
     }
-    return more;
+    return rows.length >= STREAM_POLL_LIMIT;
   }
 
   bus.on(channel, onWake);
@@ -197,13 +225,13 @@ export async function serveLiveStream(ctx, req, res, link, { onOpen, onClose } =
   req.on('error', cleanup); // a cancelled request ("aborted")
 
   try {
-    const snap = await liveStreamSnapshot(db, link.id, ctx.now());
+    const snap = await liveStreamSnapshot(db, link.id, ctx.now(), STREAM_OVERLAP_IDS);
     if (closed) return;
     if (!snap.link) {
       stream.end();
       return;
     }
-    cursor = snap.throughId;
+    accountFor(snap.ids);
     totals = { clicks: snap.totals.clicks, uniqueVisitors: snap.totals.uniqueVisitors };
     epoch = snap.epoch;
     lastStatus = statusKey(statusPayload(snap.link, ctx.now()));

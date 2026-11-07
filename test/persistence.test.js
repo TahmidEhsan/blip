@@ -1,17 +1,15 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import {
-  createDatabase, deleteLink, ensureIpHashSalt, insertClick, migrate, migrateLegacyThemeIds, openDatabase, sha256Hex,
+  INDEXES, SCHEMA_VERSION, createDatabase, deleteLink, ensureIndexes, ensureIpHashSalt, insertClick, insertLink, prepareDatabase,
 } from '../server/db.js';
-import { PROJECT_ROOT, loadConfig, resolveConfig } from '../server/config.js';
+import { resolveConfig } from '../server/config.js';
 import { createApp } from '../server/app.js';
-import { effectiveDomain, toLinkDto } from '../server/links.js';
-import { START_TIME, assertPlainCopy, removeTempDir, startServer } from './helpers.js';
+import { LINK_DEFAULTS, effectiveDomain, toLinkDto } from '../server/links.js';
+import {
+  START_TIME, assertPlainCopy, closeTestDatabase, dropTestDatabase, freshDatabaseName, openTestDatabase, startServer, testMongoUri,
+} from './helpers.js';
 import { QR_PRESETS } from '../public/assets/js/qr-shared.js';
 
 /** The flat comic look a preset id stands for, as a stored qrStyle (no label). */
@@ -20,192 +18,167 @@ const flatLook = (id, extra = {}) => {
   return { ...look, caption: null, ...extra };
 };
 
-const EXPECTED_INDEXES = ['idx_clicks_link_counted', 'idx_clicks_link_real_ts', 'idx_clicks_link_ts', 'idx_clicks_link_visitor'];
-const schemaVersion = async (db) => (await db.get("SELECT value FROM meta WHERE key = 'schema_version'"))?.value ?? null;
-const count = async (db, sql, args) => (await db.get(sql, args)).n;
+const schemaVersion = async (db) => (await db.collection('meta').findOne({ _id: 'schema_version' }))?.value ?? null;
 
-/** Everything a migration could touch: the schema, meta and every link row. */
-const snapshot = async (db) => ({
-  schema: await db.all("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"),
-  meta: await db.all('SELECT key, value FROM meta ORDER BY key'),
-  links: await db.all('SELECT * FROM links ORDER BY id'),
-});
-
-/** A database at schema version 1 as the first release left it: no meta.schema_version, user_version 1. */
-async function makeFirstReleaseDatabase(file, rows) {
-  const v1 = await openDatabase(file);
-  await v1.batch([
-    "DELETE FROM meta WHERE key = 'schema_version'",
-    ...rows.map(([slug, theme, qrStyle]) => ({
-      sql: `INSERT INTO links (slug, domain, target_url, manage_token_hash, teaser_theme, qr_style, created_at, updated_at)
-            VALUES (?, 'localhost:3030', 'https://example.com/', 'abc', ?, ?, 1, 1)`,
-      args: [slug, theme, qrStyle],
-    })),
-  ], 'write');
-  await v1.execute('PRAGMA user_version = 1');
-  v1.close();
+/** Every index by name, per collection (the ones INDEXES names, plus MongoDB's own `_id_`). */
+async function indexNames(db) {
+  const names = {};
+  for (const collection of Object.keys(INDEXES)) {
+    names[collection] = (await db.collection(collection).indexes()).map((index) => index.name).sort();
+  }
+  return names;
 }
 
-describe('file databases', () => {
-  let dir;
-  before(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blip-test-'));
-  });
-  after(() => removeTempDir(dir));
+const EXPECTED_INDEXES = {
+  links: ['_id_', 'id_unique', 'slug_unique'],
+  clicks: ['_id_', 'id_unique', 'link_id', 'link_real_ts', 'link_ts_id'],
+  visitors: ['_id_', 'link_visitor_unique'],
+};
 
+/** Everything preparing a database could touch: its indexes, meta and every link. */
+const snapshot = async (db) => ({
+  indexes: await indexNames(db),
+  meta: await db.collection('meta').find({}).sort({ _id: 1 }).toArray(),
+  links: await db.collection('links').find({}).sort({ id: 1 }).toArray(),
+});
+
+const LINK = {
+  ...LINK_DEFAULTS, domain: 'localhost:3030', target_url: 'https://example.com/', manage_token_hash: 'abc', created_at: 1, updated_at: 1,
+};
+
+describe('preparing a database', () => {
   it('reopening an existing database is idempotent and keeps data, indexes and the salt', async () => {
-    const file = path.join(dir, 'nested', 'reopen.db');
-    const first = await openDatabase(file);
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    const open = async () => {
+      const db = createDatabase({ uri, dbName });
+      await prepareDatabase(db);
+      return db;
+    };
+    const first = await open();
     const salt = await ensureIpHashSalt(first, null);
-    await first.run(`INSERT INTO links (slug, domain, target_url, manage_token_hash, created_at, updated_at)
-                     VALUES ('kept', 'localhost:3030', 'https://example.com/', 'abc', 1, 1)`);
-    first.close();
+    await insertLink(first, { ...LINK, slug: 'kept' });
+    await first.close();
 
     for (let i = 0; i < 2; i += 1) {
-      const again = await openDatabase(file);
+      const again = await open();
       try {
-        assert.equal(await schemaVersion(again), '2');
-        assert.equal((await again.get('PRAGMA journal_mode')).journal_mode, 'wal');
-        const indexes = await again.all("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'clicks' AND name LIKE 'idx_%' ORDER BY name");
-        assert.deepEqual(indexes.map((r) => r.name), EXPECTED_INDEXES);
-        assert.equal(await count(again, 'SELECT COUNT(*) AS n FROM links'), 1);
+        assert.equal(await schemaVersion(again), SCHEMA_VERSION);
+        assert.deepEqual(await indexNames(again), EXPECTED_INDEXES);
+        assert.equal(await again.collection('links').countDocuments({}), 1);
         assert.equal(await ensureIpHashSalt(again, null), salt, 'the generated salt is persisted once');
       } finally {
-        again.close();
+        await again.close();
       }
     }
+    await dropTestDatabase(dbName);
   });
 
-  it('migrates a first-release database to the comic theme and preset ids, once', async () => {
-    const file = path.join(dir, 'first-release.db');
-    const style = (preset, extra = {}) => JSON.stringify({ preset, dotColor: '#111111', ...extra });
-    const rows = [
-      // slug, stored theme, stored qr_style, expected theme, expected preset (undefined = qr_style untouched)
-      ['a', 'aurora', style('aurora', { dotColor2: '#d62828', gradientType: 'linear' }), 'hero', 'hero'],
-      ['b', 'sunset', style('sunset'), 'caption', 'pop'],
-      ['c', 'ocean', style('ocean'), 'sky', 'sky'],
-      ['d', 'neon', style('mono'), 'noir', 'ink'],
-      ['e', 'candy', style('candy'), 'paper', 'caption'],
-      ['f', 'hero', style('forest'), 'hero', 'press'],
-      ['g', 'plaid', null, 'hero', undefined],
-      ['h', 'sky', '{not json', 'sky', undefined],
-      ['i', 'noir', style('custom'), 'noir', undefined],
-      ['j', 'paper', style('neon'), 'paper', 'noir'],
-      // A caption and a centre logo the user picked survive; the preset's own old logo becomes the new preset's.
-      ['k', 'hero', style('aurora', { dotType: 'rounded', logo: 'cat', caption: 'Scan me' }), 'hero', 'hero'],
-      ['l', 'noir', style('neon', { logo: 'bolt' }), 'noir', 'noir'],
-    ];
-    const expectedStyle = {
-      k: flatLook('hero', { logo: 'cat', caption: 'Scan me' }),
-      l: flatLook('noir', { logo: 'star' }),
-    };
-    await makeFirstReleaseDatabase(file, rows);
-
-    const db = await openDatabase(file);
+  it('running it twice in a row is a no-op', async () => {
+    const db = createDatabase({ uri: await testMongoUri(), dbName: freshDatabaseName() });
     try {
-      assert.equal(await schemaVersion(db), '2');
-      for (const [slug, , qrStyle, theme, preset] of rows) {
-        const row = await db.get('SELECT teaser_theme, qr_style, updated_at FROM links WHERE slug = ?', [slug]);
-        assert.equal(row.teaser_theme, theme, `${slug}: teaser theme`);
-        if (preset === undefined) assert.equal(row.qr_style, qrStyle, `${slug}: qr_style untouched`);
-        else assert.deepEqual(JSON.parse(row.qr_style), expectedStyle[slug] || flatLook(preset), `${slug}: the old look becomes the new preset's flat look`);
-        assert.equal(row.updated_at, 1, `${slug}: a migration is not an edit`);
-      }
-      assert.deepEqual(await migrateLegacyThemeIds(db), { teaserThemes: 0, qrPresets: 0 }, 'running it again changes nothing');
+      assert.deepEqual(await ensureIndexes(db), { from: 0, to: SCHEMA_VERSION });
+      await insertLink(db, { ...LINK, slug: 'present' });
+      const once1 = await snapshot(db);
+      assert.deepEqual(once1.indexes, EXPECTED_INDEXES);
+      assert.deepEqual(await ensureIndexes(db), { from: SCHEMA_VERSION, to: SCHEMA_VERSION }, 'the second run finds nothing to do');
+      assert.deepEqual(await snapshot(db), once1, 'and changes nothing');
     } finally {
-      db.close();
+      await closeTestDatabase(db);
     }
-    const reopened = await openDatabase(file);
+  });
+
+  it('a collection dropped since the last start gets its indexes back on the next one', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    const first = createDatabase({ uri, dbName });
     try {
-      assert.equal(await schemaVersion(reopened), '2');
-      assert.equal(await count(reopened, "SELECT COUNT(*) AS n FROM links WHERE teaser_theme NOT IN ('hero','caption','noir','sky','paper')"), 0);
+      await prepareDatabase(first);
+      const link = await insertLink(first, { ...LINK, slug: 'reset-analytics' });
+      await insertClick(first, { link_id: link.id, ts: 1, visitor_hash: 'v1', device: 'desktop', outcome: 'redirect' });
+      // Analytics reset by hand in Atlas: both collections dropped, and clicks created again by the next
+      // write, with nothing but its `_id_` index.
+      await first.collection('clicks').drop();
+      await first.collection('visitors').drop();
+      await first.collection('clicks').insertOne({ id: 99, link_id: link.id, ts: 2 });
+      assert.deepEqual((await first.collection('clicks').indexes()).map((index) => index.name), ['_id_']);
     } finally {
-      reopened.close();
+      await first.close();
     }
-  });
 
-  it('running the migrations twice in a row is a no-op', async () => {
-    const file = path.join(dir, 'twice.db');
-    await makeFirstReleaseDatabase(file, [['legacy', 'aurora', JSON.stringify({ preset: 'sunset' })], ['fine', 'sky', null]]);
-    const db = createDatabase({ url: loadConfig({ DB_PATH: file }).databaseUrl });
+    const created = [];
+    const again = createDatabase({
+      uri,
+      dbName,
+      clientOptions: { monitorCommands: true },
+      onClient: (client) => client.on('commandStarted', (e) => {
+        if (e.commandName === 'createIndexes') created.push(e.command.createIndexes);
+      }),
+    });
     try {
-      assert.deepEqual(await migrate(db), { from: 1, to: 2 });
-      const once = await snapshot(db);
-      assert.deepEqual(await migrate(db), { from: 2, to: 2 }, 'the second run finds nothing to do');
-      assert.deepEqual(await snapshot(db), once, 'and changes nothing');
-      assert.equal(once.meta.find((m) => m.key === 'schema_version').value, '2');
-      assert.equal(once.links.find((l) => l.slug === 'legacy').teaser_theme, 'hero');
+      assert.deepEqual(await prepareDatabase(again), { from: SCHEMA_VERSION, to: SCHEMA_VERSION }, 'the schema version was current all along');
+      assert.deepEqual(await indexNames(again), EXPECTED_INDEXES);
+      assert.deepEqual(created.sort(), ['clicks', 'visitors'], 'only the collections that lacked indexes');
+      created.length = 0;
+      await prepareDatabase(again);
+      assert.deepEqual(created, [], 'and the start after that only reads');
+      await assert.rejects(again.collection('visitors').insertMany([{ link_id: 1, visitor_hash: 'x' }, { link_id: 1, visitor_hash: 'x' }]), /duplicate key/, 'the first-visit rule has its unique index again');
     } finally {
-      db.close();
+      await again.close();
+      await dropTestDatabase(dbName);
     }
   });
 
-  it('two instances migrating the same database at once apply each change once and agree on the salt', async () => {
-    const file = path.join(dir, 'cold-start.db');
-    const legacy = [['p', 'aurora', JSON.stringify({ preset: 'aurora' })], ['q', 'neon', JSON.stringify({ preset: 'mono' })], ['r', 'sky', null]];
-    await makeFirstReleaseDatabase(file, legacy);
-    const url = loadConfig({ DB_PATH: file }).databaseUrl;
-    const a = createDatabase({ url });
-    const b = createDatabase({ url });
+  it('several instances starting at once all succeed and agree on the salt', async () => {
+    const uri = await testMongoUri();
+    const dbName = freshDatabaseName();
+    const instances = Array.from({ length: 5 }, () => createDatabase({ uri, dbName }));
     try {
-      // Both read the same legacy rows before either writes; the guarded writes keep the second one a no-op.
-      const [ra, rb] = await Promise.all([migrateLegacyThemeIds(a), migrateLegacyThemeIds(b)]);
-      assert.equal(ra.teaserThemes + rb.teaserThemes, 2, 'each legacy theme is rewritten once');
-      assert.equal(ra.qrPresets + rb.qrPresets, 2, 'each legacy QR style is rewritten once');
-      const [ma, mb] = await Promise.all([migrate(a), migrate(b)]);
-      assert.equal(ma.to, 2);
-      assert.equal(mb.to, 2);
-      const [saltA, saltB] = await Promise.all([ensureIpHashSalt(a, null), ensureIpHashSalt(b, null)]);
-      assert.equal(saltA, saltB, 'the first salt written wins and both instances use it');
-      assert.match(saltA, /^[0-9a-f]{64}$/);
-      const rows = await a.all('SELECT slug, teaser_theme, qr_style FROM links ORDER BY slug');
-      assert.deepEqual(rows.map((r) => r.teaser_theme), ['hero', 'noir', 'sky']);
-      assert.deepEqual(rows.map((r) => r.qr_style && JSON.parse(r.qr_style).preset), ['hero', 'ink', null]);
-      assert.equal(await schemaVersion(b), '2');
+      const results = await Promise.all(instances.map(ensureIndexes));
+      for (const result of results) assert.equal(result.to, SCHEMA_VERSION);
+      assert.deepEqual(await indexNames(instances[0]), EXPECTED_INDEXES);
+      assert.equal(await schemaVersion(instances[0]), SCHEMA_VERSION);
+      const salts = await Promise.all(instances.map((db) => ensureIpHashSalt(db, null)));
+      assert.equal(new Set(salts).size, 1, 'the first salt written wins and every instance uses it');
+      assert.match(salts[0], /^[0-9a-f]{64}$/);
     } finally {
-      a.close();
-      b.close();
+      await Promise.all(instances.map((db) => db.close()));
+      await dropTestDatabase(dbName);
     }
   });
 
-  it('new databases default teaser_theme to hero', async () => {
-    const db = await openDatabase(':memory:');
+  it('a configured salt is used as it is and never stored', async () => {
+    const db = await openTestDatabase();
     try {
-      await db.run(`INSERT INTO links (slug, domain, target_url, manage_token_hash, created_at, updated_at)
-                    VALUES ('fresh', 'localhost:3030', 'https://example.com/', 'abc', 1, 1)`);
-      assert.equal((await db.get('SELECT teaser_theme FROM links')).teaser_theme, 'hero');
-      assert.equal(await schemaVersion(db), '2');
+      assert.equal(await ensureIpHashSalt(db, 'from-the-environment'), 'from-the-environment');
+      assert.equal(await db.collection('meta').findOne({ _id: 'ip_hash_salt' }), null);
     } finally {
-      db.close();
+      await closeTestDatabase(db);
     }
   });
 
-  it('DB_PATH works as an absolute path and as a path relative to the project', async () => {
-    const absolute = path.join(dir, 'odd #1 folder', 'abs path.db');
-    const relative = path.relative(PROJECT_ROOT, path.join(dir, 'relative', 'rel.db'));
-    for (const [dbPath, expected] of [[absolute, absolute], [relative, path.join(dir, 'relative', 'rel.db')]]) {
-      const config = loadConfig({ DB_PATH: dbPath });
-      assert.match(config.databaseUrl, /^file:\/\/\//, dbPath);
-      const s = await startServer({ config: { dbPath: config.dbPath } });
-      try {
-        assert.equal(s.config.databaseUrl, config.databaseUrl);
-        await s.createLink({ targetUrl: 'https://example.com/where', slug: 'where' });
-        assert.ok(fs.existsSync(expected), `the database file is at ${expected}`);
-      } finally {
-        await s.stop();
-      }
+  it('new links default teaser_theme to hero', async () => {
+    const db = await openTestDatabase();
+    try {
+      const { teaser_theme: theme } = await insertLink(db, { slug: 'fresh', domain: 'localhost:3030', target_url: 'https://example.com/', manage_token_hash: 'abc', created_at: 1, updated_at: 1 });
+      assert.equal(theme, 'hero');
+      assert.equal((await db.collection('links').findOne({ slug: 'fresh' })).teaser_theme, 'hero');
+    } finally {
+      await closeTestDatabase(db);
     }
   });
+});
 
+describe('links across restarts', () => {
   it('links made under an old base URL keep a working short URL after PORT/BASE_URL changes', async () => {
-    const dbPath = path.join(dir, 'moved.db');
-    const original = await startServer({ config: { dbPath, baseUrl: 'http://localhost:3030', domains: ['cat.ly'] } });
+    const dbName = freshDatabaseName();
+    const original = await startServer({ dbName, config: { baseUrl: 'http://localhost:3030', domains: ['cat.ly'] } });
     const moved = await original.createLink({ targetUrl: 'https://example.com/moved', slug: 'moved' });
     const meow = await original.createLink({ targetUrl: 'https://example.com/meow', slug: 'meow', domain: 'cat.ly' });
     assert.equal(moved.link.domain, 'localhost:3030');
     await original.stop();
 
-    const s = await startServer({ config: { dbPath, baseUrl: 'http://localhost:4000', domains: ['go.to'] } });
+    const s = await startServer({ dbName, config: { baseUrl: 'http://localhost:4000', domains: ['go.to'] } });
     try {
       const { json } = await s.request('GET', '/api/links/moved', { token: moved.manageToken });
       assert.equal(json.link.domain, 'localhost:4000');
@@ -221,12 +194,12 @@ describe('file databases', () => {
       assert.equal(vanity.shortUrl, 'http://localhost:4000/meow');
       assert.equal(vanity.domainLive, true);
 
-      // Clients that echo the stored legacy domain back get a 200, and the row is normalised.
+      // Clients that echo the stored legacy domain back get a 200, and the document is normalised.
       const echoed = await s.request('PATCH', '/api/links/moved', { token: moved.manageToken, body: { domain: 'localhost:3030', title: 'Moved' } });
       assert.equal(echoed.status, 200);
       assert.equal(echoed.json.link.domain, 'localhost:4000');
       assert.equal(echoed.json.link.title, 'Moved');
-      assert.equal((await s.db.get('SELECT domain FROM links WHERE slug = ?', ['moved'])).domain, 'localhost:4000');
+      assert.equal((await s.db.collection('links').findOne({ slug: 'moved' })).domain, 'localhost:4000');
       // But an unknown domain that isn't the link's own stored one is still rejected.
       const unknown = await s.request('PATCH', '/api/links/moved', { token: moved.manageToken, body: { domain: 'localhost:3030' } });
       assert.equal(unknown.status, 400);
@@ -237,152 +210,54 @@ describe('file databases', () => {
       assert.equal((await s.visit('moved')).status, 302, 'the link itself kept working all along');
     } finally {
       await s.stop();
+      await dropTestDatabase(dbName);
     }
   });
 });
 
-// The v2 schema exactly as the node:sqlite builds created it (frozen here on purpose).
-const NODE_SQLITE_V2_SCHEMA = `
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS links (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, domain TEXT NOT NULL, target_url TEXT NOT NULL,
-  title TEXT, manage_token_hash TEXT NOT NULL,
-  redirect_mode TEXT NOT NULL DEFAULT 'instant' CHECK (redirect_mode IN ('instant','teaser')),
-  teaser_seconds INTEGER NOT NULL DEFAULT 5,
-  teaser_style TEXT NOT NULL DEFAULT 'countdown' CHECK (teaser_style IN ('countdown','trivia','brand')),
-  teaser_message TEXT, teaser_theme TEXT NOT NULL DEFAULT 'hero', expires_at INTEGER, max_clicks INTEGER,
-  click_count INTEGER NOT NULL DEFAULT 0, destroyed_at INTEGER, qr_style TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS clicks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, link_id INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
-  ts INTEGER NOT NULL, visitor_hash TEXT, is_unique INTEGER NOT NULL DEFAULT 0, country TEXT, region TEXT, city TEXT,
-  lat REAL, lon REAL, device TEXT NOT NULL DEFAULT 'desktop', browser TEXT, os TEXT, referrer_host TEXT,
-  is_bot INTEGER NOT NULL DEFAULT 0, is_synthetic INTEGER NOT NULL DEFAULT 0,
-  outcome TEXT NOT NULL DEFAULT 'redirect' CHECK (outcome IN ('redirect','teaser','expired','bot-preview'))
-);
-CREATE INDEX IF NOT EXISTS idx_clicks_link_ts ON clicks(link_id, ts);
-CREATE INDEX IF NOT EXISTS idx_clicks_link_visitor ON clicks(link_id, visitor_hash);
-CREATE INDEX IF NOT EXISTS idx_clicks_link_counted ON clicks(link_id, visitor_hash) WHERE outcome IN ('redirect','teaser') AND is_bot = 0;
-CREATE INDEX IF NOT EXISTS idx_clicks_link_real_ts ON clicks(link_id, ts) WHERE outcome IN ('redirect','teaser') AND is_bot = 0 AND is_synthetic = 0;
-`;
-
-// Runs in a child process with the old engine, opened the way the old openDatabase() did. The files are
-// copied while the database is still open, like copying a running server's data folder: everything
-// written so far is still in blip.db-wal, and blip.db holds little more than its header.
-const NODE_SQLITE_WRITER = `
-import { DatabaseSync } from 'node:sqlite';
-import fs from 'node:fs';
-import path from 'node:path';
-const dir = process.env.BLIP_FIXTURE_DIR;
-const live = path.join(dir, 'live', 'blip.db');
-fs.mkdirSync(path.dirname(live), { recursive: true });
-const db = new DatabaseSync(live);
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;');
-db.exec(process.env.BLIP_FIXTURE_SCHEMA);
-db.exec('PRAGMA user_version = 2');
-db.prepare("INSERT INTO meta (key, value) VALUES ('ip_hash_salt', 'salt-from-node-sqlite')").run();
-const { lastInsertRowid: id } = db.prepare(
-  "INSERT INTO links (slug, domain, target_url, manage_token_hash, teaser_theme, max_clicks, click_count, created_at, updated_at) " +
-  "VALUES ('old-friend', 'localhost:3030', 'https://example.com/old', ?, 'sky', 10, 2, ?, ?)"
-).run(process.env.BLIP_FIXTURE_TOKEN_HASH, Number(process.env.BLIP_FIXTURE_TS), Number(process.env.BLIP_FIXTURE_TS));
-const click = db.prepare("INSERT INTO clicks (link_id, ts, visitor_hash, is_unique, device, browser, outcome) VALUES (?, ?, 'aaaaaaaaaaaaaaaaaaaaaaaa', ?, 'desktop', 'Chrome', 'redirect')");
-click.run(id, Number(process.env.BLIP_FIXTURE_TS), 1);
-click.run(id, Number(process.env.BLIP_FIXTURE_TS) + 1000, 0);
-for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(live + suffix, path.join(dir, 'blip.db' + suffix));
-db.close();
-`;
-
-describe('a database written by the node:sqlite build', () => {
-  let dir;
-  before(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blip-old-'));
+describe('clicks and the links they belong to', () => {
+  let db;
+  before(async () => {
+    db = await openTestDatabase();
   });
-  after(() => removeTempDir(dir));
+  after(() => closeTestDatabase(db));
 
-  it('opens a v2 copy (data still in its WAL) without losing anything', async (t) => {
-    const token = 'old-manage-token';
-    const written = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', NODE_SQLITE_WRITER], {
-      env: {
-        ...process.env,
-        BLIP_FIXTURE_DIR: dir,
-        BLIP_FIXTURE_SCHEMA: NODE_SQLITE_V2_SCHEMA,
-        BLIP_FIXTURE_TOKEN_HASH: sha256Hex(token),
-        BLIP_FIXTURE_TS: String(START_TIME - 3_600_000),
-      },
-      encoding: 'utf8',
-    });
-    if (written.status !== 0 && /ERR_UNKNOWN_BUILTIN_MODULE/.test(written.stderr)) {
-      t.skip('node:sqlite is not available in this Node.js');
-      return;
-    }
-    assert.equal(written.status, 0, written.stderr);
-    const file = path.join(dir, 'blip.db');
-    assert.ok(fs.statSync(`${file}-wal`).size > fs.statSync(file).size, 'most of the copy is still in blip.db-wal');
+  it('deleting a link removes its clicks and visitors, and a click arriving afterwards stores nothing', async () => {
+    const link = await insertLink(db, { ...LINK, slug: 'short-lived' });
+    const other = await insertLink(db, { ...LINK, slug: 'stays' });
+    for (let i = 0; i < 3; i += 1) await insertClick(db, { link_id: link.id, ts: i, visitor_hash: `v${i}`, device: 'desktop', outcome: 'redirect' });
+    await insertClick(db, { link_id: other.id, ts: 1, visitor_hash: 'v0', device: 'desktop', outcome: 'redirect' });
+    const count = (name, filter) => db.collection(name).countDocuments(filter);
+    assert.equal(await count('clicks', { link_id: link.id }), 3);
+    assert.equal(await count('visitors', { link_id: link.id }), 3);
 
-    const s = await startServer({ config: { dbPath: file } });
-    try {
-      const { status, json } = await s.request('GET', '/api/links/old-friend', { token });
-      assert.equal(status, 200);
-      assert.equal(json.link.targetUrl, 'https://example.com/old');
-      assert.equal(json.link.teaser.theme, 'sky');
-      assert.equal(json.link.clickCount, 2);
-      assert.equal(json.link.clicksRemaining, 8);
-      const stats = await s.request('GET', '/api/links/old-friend/stats?range=all', { token });
-      assert.equal(stats.json.totals.clicks, 2);
-      assert.equal(stats.json.totals.uniqueVisitors, 1);
-      assert.equal((await s.visit('old-friend')).status, 302);
-      assert.equal((await s.db.get("SELECT value FROM meta WHERE key = 'ip_hash_salt'")).value, 'salt-from-node-sqlite', 'the salt is kept, so visitor hashes still match');
-      assert.equal(await schemaVersion(s.db), '2', 'the version moved from PRAGMA user_version into meta');
-      assert.equal((await s.db.get('PRAGMA user_version')).user_version, 2, 'user_version is left as it was');
-    } finally {
-      await s.stop();
-    }
+    assert.equal(await deleteLink(db, link.id), 1);
+    assert.equal(await count('links', { id: link.id }), 0);
+    assert.equal(await count('clicks', { link_id: link.id }), 0, 'no orphaned clicks are left behind');
+    assert.equal(await count('visitors', { link_id: link.id }), 0, 'no orphaned visitors either');
+    assert.equal(await count('clicks', { link_id: other.id }), 1, 'other links keep theirs');
+    assert.equal(await count('visitors', { link_id: other.id }), 1);
+    assert.equal(await deleteLink(db, link.id), 0, 'deleting it again finds nothing');
 
-    const again = await startServer({ config: { dbPath: file } });
-    try {
-      const { json } = await again.request('GET', '/api/links/old-friend', { token });
-      assert.equal(json.link.clickCount, 3, 'the visit made after the switch was saved');
-      assert.equal(await count(again.db, 'SELECT COUNT(*) AS n FROM clicks'), 3);
-    } finally {
-      await again.stop();
-    }
-  });
-});
-
-describe('remote-safe data rules', () => {
-  it('deleting a link removes its clicks without relying on foreign keys', async () => {
-    const db = await openDatabase(':memory:');
-    try {
-      await db.execute('PRAGMA foreign_keys = OFF'); // as on a connection that does not enforce them
-      const link = await db.get(`INSERT INTO links (slug, domain, target_url, manage_token_hash, created_at, updated_at)
-                                 VALUES ('short-lived', 'localhost:3030', 'https://example.com/', 'abc', 1, 1) RETURNING id`);
-      for (let i = 0; i < 3; i += 1) await insertClick(db, { link_id: link.id, ts: i, visitor_hash: `v${i}`, device: 'desktop', outcome: 'redirect' });
-      assert.equal(await count(db, 'SELECT COUNT(*) AS n FROM clicks'), 3);
-      assert.equal(await deleteLink(db, link.id), 1);
-      assert.equal(await count(db, 'SELECT COUNT(*) AS n FROM links'), 0);
-      assert.equal(await count(db, 'SELECT COUNT(*) AS n FROM clicks'), 0, 'no orphaned clicks are left behind');
-      // A visit recorded after its link is gone stores nothing either.
-      await assert.rejects(insertClick(db, { link_id: link.id, ts: 9, visitor_hash: 'late', outcome: 'redirect' }), /no longer exists/);
-      assert.equal(await count(db, 'SELECT COUNT(*) AS n FROM clicks'), 0);
-    } finally {
-      db.close();
-    }
+    // A visit recorded after its link is gone stores nothing either.
+    await assert.rejects(insertClick(db, { link_id: link.id, ts: 9, visitor_hash: 'late', outcome: 'redirect' }), /no longer exists/);
+    assert.equal(await count('clicks', { link_id: link.id }), 0);
+    assert.equal(await count('visitors', { link_id: link.id }), 0);
   });
 
-  it('decides is_unique inside the insert, so a repeat visitor is never unique twice', async () => {
-    const db = await openDatabase(':memory:');
-    try {
-      const link = await db.get(`INSERT INTO links (slug, domain, target_url, manage_token_hash, created_at, updated_at)
-                                 VALUES ('repeat', 'localhost:3030', 'https://example.com/', 'abc', 1, 1) RETURNING id`);
-      const visit = (hash, extra = {}) => insertClick(db, { link_id: link.id, ts: 1, visitor_hash: hash, device: 'desktop', outcome: 'redirect', ...extra });
-      const rows = await Promise.all([visit('same'), visit('same'), visit('same', { is_bot: 1 }), visit('other'), visit(null)]);
-      assert.deepEqual(rows.map((r) => r.is_unique), [1, 0, 0, 1, 0]);
-      assert.ok(rows.every((r) => Number.isInteger(r.id) && typeof r.ts === 'number'), 'plain numbers, never BigInt');
-    } finally {
-      db.close();
-    }
+  it('a repeat visitor is only ever unique once, and only a counted click can be first', async () => {
+    const link = await insertLink(db, { ...LINK, slug: 'repeat' });
+    const visit = (hash, extra = {}) => insertClick(db, { link_id: link.id, ts: 1, visitor_hash: hash, device: 'desktop', outcome: 'redirect', ...extra });
+    const first = await visit('same');
+    const second = await visit('same');
+    const bot = await visit('bot-first', { is_bot: 1 });
+    const blocked = await visit('blocked-first', { outcome: 'expired' });
+    const other = await visit('other');
+    const anonymous = await visit(null);
+    assert.deepEqual([first, second, bot, blocked, other, anonymous].map((r) => r.is_unique), [1, 0, 0, 0, 1, 0]);
+    assert.ok([first, other].every((r) => Number.isInteger(r.id) && typeof r.ts === 'number' && !('_id' in r)), 'plain numbers, and no _id');
+    assert.equal((await visit('bot-first')).is_unique, 1, 'a bot or a blocked attempt before does not use up the first visit');
+    assert.equal((await visit('blocked-first')).is_unique, 1);
   });
 });
 
@@ -394,7 +269,7 @@ describe('toLinkDto with a legacy stored domain', () => {
   };
 
   it('maps an unknown stored domain to the current base host', () => {
-    const config = resolveConfig({ baseUrl: 'http://localhost:4000', dbPath: ':memory:', domains: ['cat.ly'], liveDomains: [] });
+    const config = resolveConfig({ baseUrl: 'http://localhost:4000', domains: ['cat.ly'], liveDomains: [] });
     const dto = toLinkDto(row, config, START_TIME);
     assert.equal(dto.domain, 'localhost:4000');
     assert.equal(dto.domainLive, true);
@@ -406,13 +281,39 @@ describe('toLinkDto with a legacy stored domain', () => {
   });
 
   it('reports first-release theme and preset ids under their new names', () => {
-    const config = resolveConfig({ dbPath: ':memory:' });
+    const config = resolveConfig({});
     const dto = toLinkDto({ ...row, qr_style: JSON.stringify({ preset: 'candy', logo: 'heart' }) }, config, START_TIME);
     assert.equal(dto.teaser.theme, 'hero', 'aurora is served as hero');
     assert.deepEqual(dto.qrStyle, flatLook('caption', { logo: 'heart' }), 'candy becomes the flat caption look, keeping the logo the user picked');
     assert.equal(toLinkDto({ ...row, teaser_theme: 'candy' }, config, START_TIME).teaser.theme, 'paper');
     assert.equal(toLinkDto({ ...row, teaser_theme: 'sky' }, config, START_TIME).teaser.theme, 'sky');
     assert.equal(toLinkDto({ ...row, qr_style: '{"logo":"cat"}' }, config, START_TIME).qrStyle.preset, undefined, 'a style without a preset stays without one');
+  });
+
+  it('serves every first-release theme and QR style found in storage under the comic ids', () => {
+    const config = resolveConfig({});
+    const style = (preset, extra = {}) => JSON.stringify({ preset, dotColor: '#111111', ...extra });
+    const stored = [
+      // stored theme, stored qr_style, expected theme, expected qrStyle (undefined = kept as stored)
+      ['aurora', style('aurora', { dotColor2: '#d62828', gradientType: 'linear' }), 'hero', flatLook('hero')],
+      ['sunset', style('sunset'), 'caption', flatLook('pop')],
+      ['ocean', style('ocean'), 'sky', flatLook('sky')],
+      ['neon', style('mono'), 'noir', flatLook('ink')],
+      ['candy', style('candy'), 'paper', flatLook('caption')],
+      ['hero', style('forest'), 'hero', flatLook('press')],
+      ['plaid', null, 'hero', null],
+      ['sky', '{not json', 'sky', null],
+      ['noir', style('custom'), 'noir', undefined],
+      ['paper', style('neon'), 'paper', flatLook('noir')],
+      // A caption and a centre logo the user picked survive; the preset's own old logo becomes the new preset's.
+      ['hero', style('aurora', { dotType: 'rounded', logo: 'cat', caption: 'Scan me' }), 'hero', flatLook('hero', { logo: 'cat', caption: 'Scan me' })],
+      ['noir', style('neon', { logo: 'bolt' }), 'noir', flatLook('noir', { logo: 'star' })],
+    ];
+    for (const [theme, qrStyle, expectedTheme, expectedStyle] of stored) {
+      const dto = toLinkDto({ ...row, teaser_theme: theme, qr_style: qrStyle }, config, START_TIME);
+      assert.equal(dto.teaser.theme, expectedTheme, `${theme}: teaser theme`);
+      assert.deepEqual(dto.qrStyle, expectedStyle === undefined ? JSON.parse(qrStyle) : expectedStyle, `${qrStyle}: QR style`);
+    }
   });
 });
 
@@ -425,7 +326,8 @@ describe('start-up', () => {
   }
 
   it('requests that arrive before the database is ready wait for it', async () => {
-    const instance = createApp({ config: { dbPath: ':memory:' } });
+    const mongodbDb = freshDatabaseName();
+    const instance = createApp({ config: { mongodbUri: await testMongoUri(), mongodbDb } });
     const { server, base } = await listen(instance);
     try {
       const res = await fetch(`${base}/api/links`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ targetUrl: 'https://example.com/cold' }) });
@@ -434,16 +336,15 @@ describe('start-up', () => {
     } finally {
       server.close();
       await instance.close();
+      await dropTestDatabase(mongodbDb);
     }
   });
 
-  it('a database that cannot be opened rejects `ready` and answers 503 until it can', async (t) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blip-broken-'));
-    const blocker = path.join(dir, 'not-a-folder');
-    fs.writeFileSync(blocker, 'a file where the data folder should be');
+  it('a database that cannot be reached rejects `ready` and answers 503 until it can', async (t) => {
     const errors = t.mock.method(console, 'error', () => {});
-    const instance = createApp({ config: { dbPath: path.join(blocker, 'blip.db') } });
-    await assert.rejects(instance.ready);
+    // Nothing listens on the discard port, so every attempt fails as soon as its time to find a server is up.
+    const instance = createApp({ config: { mongodbUri: 'mongodb://127.0.0.1:9/?directConnection=true', mongodbDb: 'blip_test_unreachable' }, databaseTimeoutMs: 100 });
+    await assert.rejects(instance.ready, (err) => err.name === 'MongoServerSelectionError');
     const { server, base } = await listen(instance);
     try {
       for (let i = 0; i < 2; i += 1) {
@@ -466,7 +367,19 @@ describe('start-up', () => {
     } finally {
       server.close();
       await instance.close();
-      await removeTempDir(dir);
+    }
+  });
+
+  it('a malformed connection string answers 503 too, instead of crashing on start-up', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const instance = createApp({ config: { mongodbUri: 'mongodb://', mongodbDb: 'blip_test_malformed' } });
+    await assert.rejects(instance.ready);
+    const { server, base } = await listen(instance);
+    try {
+      assert.equal((await fetch(`${base}/api/health`)).status, 503);
+    } finally {
+      server.close();
+      await instance.close();
     }
   });
 });
@@ -474,17 +387,19 @@ describe('start-up', () => {
 describe('shutdown', () => {
   it('close() closes the database, and tolerates one that is already closed', async () => {
     const s = await startServer();
+    const { db } = s;
     await s.stop();
-    await assert.rejects(s.db.get('SELECT 1'), /closed/i, 'the database is closed');
+    assert.equal(db.closed, true);
+    assert.throws(() => db.collection('links'), /closed/i, 'the database is closed');
     await assert.doesNotReject(s.close(), 'a second close() is a no-op');
 
     const closedElsewhere = await startServer();
-    closedElsewhere.db.close();
+    await closedElsewhere.db.close();
     await assert.doesNotReject(closedElsewhere.stop());
   });
 
   it('close() is safe while the database is still starting up', async () => {
-    const instance = createApp({ config: { dbPath: ':memory:' } });
+    const instance = createApp({ config: { mongodbUri: await testMongoUri(), mongodbDb: freshDatabaseName() } });
     await instance.close();
     await assert.rejects(instance.ready, /closed/i, 'start-up stops instead of using a closed database');
     await assert.doesNotReject(instance.close());

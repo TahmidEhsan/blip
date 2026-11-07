@@ -1,7 +1,8 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { MongoNetworkError, MongoServerError, MongoServerSelectionError } from 'mongodb';
 import { DATABASE_UNAVAILABLE_MESSAGE } from '../server/app.js';
-import { HOUR, UA, assertPlainCopy, blipData, startServer } from './helpers.js';
+import { HOUR, UA, assertPlainCopy, blipData, clickRowsOf, startServer } from './helpers.js';
 
 describe('visits (GET /:slug)', () => {
   let s;
@@ -10,8 +11,8 @@ describe('visits (GET /:slug)', () => {
   });
   after(() => s.stop());
 
-  const clickCount = async (slug) => (await s.db.get('SELECT click_count AS n FROM links WHERE slug = ?', [slug])).n;
-  const clickRows = (slug) => s.db.all('SELECT c.* FROM clicks c JOIN links l ON l.id = c.link_id WHERE l.slug = ? ORDER BY c.id', [slug]);
+  const clickCount = async (slug) => (await s.db.collection('links').findOne({ slug })).click_count;
+  const clickRows = (slug) => clickRowsOf(s.db, slug);
 
   it('instant links answer 302 with no-store and noindex', async () => {
     await s.createLink({ targetUrl: 'https://example.com/landing?utm=blip', slug: 'instant' });
@@ -87,7 +88,7 @@ describe('visits (GET /:slug)', () => {
   it('teaser pages use the new theme id for links stored with a first-release theme', async () => {
     await s.createLink({ targetUrl: 'https://example.com/themed', slug: 'old-theme', redirectMode: 'teaser', teaser: { style: 'countdown' } });
     for (const [legacy, current] of [['aurora', 'hero'], ['sunset', 'caption'], ['ocean', 'sky'], ['neon', 'noir'], ['candy', 'paper'], ['plaid', 'hero']]) {
-      await s.db.run('UPDATE links SET teaser_theme = ? WHERE slug = ?', [legacy, 'old-theme']);
+      await s.db.collection('links').updateOne({ slug: 'old-theme' }, { $set: { teaser_theme: legacy } });
       const res = await s.visit('old-theme');
       assert.equal(res.status, 200);
       assert.ok(res.text.includes(`data-theme="${current}"`), `${legacy} renders as ${current}`);
@@ -247,7 +248,7 @@ describe('visits with a slow geo provider', () => {
     const elapsed = performance.now() - started;
     assert.equal(res.status, 302);
     assert.ok(elapsed < 1000, `took ${elapsed.toFixed(0)} ms`);
-    const row = await s.db.get('SELECT country FROM clicks');
+    const row = await s.db.collection('clicks').findOne({});
     assert.equal(row.country, null);
   });
 });
@@ -259,7 +260,7 @@ describe('analytics failures never break a visit', () => {
     s = await startServer({
       geoLookup: async () => {
         if (mode === 'throw') throw new Error('geo provider exploded');
-        if (mode === 'delete') await s.db.run('DELETE FROM links WHERE slug = ?', ['gone']); // deleted mid-visit
+        if (mode === 'delete') await s.db.collection('links').deleteOne({ slug: 'gone' }); // deleted mid-visit
         return null;
       },
     });
@@ -269,7 +270,7 @@ describe('analytics failures never break a visit', () => {
   it('a link deleted (on any instance) before the visit is consumed answers 404 and stores nothing', async (t) => {
     const errors = t.mock.method(console, 'error', () => {});
     const { link } = await s.createLink({ targetUrl: 'https://example.com/gone', slug: 'gone', maxClicks: 5 });
-    const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', ['gone'])).id;
+    const linkId = (await s.db.collection('links').findOne({ slug: 'gone' })).id;
     mode = 'delete'; // deleted while the visit looks up its location, so after the lookup and before the consume
     const res = await s.visit('gone', { headers: { Accept: 'text/html' } });
     mode = 'ok';
@@ -277,7 +278,7 @@ describe('analytics failures never break a visit', () => {
     assert.equal(res.status, 404, 'not 410 "used up its clicks": the link was never clicked');
     assert.equal(blipData(res.text).slug, 'gone');
     assert.equal(errors.mock.callCount(), 0);
-    assert.equal((await s.db.get('SELECT COUNT(*) AS n FROM clicks WHERE link_id = ?', [linkId])).n, 0);
+    assert.equal(await s.db.collection('clicks').countDocuments({ link_id: linkId }), 0);
   });
 
   it('a link deleted while its blocked attempt is being recorded still gets its page', async (t) => {
@@ -300,8 +301,8 @@ describe('analytics failures never break a visit', () => {
     const res = await s.visit('geo-throws');
     mode = 'ok';
     assert.equal(res.status, 200);
-    const rows = await s.db.all('SELECT c.outcome, c.country FROM clicks c JOIN links l ON l.id = c.link_id WHERE l.slug = ?', ['geo-throws']);
-    assert.deepEqual(rows.map((r) => ({ ...r })), [{ outcome: 'teaser', country: null }]);
+    const rows = await clickRowsOf(s.db, 'geo-throws');
+    assert.deepEqual(rows.map(({ outcome, country }) => ({ outcome, country })), [{ outcome: 'teaser', country: null }]);
   });
 });
 
@@ -321,7 +322,7 @@ describe('visits with an injected geo provider', () => {
   it('stores the injected geo result', async () => {
     await s.createLink({ targetUrl: 'https://example.com/geo', slug: 'geo' });
     await s.visit('geo');
-    const row = await s.db.get('SELECT country, region, city, lat, lon FROM clicks');
+    const row = await s.db.collection('clicks').findOne({}, { projection: { _id: 0, country: 1, region: 1, city: 1, lat: 1, lon: 1 } });
     assert.deepEqual({ ...row }, { country: 'JP', region: '13', city: 'Tokyo', lat: 35.7, lon: 139.7 });
     assert.equal(seen.length, 1);
     assert.equal(seen[0].ip, '127.0.0.1', 'IPv4-mapped prefix stripped before lookup');
@@ -337,7 +338,7 @@ describe('database failures after start-up', () => {
     ({ manageToken } = await s.createLink({ targetUrl: 'https://example.com/db-down', slug: 'db-down' }));
   });
   after(() => {
-    delete s.db.execute;
+    delete s.db.collection;
     return s.stop();
   });
 
@@ -359,27 +360,34 @@ describe('database failures after start-up', () => {
     assert.equal(api.headers.get('retry-after'), '5');
     assert.deepEqual(api.json, { error: { code: 'unavailable', message: DATABASE_UNAVAILABLE_MESSAGE } });
     assert.equal(errors.mock.callCount(), 2);
-    for (const call of errors.mock.calls) assert.match(String(call.arguments[0]), /^\[blip\] database request failed \(in memory\): /);
+    for (const call of errors.mock.calls) assert.match(String(call.arguments[0]), new RegExp(`^\\[blip\\] database request failed \\(mongodb://127\\.0\\.0\\.1:\\d+, database ${s.db.name}\\): `));
   }
 
-  it('a database server error is answered with 503 unavailable (HTML for visitors, JSON for the API)', async (t) => {
-    // The instance property shadows Database#execute, which get/all/run go through.
-    s.db.execute = async () => {
-      throw Object.assign(new Error('SERVER_ERROR: Server returned HTTP status 502'), { code: 'SERVER_ERROR' });
+  it('a database going down (a failover, a shutdown) is answered with 503 unavailable (HTML for visitors, JSON for the API)', async (t) => {
+    // The instance property shadows Database#collection, which every query goes through.
+    s.db.collection = () => {
+      throw new MongoServerError({ message: 'not primary', code: 10107 });
     };
     await assertUnavailable(t);
   });
 
-  it('a network failure (fetch failed) is answered the same way', async (t) => {
-    s.db.execute = async () => {
-      throw new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+  it('a network failure is answered the same way', async (t) => {
+    s.db.collection = () => {
+      throw new MongoNetworkError('read ECONNRESET');
+    };
+    await assertUnavailable(t);
+  });
+
+  it('a server that cannot be found is answered the same way', async (t) => {
+    s.db.collection = () => {
+      throw new MongoServerSelectionError('Server selection timed out after 5000 ms', {});
     };
     await assertUnavailable(t);
   });
 
   it('any other error is still a 500 internal error', async (t) => {
     const errors = t.mock.method(console, 'error', () => {});
-    s.db.execute = async () => {
+    s.db.collection = () => {
       throw new Error('boom');
     };
     const res = await stats();
@@ -390,7 +398,7 @@ describe('database failures after start-up', () => {
   });
 
   it('works again as soon as the database answers', async () => {
-    delete s.db.execute;
+    delete s.db.collection;
     assert.equal((await page()).status, 302);
     assert.equal((await stats()).status, 200);
   });

@@ -1,7 +1,7 @@
 // Blip: server entry point (loadConfig() → createApp() → wait for the database → listen, with graceful shutdown).
 import { loadConfig } from './config.js';
-import { createApp, redactSecrets } from './app.js';
-import { describeDatabaseUrl } from './db.js';
+import { createApp, describeDatabaseFailure, redactSecrets } from './app.js';
+import { databaseFailureHint, describeDatabaseUrl } from './db.js';
 
 const SHUTDOWN_GRACE_MS = 5_000;
 
@@ -9,28 +9,25 @@ let config;
 try {
   config = loadConfig();
 } catch (err) {
-  console.error(`[blip] ${err.message}`);
+  // The message never quotes a value that could hold credentials; the mask is a second line of defence.
+  console.error(`[blip] ${redactSecrets(err.message)}`);
   process.exit(1);
 }
 
-if (!config.databaseUrl) {
-  // Only on Vercel settings (VERCEL set) without a database URL; a local run always has DB_PATH.
+if (!config.mongodbUri) {
   console.error(`[blip] ${config.databaseProblem}`);
   process.exit(1);
 }
 
-const database = describeDatabaseUrl(config.databaseUrl);
+const database = `${describeDatabaseUrl(config.mongodbUri)}, database ${config.mongodbDb}`;
 const { app, close, endStreams, ready } = createApp({ config });
 
 try {
   await ready;
 } catch (err) {
-  console.error(`[blip] Could not open the database (${database}): ${redactSecrets(err?.message || err, config)}`);
-  if (config.databaseUrl.startsWith('file:')) {
-    console.error('[blip] Check that DB_PATH points at a folder Blip can write to, or set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to use a hosted database.');
-  } else {
-    console.error('[blip] Check the database URL and its auth token (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN).');
-  }
+  // The message names the cluster's hosts and the database, never the credentials, then what to check.
+  console.error(`[blip] Could not open the database ${describeDatabaseFailure(err, config)}`);
+  if (!databaseFailureHint(err)) console.error("[blip] Check MONGODB_URI (host, user name and password) and the cluster's IP Access List in Atlas (Network Access).");
   await close();
   process.exit(1);
 }

@@ -1,754 +1,684 @@
-// Blip: storage through @libsql/client (SPEC §3). By default a local SQLite file (DB_PATH); with
-// TURSO_DATABASE_URL (or DATABASE_URL / LIBSQL_URL) a hosted libSQL database such as Turso.
+// Blip: storage on MongoDB through the official driver (SPEC §3).
 //
-// Every helper is async and returns plain objects, with numbers (never BigInt) for counts and ids.
-// Rules that keep a remote database correct, where each request may run on a different connection:
-//  - nothing relies on per-connection PRAGMAs: journal mode and busy timeout are local-file tuning only,
-//    and foreign keys may be off, so a link's clicks are deleted explicitly (deleteLink) and a click is
-//    only inserted while its link still exists (insertClick);
-//  - multi-statement work that must be atomic goes through one `batch(..., 'write')`. Interactive
-//    `client.transaction()` is never used: on a local file it opens a second connection, and on
-//    `:memory:` (one connection only) every other query is rejected while it is open;
-//  - the schema version lives in the `meta` table (key `schema_version`), and every migration step is
-//    idempotent and guarded, so two instances cold-starting at once can both run them.
+// Collections: links, clicks, visitors (one document per link and visitor, which decides is_unique),
+// counters (the numeric id sequences) and meta (salt, schema version, clicks epoch). Documents keep the
+// column names and the plain values the rest of the code expects: numbers for ids and timestamps, 0/1
+// for is_bot, is_synthetic and is_unique, null for "no value", and `_id` never leaves this layer.
 //
-// @libsql/client notes (verified with 0.18.0 on Node 22.17):
-//  - named parameters are sent with their `:` prefix (the local driver strips it, a server matches it);
-//  - `undefined` cannot be bound (we bind null) and JS numbers bind as REAL, which INTEGER columns store
-//    as integers;
-//  - a local `INSERT/UPDATE/DELETE ... RETURNING` reports rowsAffected 0, so it is normalised to the
-//    number of returned rows; lastInsertRowid comes back as a BigInt (or undefined) and is normalised too;
-//  - local files get one pooled connection (`concurrency: 1`) and a 3 s busy timeout on every connection
-//    the pool opens (the `timeout` option, in ms);
-//  - a server (libsql:, https:, wss:) is reached through `@libsql/client/web`, which is plain JavaScript
-//    (the same HTTP client the default entry picks for libsql: and https: URLs). The default entry loads
-//    the native `libsql` binary as soon as it is imported, and Vercel's file tracer can't follow that
-//    binary's platform-specific require, so it is only imported, lazily, when a local file is opened;
-//  - the HTTP client sends its requests without any time limit of its own (undici's defaults are 300 s,
-//    as long as a Vercel function may run), so every round trip to a server gets REMOTE_QUERY_TIMEOUT_MS
-//    through a `fetch` wrapper. A query that runs out of time rejects with a `TimeoutError` (not wrapped
-//    in a LibsqlError) and the client stays usable. A write that timed out may still have been applied.
-//    isDatabaseUnavailable() tells these failures (and the server's own 5xx answers) apart from bugs.
-import fs from 'node:fs';
-import path from 'node:path';
+// Rules that keep this correct across several instances of the function, with no transactions:
+//  - click and link ids come from a counters document ($inc, so they only grow) and are allocated before
+//    the row is inserted, so ids can land out of order: a live stream re-reads a window below its cursor
+//    (server/live.js). An insert that finds its id taken (the counters document was removed, say) raises
+//    the sequence to the highest stored id and tries once more under a new one;
+//  - consuming a visit is one guarded findOneAndUpdate, so racing visits can never exceed max_clicks. The
+//    click row is written after it: a crash in between loses that row (analytics), and never lets a
+//    visit through that was not consumed;
+//  - insertClick and insertClicks check that the link still exists after the insert, and deleteLink removes
+//    the link before its rows. Whichever order they interleave in, no row of a deleted link stays behind;
+//  - everything that runs at start-up is idempotent and safe when several cold starts race.
+//
+// One MongoClient per Database, which createApp builds once per process. It is created on first use, so
+// a malformed URI surfaces as a rejected `ready` instead of a crash at import time. isDatabaseUnavailable()
+// tells transport failures apart from bugs, and those become a 503.
 import crypto from 'node:crypto';
-import { createClient as createRemoteClient } from '@libsql/client/web';
-import { fileUrlFromPath } from './config.js';
-import { DEFAULT_TEASER_THEME, LEGACY_QR_PRESETS, LEGACY_TEASER_THEMES, TEASER_THEMES, upgradeLegacyQrStyle } from './themes.js';
+import { MongoClient } from 'mongodb';
+import { uriHasCredentials } from './config.js';
 
 /**
- * Schema versions (stored in meta.schema_version; databases made by the node:sqlite builds kept it in
- * PRAGMA user_version, which is read once as a fallback):
- *   1  initial schema
- *   2  teaser themes and QR presets renamed for the comic redesign (migrateLegacyThemeIds)
+ * Bumped whenever INDEXES changes (stored in meta under `schema_version`). A start-up that finds this
+ * version and every index in place only reads; otherwise it creates what is missing (see ensureIndexes).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 1;
 
-/** SQL fragment: a click that counts toward totals (real visit, not a bot, not blocked). */
-export const COUNTED_CLICK_SQL = `outcome IN ('redirect','teaser') AND is_bot = 0`;
+/** A click that counts toward totals (a real visit, not a bot, not blocked). */
+export const COUNTED_CLICK_FILTER = Object.freeze({ outcome: Object.freeze({ $in: Object.freeze(['redirect', 'teaser']) }), is_bot: 0 });
 
-const LOCAL_BUSY_TIMEOUT_MS = 3000;
-/** Longest one HTTP round trip to a database server may take (request and response body). */
-export const REMOTE_QUERY_TIMEOUT_MS = 8000;
-const RETURNING_RE = /\bRETURNING\b/i;
-const IN_LIST_CHUNK = 500;
+/**
+ * Longest one attempt at an operation may wait on its socket. The driver retries a failed read or write
+ * once (it is what makes a dropped connection or a failover invisible), so an operation can take about twice
+ * this on a stalled database: what a visitor waits for has its own limit (see withDeadline).
+ */
+export const QUERY_TIMEOUT_MS = 8000;
+/** Longest an operation may wait for a usable server. */
+export const SERVER_SELECTION_TIMEOUT_MS = 5000;
+/** Longest the server may work on an aggregation: it gives up, and answers so, before the socket gives up on it. */
+export const AGGREGATION_TIME_LIMIT_MS = QUERY_TIMEOUT_MS - 1000;
+const MAX_POOL_SIZE = 20;
+/** Connections idle this long are closed, so a quiet instance holds none open against the cluster's limit. */
+const MAX_IDLE_TIME_MS = 60_000;
 
-// The partial indexes below reuse COUNTED_CLICK_SQL verbatim: SQLite only picks a partial index when
-// the query's WHERE clause contains the index's WHERE terms, so the text must match the queries exactly.
-// The schema runs (idempotently) on every start, so existing databases pick up new indexes without a migration.
-// `ON DELETE CASCADE` is kept for databases that enforce foreign keys, but nothing depends on it.
-export const SCHEMA_STATEMENTS = Object.freeze([
-  'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
-  `CREATE TABLE IF NOT EXISTS links (
-  id                INTEGER PRIMARY KEY AUTOINCREMENT,
-  slug              TEXT NOT NULL UNIQUE,
-  domain            TEXT NOT NULL,
-  target_url        TEXT NOT NULL,
-  title             TEXT,
-  manage_token_hash TEXT NOT NULL,
-  redirect_mode     TEXT NOT NULL DEFAULT 'instant' CHECK (redirect_mode IN ('instant','teaser')),
-  teaser_seconds    INTEGER NOT NULL DEFAULT 5,
-  teaser_style      TEXT NOT NULL DEFAULT 'countdown' CHECK (teaser_style IN ('countdown','trivia','brand')),
-  teaser_message    TEXT,
-  teaser_theme      TEXT NOT NULL DEFAULT 'hero',
-  expires_at        INTEGER,
-  max_clicks        INTEGER,
-  click_count       INTEGER NOT NULL DEFAULT 0,
-  destroyed_at      INTEGER,
-  qr_style          TEXT,
-  created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL
-)`,
-  `CREATE TABLE IF NOT EXISTS clicks (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  link_id       INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
-  ts            INTEGER NOT NULL,
-  visitor_hash  TEXT,
-  is_unique     INTEGER NOT NULL DEFAULT 0,
-  country       TEXT,
-  region        TEXT,
-  city          TEXT,
-  lat           REAL,
-  lon           REAL,
-  device        TEXT NOT NULL DEFAULT 'desktop',
-  browser       TEXT,
-  os            TEXT,
-  referrer_host TEXT,
-  is_bot        INTEGER NOT NULL DEFAULT 0,
-  is_synthetic  INTEGER NOT NULL DEFAULT 0,
-  outcome       TEXT NOT NULL DEFAULT 'redirect' CHECK (outcome IN ('redirect','teaser','expired','bot-preview'))
-)`,
-  'CREATE INDEX IF NOT EXISTS idx_clicks_link_ts ON clicks(link_id, ts)',
-  'CREATE INDEX IF NOT EXISTS idx_clicks_link_visitor ON clicks(link_id, visitor_hash)',
-  `CREATE INDEX IF NOT EXISTS idx_clicks_link_counted ON clicks(link_id, visitor_hash) WHERE ${COUNTED_CLICK_SQL}`,
-  `CREATE INDEX IF NOT EXISTS idx_clicks_link_real_ts ON clicks(link_id, ts) WHERE ${COUNTED_CLICK_SQL} AND is_synthetic = 0`,
-]);
+const NO_ID = Object.freeze({ _id: 0 });
+
+/**
+ * Every index Blip's queries need:
+ *  - clicks.id_unique: the highest id of any link (throughClickId), and a guard on the id sequence;
+ *  - clicks.link_id: a live stream's poll, which reads one link's rows after a cursor;
+ *  - clicks.link_ts_id: the stats windows, the first click, and `recent` (newest by ts, then id) without
+ *    a blocking sort. It is `{ link_id, ts, id }` and not `{ link_id, ts }` for that sort;
+ *  - clicks.link_real_ts: the last real visit, which an exhausted link looks up on every blocked attempt
+ *    (only real counted clicks are in it, so the blocked rows after them are never walked).
+ */
+export const INDEXES = Object.freeze({
+  links: [
+    { key: { slug: 1 }, name: 'slug_unique', unique: true },
+    { key: { id: 1 }, name: 'id_unique', unique: true },
+  ],
+  clicks: [
+    { key: { id: 1 }, name: 'id_unique', unique: true },
+    { key: { link_id: 1, id: 1 }, name: 'link_id' },
+    { key: { link_id: 1, ts: 1, id: 1 }, name: 'link_ts_id' },
+    {
+      key: { link_id: 1, ts: 1 },
+      name: 'link_real_ts',
+      partialFilterExpression: { outcome: { $in: ['redirect', 'teaser'] }, is_bot: 0, is_synthetic: 0 },
+    },
+  ],
+  visitors: [
+    { key: { link_id: 1, visitor_hash: 1 }, name: 'link_visitor_unique', unique: true },
+  ],
+});
 
 // ---------------------------------------------------------------------------
 // URLs
 // ---------------------------------------------------------------------------
-export const isMemoryUrl = (url) => url === ':memory:' || /^file::memory:/i.test(String(url));
-/** A local SQLite file (not `:memory:`, not a server). */
-export const isFileUrl = (url) => /^file:/i.test(String(url)) && !isMemoryUrl(url);
 
-/** The filesystem path a `file:` URL points at (the same parsing @libsql/client applies). */
-export function filePathFromUrl(url) {
-  const match = /^file:(?:\/\/[^/?#]*)?([^?#]*)/i.exec(String(url));
-  let p = decodeURIComponent(match ? match[1] : '');
-  if (process.platform === 'win32' && /^\/[A-Za-z]:/.test(p)) p = p.slice(1);
-  return p;
-}
-
-/** A log-safe description of a database URL: no credentials, no query string (it can carry a token). */
+/** A log-safe description of a connection string: scheme and hosts, no credentials, no query string. */
 export function describeDatabaseUrl(url) {
   if (!url) return '(none)';
-  if (isMemoryUrl(url)) return 'in memory';
-  if (isFileUrl(url)) return path.resolve(filePathFromUrl(url));
-  const m = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/?#]*@)?([^/?#]*)/i.exec(String(url));
-  return m ? `${m[1].toLowerCase()}://${m[2]}` : 'a remote database';
+  const m = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/i.exec(String(url));
+  if (!m) return 'a remote database';
+  const afterCredentials = m[2].slice(m[2].lastIndexOf('@') + 1);
+  return `${m[1].toLowerCase()}://${afterCredentials.split(/[/?#]/)[0]}`;
+}
+
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+const closedError = () => Object.assign(new Error('The database is closed.'), { code: 'CLIENT_CLOSED' });
+
+// Driver errors that mean "the database could not be reached right now", as opposed to "this query is wrong".
+const UNAVAILABLE_ERROR_NAMES = new Set([
+  'MongoNetworkError', 'MongoNetworkTimeoutError', 'MongoServerSelectionError', 'MongoTopologyClosedError',
+  'MongoServerClosedError', 'MongoClientClosedError', 'MongoNotConnectedError', 'MongoPoolClosedError',
+  'MongoPoolClearedError', 'PoolClearedOnNetworkError', 'MongoWaitQueueTimeoutError', 'MongoOperationTimeoutError',
+  'MongoStalePrimaryError', 'MongoWriteConcernError', 'MongoExpiredSessionError', 'TimeoutError', 'AbortError',
+]);
+// Server error codes for the same thing: a failover or a node going down, a stalled operation, and
+// credentials or a tier that stopped working (AtlasError 8000 covers bad auth and an exceeded quota).
+const UNAVAILABLE_CODES = new Set([
+  6, 7, 13, 18, 50, 64, 89, 91, 133, 134, 189, 262, 391, 8000, 9001, 10058, 10107, 11600, 11602, 13435, 13436,
+]);
+const NETWORK_CODE_RE = /^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|ERR_SSL_|ERR_TLS_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_)/;
+
+/**
+ * True when an operation failed because the database could not be reached (server selection, a network
+ * error, a timeout, a failover, credentials it no longer accepts), as opposed to a bug or a constraint
+ * violation. Such failures are transient: Blip answers them with 503 `unavailable` and tries again on the
+ * next request. Looks through `cause` chains, because the driver wraps socket errors.
+ */
+export function isDatabaseUnavailable(err) {
+  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) {
+    if (UNAVAILABLE_ERROR_NAMES.has(e.name)) return true;
+    if (typeof e.code === 'number' && UNAVAILABLE_CODES.has(e.code)) return true;
+    if (typeof e.code === 'string' && (e.code === 'CLIENT_CLOSED' || NETWORK_CODE_RE.test(e.code))) return true;
+    if (typeof e.hasErrorLabel === 'function' && e.hasErrorLabel('RetryableWriteError')) return true;
+  }
+  return false;
+}
+
+/**
+ * What to check when the database can't be opened or used, for the failures people run into while setting
+ * Blip up. It goes into the log right after the driver's message and never contains a setting's value.
+ * @returns {string|null} null when there is nothing more specific to say than the error itself
+ */
+export function databaseFailureHint(err) {
+  const chain = [];
+  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) chain.push(e);
+  const any = (test) => chain.some((e) => test(e, String(e.message ?? '')));
+  if (any((e) => e.name === 'MongoParseError')) {
+    return 'Check MONGODB_URI: copy the connection string again from Atlas (Connect, then Drivers), and percent-encode special characters in the password.';
+  }
+  if (any((e, message) => e.code === 18 || /bad auth|authentication failed/i.test(message))) {
+    return 'The cluster refused the user name or password: compare MONGODB_URI (or MONGODB_USERNAME and MONGODB_PASSWORD) with the database user under Database Access in Atlas.';
+  }
+  if (any((e, message) => e.code === 13 || /not allowed to do action|not authorized/i.test(message))) {
+    return 'The database user may not use this database: give it the readWrite role on it under Database Access in Atlas.';
+  }
+  if (any((e, message) => e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' || /^query(srv|txt)\b/i.test(message))) {
+    return "The cluster's host name was not found: check the host in MONGODB_URI, and this machine's internet connection.";
+  }
+  if (any((e) => ['MongoServerSelectionError', 'MongoNetworkError', 'MongoNetworkTimeoutError', 'TimeoutError'].includes(e.name))) {
+    return "No server answered in time: check that the cluster is running and that its IP Access List (Network Access in Atlas) allows this address. Vercel's addresses change, so a deployment needs 0.0.0.0/0 there.";
+  }
+  return null;
+}
+
+/**
+ * The fields of the unique index a duplicate-key error is about: the server names them in `keyPattern`
+ * (and `keyValue`), and for a bulk write only in its message ("... index: id_unique dup key: { id: 7 }").
+ */
+function duplicateKeyFields(e) {
+  const key = e.keyPattern ?? e.keyValue;
+  if (key && typeof key === 'object') return Object.keys(key);
+  const fields = /dup key: \{(.*)\}/.exec(String(e.errmsg ?? e.message ?? ''))?.[1] ?? '';
+  return [...fields.matchAll(/(?:^|,)\s*([^\s:,]+):/g)].map((m) => m[1]);
+}
+
+/**
+ * A write lost to a unique index (a taken slug, a racing upsert). With `field`, only a duplicate on an
+ * index of that field counts: `isUniqueViolation(err, 'slug')` is a taken slug, `'id'` an id that was
+ * already stored.
+ */
+export function isUniqueViolation(err, field = null) {
+  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) {
+    if (e.code === 11000 || e.code === 11001) return typeof field !== 'string' || duplicateKeyFields(e).includes(field);
+  }
+  return false;
+}
+
+/**
+ * `promise`, or a rejection with a TimeoutError once `ms` have passed (isDatabaseUnavailable knows it). A
+ * write it gives up on may still be applied; that is accepted, because the visitor gets a prompt 503.
+ */
+export function withDeadline(promise, ms, message) {
+  let timer;
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(message), { name: 'TimeoutError' })), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 // ---------------------------------------------------------------------------
 // The database handle
 // ---------------------------------------------------------------------------
-const closedError = () => Object.assign(new Error('The database is closed.'), { code: 'CLIENT_CLOSED' });
 
-// Error codes that mean "the database could not be reached or is busy", not "this query is wrong":
-// LibsqlError codes from the HTTP client (a 5xx answer is SERVER_ERROR, a broken stream HRANA_*), our
-// own closed handle, and a local file that stayed locked past the busy timeout.
-const UNAVAILABLE_CODES = new Set([
-  'SERVER_ERROR', 'CLIENT_CLOSED', 'HRANA_CLOSED_ERROR', 'HRANA_WEBSOCKET_ERROR', 'HRANA_PROTO_ERROR', 'SQLITE_BUSY', 'SQLITE_LOCKED',
-]);
-const NETWORK_CODE_RE = /^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_)/;
-
-/**
- * True when a query failed because the database could not be reached (a timeout, a network error, a
- * 5xx from the server, a locked local file), as opposed to a bug or a constraint violation. Such
- * failures are transient: Blip answers them with 503 `unavailable` and tries again on the next request.
- * Looks through `cause` chains, because the HTTP client passes network errors on as they are (a
- * `TypeError: fetch failed` with the socket error as its cause) or wraps them in a closed-stream error.
- */
-export function isDatabaseUnavailable(err) {
-  for (let e = err, depth = 0; e && typeof e === 'object' && depth < 5; e = e.cause, depth += 1) {
-    if (typeof e.code === 'string' && (UNAVAILABLE_CODES.has(e.code) || NETWORK_CODE_RE.test(e.code))) return true;
-    if (e.name === 'TimeoutError' || e.name === 'AbortError') return true;
-    if (e instanceof TypeError && /fetch failed/i.test(e.message || '')) return true;
-  }
-  return false;
-}
-
-/** `fetch` for the HTTP client with a time limit on each request, response body included. */
-function boundedFetch(timeoutMs) {
-  return (input, init) => {
-    const timeout = AbortSignal.timeout(timeoutMs);
-    const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-    return fetch(input, { ...init, signal });
-  };
-}
-
-/** `{ sql, args }` with `:`-prefixed names, null for undefined and 1/0 for booleans. */
-function toStatement(input, args) {
-  let sql;
-  let values;
-  if (typeof input === 'string') {
-    sql = input;
-    values = args;
-  } else if (Array.isArray(input)) {
-    [sql, values] = input;
-  } else {
-    ({ sql, args: values } = input);
-  }
-  const bind = (v) => {
-    if (v === undefined) return null;
-    if (typeof v === 'boolean') return v ? 1 : 0;
-    return v;
-  };
-  if (values === undefined || values === null) return { sql, args: [] };
-  if (Array.isArray(values)) return { sql, args: values.map(bind) };
-  const named = {};
-  for (const [key, value] of Object.entries(values)) named[/^[:@$]/.test(key) ? key : `:${key}`] = bind(value);
-  return { sql, args: named };
-}
-
-/** A libSQL ResultSet → `{ rows: plain objects, columns, rowsAffected, lastInsertRowid }` with numbers only. */
-function normalizeResult(sql, result) {
-  const columns = [...result.columns];
-  const rows = result.rows.map((row) => {
-    const out = {};
-    columns.forEach((column, i) => {
-      if (Object.hasOwn(out, column)) return; // duplicate names: the first column wins, like libSQL's own rows
-      const value = row[i];
-      out[column] = typeof value === 'bigint' ? Number(value) : value;
-    });
-    return out;
-  });
-  const reported = Number(result.rowsAffected ?? 0);
-  const rowsAffected = reported === 0 && rows.length > 0 && RETURNING_RE.test(sql) ? rows.length : reported;
-  const id = result.lastInsertRowid;
-  return { rows, columns, rowsAffected, lastInsertRowid: id === undefined || id === null ? null : Number(id) };
-}
-
-let localDriver = null;
-/** The default @libsql/client entry, with the native driver for local files (imported once, on first use). */
-function loadLocalDriver() {
-  localDriver ??= import('@libsql/client').catch((err) => {
-    localDriver = null;
-    throw err;
-  });
-  return localDriver;
-}
-
-/**
- * One database: a thin, async wrapper around a libSQL client.
- * The client is created on first use, so a bad URL or an unreachable file surfaces as a rejected
- * query (and so as a rejected `ready` in createApp) instead of a crash at import time.
- */
+/** One database on one MongoClient. Nothing connects until the first operation. */
 export class Database {
   #client = null;
-  #opening = null; // the local client while its driver loads
-  #url;
-  #authToken;
-  #timeoutMs;
-  #closed = false;
+  #closing = null;
+  #uri;
+  #dbName;
+  #clientOptions;
+  #onClient;
 
   /**
-   * @param {{ url: string, authToken?: string|null, timeoutMs?: number }} options `timeoutMs` limits each
-   *   round trip to a server (REMOTE_QUERY_TIMEOUT_MS by default; local databases have no such limit)
+   * @param {{
+   *   uri: string,
+   *   dbName: string,
+   *   username?: string|null,
+   *   password?: string|null,
+   *   timeoutMs?: number,
+   *   clientOptions?: import('mongodb').MongoClientOptions,
+   *   onClient?: (client: MongoClient) => void,
+   * }} options `username` and `password` apply when the URI carries no credentials. `timeoutMs` replaces
+   *   QUERY_TIMEOUT_MS (and caps the time to find a server). `onClient` runs right after the client is
+   *   created (on Vercel, for attachDatabasePool).
    */
-  constructor({ url, authToken = null, timeoutMs = REMOTE_QUERY_TIMEOUT_MS }) {
-    this.#url = url; // private (a URL can carry a token), so logging or serialising the handle never shows it
-    this.#authToken = authToken || undefined;
-    this.#timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : REMOTE_QUERY_TIMEOUT_MS;
-    this.memory = isMemoryUrl(url);
-    this.file = isFileUrl(url);
-    /** A database in this process (a file or memory), as opposed to a server such as Turso. */
-    this.local = this.memory || this.file;
+  constructor({ uri, dbName, username = null, password = null, timeoutMs, clientOptions = {}, onClient = null }) {
+    const socketTimeoutMS = Number(timeoutMs) > 0 ? Number(timeoutMs) : QUERY_TIMEOUT_MS;
+    const selectionTimeoutMS = Math.min(socketTimeoutMS, SERVER_SELECTION_TIMEOUT_MS);
+    this.#uri = uri; // private (it carries credentials), so logging or serialising the handle never shows it
+    this.#dbName = dbName;
+    this.#onClient = onClient;
+    this.#clientOptions = {
+      appName: 'blip',
+      socketTimeoutMS,
+      serverSelectionTimeoutMS: selectionTimeoutMS,
+      connectTimeoutMS: selectionTimeoutMS,
+      waitQueueTimeoutMS: selectionTimeoutMS,
+      maxPoolSize: MAX_POOL_SIZE,
+      maxIdleTimeMS: MAX_IDLE_TIME_MS,
+      ...(username && password && !uriHasCredentials(uri) ? { auth: { username, password } } : {}),
+      ...clientOptions,
+    };
   }
 
-  /** The libSQL URL (may carry credentials: describe it with describeDatabaseUrl() before logging). */
-  get url() {
-    return this.#url;
+  /** The database's name on the cluster. */
+  get name() {
+    return this.#dbName;
   }
 
   get closed() {
-    return this.#closed;
+    return this.#closing !== null;
   }
 
-  async #getClient() {
-    if (this.#closed) throw closedError();
-    if (this.#client) return this.#client;
-    if (!this.local) {
-      this.#client = createRemoteClient({ url: this.url, authToken: this.#authToken, fetch: boundedFetch(this.#timeoutMs) });
-      return this.#client;
+  #getClient() {
+    if (this.closed) throw closedError(); // the driver itself would quietly reconnect
+    if (!this.#client) {
+      this.#client = new MongoClient(this.#uri, this.#clientOptions);
+      this.#onClient?.(this.#client);
     }
-    if (!this.#opening) {
-      const opening = this.#openLocal();
-      this.#opening = opening;
-      // A failed open is not cached (the folder may be fixed by the next attempt).
-      opening.catch(() => {
-        if (this.#opening === opening) this.#opening = null;
-      });
-    }
-    const client = await this.#opening;
-    if (this.#closed) throw closedError();
-    return client;
+    return this.#client;
   }
 
-  async #openLocal() {
-    if (this.file) fs.mkdirSync(path.dirname(path.resolve(filePathFromUrl(this.url))), { recursive: true });
-    const { createClient } = await loadLocalDriver();
-    const client = this.file
-      ? createClient({ url: this.url, concurrency: 1, timeout: LOCAL_BUSY_TIMEOUT_MS })
-      : createClient({ url: this.url });
-    if (this.#closed) {
-      // close() ran while the driver was loading
-      try {
-        client.close();
-      } catch {
-        // already closed
-      }
-      throw closedError();
-    }
-    this.#client = client;
-    return client;
+  /** A collection of this database. Throws once the handle is closed. */
+  collection(name) {
+    return this.#getClient().db(this.#dbName).collection(name);
   }
 
   /**
-   * Run one statement.
-   * @param {string|{sql: string, args?: any[]|object}|[string, any]} sql
-   * @param {any[]|object} [args] positional values, or named values for `:name` placeholders
-   * @returns {Promise<{ rows: object[], columns: string[], rowsAffected: number, lastInsertRowid: number|null }>}
+   * Connect, or join a connection attempt in progress. An operation would connect by itself, but when that
+   * first connection fails the driver's client keeps answering "Topology is closed" for good, while
+   * calling this again starts over. So start-up goes through here until it succeeds; once connected,
+   * the driver follows the cluster through network failures and failovers on its own.
    */
-  async execute(sql, args) {
-    const stmt = toStatement(sql, args);
-    const result = await (await this.#getClient()).execute(stmt);
-    return normalizeResult(stmt.sql, result);
+  async connect() {
+    await this.#getClient().connect();
   }
 
-  /** Every row. */
-  async all(sql, args) {
-    return (await this.execute(sql, args)).rows;
-  }
-
-  /** The first row, or null. */
-  async get(sql, args) {
-    return (await this.execute(sql, args)).rows[0] ?? null;
-  }
-
-  /** `{ rowsAffected, lastInsertRowid }`. */
-  async run(sql, args) {
-    const { rowsAffected, lastInsertRowid } = await this.execute(sql, args);
-    return { rowsAffected, lastInsertRowid };
-  }
-
-  /**
-   * Run statements in one transaction and one round trip: all of them or none of them.
-   * @param {Array<string|{sql: string, args?: any}|[string, any]>} statements
-   * @param {'write'|'read'|'deferred'} [mode] 'read' for independent reads that should see one snapshot
-   */
-  async batch(statements, mode = 'write') {
-    const stmts = statements.map((s) => toStatement(s));
-    if (!stmts.length) return [];
-    const results = await (await this.#getClient()).batch(stmts, mode);
-    return results.map((result, i) => normalizeResult(stmts[i].sql, result));
-  }
-
-  /** Close the client. Idempotent; queries after this reject. */
+  /** Close the client. Idempotent; operations after this reject. Resolves once its sockets are closed. */
   close() {
-    if (this.#closed) return;
-    this.#closed = true;
-    const client = this.#client;
-    this.#client = null;
-    this.#opening = null; // a client still being opened closes itself (see #openLocal)
-    try {
-      client?.close();
-    } catch {
-      // already closed
+    if (!this.#closing) {
+      const client = this.#client;
+      this.#client = null;
+      this.#closing = client ? client.close().catch(() => {}) : Promise.resolve();
     }
+    return this.#closing;
   }
 }
 
-/** @param {{ url: string, authToken?: string|null, timeoutMs?: number }} options */
+/** @param {ConstructorParameters<typeof Database>[0]} options */
 export function createDatabase(options) {
   return new Database(options);
 }
 
 /**
- * Tune a local file and run migrations. Safe to run again, and from several instances at once.
- * @param {Database} db
+ * An upsert on a unique key can lose a race with another one: the loser gets a duplicate-key error, and
+ * by then the document exists, so running it again finds it.
  */
-export async function prepareDatabase(db) {
-  // WAL is a property of the file, so setting it once is enough (and it is meaningless elsewhere).
-  if (db.file) await db.execute('PRAGMA journal_mode = WAL');
-  return migrate(db);
+async function retryOnDuplicateKey(operation, attempts = 3) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (attempt >= attempts || !isUniqueViolation(err)) throw err;
+    }
+  }
 }
 
-/**
- * Open a database by URL (`:memory:`, `file:...`, `libsql://...`) or local path (relative paths
- * resolve against the project root, like DB_PATH), with migrations applied.
- * @param {string} target
- * @param {{ authToken?: string|null }} [options]
- */
-export async function openDatabase(target, { authToken = null, timeoutMs } = {}) {
-  const url = target === ':memory:' || /^[a-z][a-z0-9+.-]+:/i.test(target) ? target : fileUrlFromPath(target);
-  const db = createDatabase({ url, authToken, timeoutMs });
+// ---------------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------------
+
+/** The names of a collection's indexes; none for a collection that does not exist (yet). */
+async function indexNames(db, name) {
   try {
-    await prepareDatabase(db);
+    return new Set((await db.collection(name).listIndexes().toArray()).map((index) => index.name));
   } catch (err) {
-    db.close();
+    if (err?.code === 26) return new Set(); // NamespaceNotFound: MongoDB creates a collection on its first write
     throw err;
   }
-  return db;
-}
-
-// ---------------------------------------------------------------------------
-// migrations
-// ---------------------------------------------------------------------------
-const SCHEMA_VERSION_SQL = "SELECT value FROM meta WHERE key = 'schema_version'";
-
-/** Never lowers a version another instance (or a newer build) already recorded. */
-const recordVersionStatement = (version) => ({
-  sql: `INSERT INTO meta (key, value) VALUES ('schema_version', :version)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)`,
-  args: { version: String(version) },
-});
-
-/** PRAGMA user_version of a database made by a node:sqlite build (0 when there is none or it can't be read). */
-async function legacyUserVersion(db) {
-  try {
-    const row = await db.get('PRAGMA user_version');
-    return Number(row?.user_version ?? 0) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-/** The name of every table and index SCHEMA_STATEMENTS creates. */
-const SCHEMA_OBJECTS = Object.freeze(SCHEMA_STATEMENTS.map((sql) => /^CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)/i.exec(sql)[1]));
-
-/**
- * The stored schema version when every table and index already exists, else null. One read batch, so
- * a cold start on an up-to-date database never takes the write lock. A database that can't be reached
- * rejects; one without a `meta` table yet just needs the full migration (null).
- */
-async function currentSchemaVersion(db) {
-  try {
-    const [objects, version] = await db.batch([
-      { sql: `SELECT COUNT(*) AS n FROM sqlite_master WHERE name IN (${SCHEMA_OBJECTS.map(() => '?').join(', ')})`, args: [...SCHEMA_OBJECTS] },
-      SCHEMA_VERSION_SQL,
-    ], 'read');
-    const stored = Number(version.rows[0]?.value);
-    return objects.rows[0]?.n === SCHEMA_OBJECTS.length && Number.isInteger(stored) ? stored : null;
-  } catch (err) {
-    if (isDatabaseUnavailable(err)) throw err;
-    return null;
-  }
 }
 
 /**
- * Create missing tables and indexes, then bring the data up to SCHEMA_VERSION.
- * Running it again is a no-op; two instances running it at once is safe. When the schema is already
- * complete and current (the usual cold start) it only reads; otherwise the DDL (all `IF NOT EXISTS`)
- * runs in one write batch, so a table or index added to SCHEMA_STATEMENTS is picked up on the next start.
+ * Create the indexes this build needs. Running it again is a no-op, and several cold starts running it at
+ * once is safe: creating an index that exists does nothing. It reads the stored schema version and the
+ * index names of every collection in INDEXES at once (one round trip), and when the version is current
+ * and every index is there (the usual cold start), that is all it does. Otherwise it creates the indexes of
+ * each collection that lacks one: a collection dropped in Atlas comes back on its next write with only
+ * `_id_`, and gets its indexes back on the next start. An older version is raised last, so a start-up that
+ * stops halfway is finished by the next one.
  * @returns {Promise<{ from: number, to: number }>} the version found and the version left behind
  */
-export async function migrate(db) {
-  const current = await currentSchemaVersion(db);
-  if (current !== null && current >= SCHEMA_VERSION) return { from: current, to: current };
-  const results = await db.batch([...SCHEMA_STATEMENTS, SCHEMA_VERSION_SQL], 'write');
-  const stored = results.at(-1).rows[0]?.value;
-  // Databases made by the node:sqlite builds have no meta.schema_version yet: their version is in PRAGMA user_version.
-  const from = stored === undefined ? await legacyUserVersion(db) : Number(stored) || 0;
-  if (from >= SCHEMA_VERSION) {
-    if (stored === undefined) await db.batch([recordVersionStatement(from)], 'write');
-    return { from, to: from };
-  }
-  if (from < 2) await migrateLegacyThemeIds(db, { recordVersion: 2 });
+export async function ensureIndexes(db) {
+  const meta = db.collection('meta');
+  const collections = Object.keys(INDEXES);
+  const [version, ...present] = await Promise.all([
+    meta.findOne({ _id: 'schema_version' }),
+    ...collections.map((name) => indexNames(db, name)),
+  ]);
+  const from = Number(version?.value) || 0;
+  const lacking = collections.filter((name, i) => INDEXES[name].some((index) => !present[i].has(index.name)));
+  if (from >= SCHEMA_VERSION && !lacking.length) return { from, to: from };
+  await Promise.all(lacking.map((name) => db.collection(name).createIndexes(INDEXES[name])));
+  if (from >= SCHEMA_VERSION) return { from, to: from };
+  await retryOnDuplicateKey(() => meta.updateOne({ _id: 'schema_version' }, { $max: { value: SCHEMA_VERSION } }, { upsert: true }));
   return { from, to: SCHEMA_VERSION };
 }
 
-const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
+/**
+ * Everything a database needs before it serves requests. Safe to run again after a failure, and from
+ * several instances at once.
+ * @param {Database} db
+ */
+export async function prepareDatabase(db) {
+  await db.connect();
+  return ensureIndexes(db);
+}
 
 /**
- * Rewrite stored teaser themes and QR presets from the first release's ids (aurora, sunset, ...)
- * to the comic redesign's ids. A QR style saved under an old preset id is that preset's old look
- * (gradients, rounded shapes), so it is replaced with the new preset's flat look; the caption and
- * a centre logo the user picked are kept (upgradeLegacyQrStyle in public/assets/js/qr-shared.js).
- * Idempotent: a second run finds nothing to change. A teaser theme that is neither current nor
- * legacy falls back to the default theme. `updated_at` is left alone because nobody edited the link.
- * The QR rewrites only apply while the row still holds the style that was read (compare-and-set), and
- * everything (plus the version bump, when asked) is written in one atomic batch, so a second instance
- * migrating at the same time changes nothing twice.
- * @param {{ recordVersion?: number|null }} [options] also record this schema version in the same batch
- * @returns {Promise<{ teaserThemes: number, qrPresets: number }>} rows changed
+ * The configured salt, or the one stored in `meta`, generating it on first use. When two instances start
+ * at once, the first upsert wins and both read that same salt back.
  */
-export async function migrateLegacyThemeIds(db, { recordVersion = null } = {}) {
-  const cases = Object.entries(LEGACY_TEASER_THEMES).map(([from, to]) => `WHEN ${sqlString(from)} THEN ${sqlString(to)}`).join(' ');
-  const statements = [`
-    UPDATE links SET teaser_theme = CASE teaser_theme ${cases} ELSE ${sqlString(DEFAULT_TEASER_THEME)} END
-    WHERE teaser_theme NOT IN (${TEASER_THEMES.map(sqlString).join(', ')})
-  `];
-  for (const row of await db.all(`SELECT id, qr_style FROM links WHERE qr_style LIKE '%"preset"%'`)) {
-    let style;
-    try {
-      style = JSON.parse(row.qr_style);
-    } catch {
-      continue; // unreadable styles are already ignored when links are serialised
-    }
-    const legacy = style && typeof style === 'object' && typeof style.preset === 'string' ? LEGACY_QR_PRESETS[style.preset] : undefined;
-    if (!legacy) continue;
-    statements.push({
-      sql: 'UPDATE links SET qr_style = :next WHERE id = :id AND qr_style = :previous',
-      args: { next: JSON.stringify(upgradeLegacyQrStyle(style)), id: row.id, previous: row.qr_style },
-    });
-  }
-  const qrCount = statements.length - 1;
-  if (recordVersion !== null) statements.push(recordVersionStatement(recordVersion));
-  const results = await db.batch(statements, 'write');
-  const qrPresets = results.slice(1, 1 + qrCount).reduce((sum, r) => sum + r.rowsAffected, 0);
-  return { teaserThemes: results[0].rowsAffected, qrPresets };
+export async function ensureIpHashSalt(db, configured) {
+  if (configured) return String(configured);
+  const meta = db.collection('meta');
+  const existing = await meta.findOne({ _id: 'ip_hash_salt' });
+  if (existing) return existing.value;
+  const salt = crypto.randomBytes(32).toString('hex');
+  const stored = await retryOnDuplicateKey(() => meta.findOneAndUpdate(
+    { _id: 'ip_hash_salt' },
+    { $setOnInsert: { value: salt } },
+    { upsert: true, returnDocument: 'after' },
+  ));
+  return stored.value;
 }
 
 // ---------------------------------------------------------------------------
 // Generic helpers
 // ---------------------------------------------------------------------------
-export function isUniqueViolation(err) {
-  if (!err) return false;
-  if (err.extendedCode === 'SQLITE_CONSTRAINT_UNIQUE' || err.extendedCode === 'SQLITE_CONSTRAINT_PRIMARYKEY') return true;
-  if (err.rawCode === 2067 || err.rawCode === 1555 || err.errcode === 2067 || err.errcode === 1555) return true;
-  if (/UNIQUE constraint failed/i.test(err.message || '')) return true;
-  return err.cause && err.cause !== err ? isUniqueViolation(err.cause) : false;
-}
-
 export const sha256Hex = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 
-// ---------------------------------------------------------------------------
-// meta
-// ---------------------------------------------------------------------------
-export async function getMeta(db, key) {
-  return (await db.get('SELECT value FROM meta WHERE key = :key', { key }))?.value ?? null;
-}
-
-export async function setMeta(db, key, value) {
-  await db.run('INSERT INTO meta (key, value) VALUES (:key, :value) ON CONFLICT(key) DO UPDATE SET value = excluded.value', { key, value: String(value) });
+/**
+ * Reserve `count` ids of a sequence (the `links` or the `clicks` ids). They only grow and are never reused.
+ * @returns {Promise<number>} the first id of the block
+ */
+export async function allocateIds(db, sequence, count = 1) {
+  const { seq } = await retryOnDuplicateKey(() => db.collection('counters').findOneAndUpdate(
+    { _id: sequence },
+    { $inc: { seq: count } },
+    { upsert: true, returnDocument: 'after' },
+  ));
+  return seq - count + 1;
 }
 
 /**
- * The configured salt, or the one stored in `meta`, generating it on first use. When two instances
- * start at once, the first insert wins and both read that same salt back.
+ * Raise a sequence to the highest id stored in its collection (each sequence is named after its
+ * collection). Its counters document only falls behind when the data was changed outside Blip: the
+ * document was removed, or documents were copied in without it.
  */
-export async function ensureIpHashSalt(db, configured) {
-  if (configured) return String(configured);
-  const existing = await getMeta(db, 'ip_hash_salt');
-  if (existing) return existing;
-  const [, stored] = await db.batch([
-    { sql: "INSERT INTO meta (key, value) VALUES ('ip_hash_salt', :salt) ON CONFLICT(key) DO NOTHING", args: { salt: crypto.randomBytes(32).toString('hex') } },
-    "SELECT value FROM meta WHERE key = 'ip_hash_salt'",
-  ], 'write');
-  return stored.rows[0].value;
+async function catchUpSequence(db, sequence) {
+  const [newest] = await db.collection(sequence).find({}, { projection: { _id: 0, id: 1 } }).sort({ id: -1 }).limit(1).toArray();
+  if (!newest) return;
+  await retryOnDuplicateKey(() => db.collection('counters').updateOne({ _id: sequence }, { $max: { seq: newest.id } }, { upsert: true }));
 }
+
+/**
+ * Insert documents numbered from their sequence (`docs[i].id`, collection and sequence share a name), in
+ * order: `one` sends the single document with insertOne, otherwise one ordered insertMany. When an id is
+ * already stored, the sequence has fallen behind (see catchUpSequence): it catches up, and the documents
+ * not stored yet are numbered again from a new block and inserted once more. A taken slug or any other
+ * failure is thrown as it is.
+ */
+async function insertNumbered(db, name, docs, { one = false } = {}) {
+  const insert = (batch) => (one ? db.collection(name).insertOne(batch[0]) : db.collection(name).insertMany(batch, { ordered: true }));
+  try {
+    await insert(docs);
+  } catch (err) {
+    if (!isUniqueViolation(err, 'id')) throw err;
+    const rest = docs.slice(err.result?.insertedCount ?? 0); // an ordered insert stops at the first taken id
+    await catchUpSequence(db, name);
+    const first = await allocateIds(db, name, rest.length);
+    rest.forEach((doc, i) => {
+      doc.id = first + i;
+    });
+    await insert(rest);
+  }
+}
+
+/** A stored document as the rest of the code sees it: without `_id`. */
+const stripId = ({ _id, ...row }) => row;
 
 // ---------------------------------------------------------------------------
 // links
 // ---------------------------------------------------------------------------
 export async function findLinkBySlug(db, slug) {
-  return db.get('SELECT * FROM links WHERE slug = :slug', { slug: String(slug) });
+  return db.collection('links').findOne({ slug: String(slug) }, { projection: NO_ID });
 }
 
 export async function findLinkById(db, id) {
-  return db.get('SELECT * FROM links WHERE id = :id', { id });
+  return db.collection('links').findOne({ id }, { projection: NO_ID });
 }
 
-/** Rows for many slugs in one round trip (per 500): Map slug → links row. */
+/** Documents for many slugs in one round trip: Map slug → link. */
 export async function findLinksBySlugs(db, slugs) {
-  const unique = [...new Set(slugs.map(String))];
-  const found = new Map();
-  for (let i = 0; i < unique.length; i += IN_LIST_CHUNK) {
-    const chunk = unique.slice(i, i + IN_LIST_CHUNK);
-    const rows = await db.all(`SELECT * FROM links WHERE slug IN (${chunk.map(() => '?').join(', ')})`, chunk);
-    for (const row of rows) found.set(row.slug, row);
-  }
-  return found;
+  const rows = await db.collection('links').find({ slug: { $in: [...new Set(slugs.map(String))] } }, { projection: NO_ID }).toArray();
+  return new Map(rows.map((row) => [row.slug, row]));
 }
 
 export async function slugTaken(db, slug) {
-  return Boolean(await db.get('SELECT 1 AS x FROM links WHERE slug = :slug', { slug: String(slug) }));
+  return Boolean(await db.collection('links').findOne({ slug: String(slug) }, { projection: { _id: 0, slug: 1 } }));
 }
 
-/** Which of these slugs are taken, in one round trip (per 500). */
+/** Which of these slugs are taken, in one round trip. */
 export async function takenSlugs(db, slugs) {
-  const unique = [...new Set(slugs.map(String))];
-  const taken = new Set();
-  for (let i = 0; i < unique.length; i += IN_LIST_CHUNK) {
-    const chunk = unique.slice(i, i + IN_LIST_CHUNK);
-    const rows = await db.all(`SELECT slug FROM links WHERE slug IN (${chunk.map(() => '?').join(', ')})`, chunk);
-    for (const row of rows) taken.add(row.slug);
-  }
-  return taken;
+  const rows = await db.collection('links').find({ slug: { $in: [...new Set(slugs.map(String))] } }, { projection: { _id: 0, slug: 1 } }).toArray();
+  return new Set(rows.map((row) => row.slug));
 }
 
 /**
- * @param {object} link snake_case column values (without id/click_count)
- * @returns {Promise<object>} the stored links row
+ * @param {object} link snake_case fields (without id/click_count)
+ * @returns {Promise<object>} the stored link
+ * @throws a duplicate-key error (`isUniqueViolation(err, 'slug')`) when the slug is taken. An id that is
+ *   already stored never is one: the id sequence catches up and the link gets the next free id.
  */
 export async function insertLink(db, link) {
-  return db.get(`
-    INSERT INTO links (slug, domain, target_url, title, manage_token_hash, redirect_mode, teaser_seconds, teaser_style,
-                       teaser_message, teaser_theme, expires_at, max_clicks, qr_style, created_at, updated_at)
-    VALUES (:slug, :domain, :target_url, :title, :manage_token_hash, :redirect_mode, :teaser_seconds, :teaser_style,
-            :teaser_message, :teaser_theme, :expires_at, :max_clicks, :qr_style, :created_at, :updated_at)
-    RETURNING *
-  `, {
+  const doc = {
+    id: await allocateIds(db, 'links'),
     slug: link.slug,
     domain: link.domain,
     target_url: link.target_url,
     title: link.title ?? null,
     manage_token_hash: link.manage_token_hash,
-    redirect_mode: link.redirect_mode,
-    teaser_seconds: link.teaser_seconds,
-    teaser_style: link.teaser_style,
+    redirect_mode: link.redirect_mode ?? 'instant',
+    teaser_seconds: link.teaser_seconds ?? 5,
+    teaser_style: link.teaser_style ?? 'countdown',
     teaser_message: link.teaser_message ?? null,
-    teaser_theme: link.teaser_theme,
+    teaser_theme: link.teaser_theme ?? 'hero',
     expires_at: link.expires_at ?? null,
     max_clicks: link.max_clicks ?? null,
+    click_count: 0,
+    destroyed_at: null,
     qr_style: link.qr_style ?? null,
     created_at: link.created_at,
     updated_at: link.updated_at,
-  });
+  };
+  await insertNumbered(db, 'links', [doc], { one: true });
+  return stripId(doc);
 }
 
-const UPDATABLE_COLUMNS = new Set([
+const UPDATABLE_FIELDS = new Set([
   'domain', 'target_url', 'title', 'redirect_mode', 'teaser_seconds', 'teaser_style', 'teaser_message',
   'teaser_theme', 'expires_at', 'max_clicks', 'qr_style', 'destroyed_at', 'updated_at',
 ]);
 
 /**
- * Update whitelisted columns of one link.
- * @returns {Promise<object|null>} the updated row (the current row when no column applies), or null when the link is gone
+ * Update whitelisted fields of one link.
+ * @returns {Promise<object|null>} the updated link (the current one when no field applies), or null when the link is gone
  */
 export async function updateLink(db, id, fields) {
-  const cols = Object.keys(fields).filter((k) => UPDATABLE_COLUMNS.has(k));
-  if (!cols.length) return findLinkById(db, id);
-  const params = { id };
-  for (const c of cols) params[c] = fields[c] ?? null;
-  return db.get(`UPDATE links SET ${cols.map((c) => `${c} = :${c}`).join(', ')} WHERE id = :id RETURNING *`, params);
+  const names = Object.keys(fields).filter((k) => UPDATABLE_FIELDS.has(k));
+  if (!names.length) return findLinkById(db, id);
+  const $set = Object.fromEntries(names.map((name) => [name, fields[name] ?? null]));
+  return db.collection('links').findOneAndUpdate({ id }, { $set }, { returnDocument: 'after', projection: NO_ID });
+}
+
+/** Remove every click and visitor of a link that no longer exists. Safe to repeat. */
+async function sweepLinkRows(db, linkId) {
+  await Promise.all([
+    db.collection('clicks').deleteMany({ link_id: linkId }),
+    db.collection('visitors').deleteMany({ link_id: linkId }),
+  ]);
 }
 
 /**
- * Delete a link and its clicks atomically, without relying on foreign-key cascades.
+ * Delete a link, then its clicks and visitors: with the link gone first, no new click can land (see
+ * insertClick for one already on its way).
  * @returns {Promise<number>} links deleted (0 or 1)
  */
 export async function deleteLink(db, id) {
-  const [, links] = await db.batch([
-    { sql: 'DELETE FROM clicks WHERE link_id = :id', args: { id } },
-    { sql: 'DELETE FROM links WHERE id = :id', args: { id } },
-  ], 'write');
-  return links.rowsAffected;
+  const { deletedCount } = await db.collection('links').deleteOne({ id });
+  await sweepLinkRows(db, id);
+  return deletedCount;
 }
 
 /**
- * Atomically consume one visit (SPEC §4.4 step 6): one guarded UPDATE, checked through rowsAffected.
- * @returns {Promise<{ consumed: boolean, link: object|null }>} the row as it is right after the visit was consumed
+ * Atomically consume one visit (SPEC §4.4 step 6): one guarded findOneAndUpdate, which changes the link
+ * only while it is active, so 30 racing visits for 3 remaining clicks consume exactly 3.
+ * @returns {Promise<{ consumed: boolean, link: object|null }>} the link as it is right after the visit was consumed
  */
 export async function consumeVisit(db, id, now) {
-  const { rows, rowsAffected } = await db.execute(consumeVisitStatement(id, now));
-  return { consumed: rowsAffected === 1, link: rows[0] ?? null };
-}
-
-/** The guarded UPDATE behind consumeVisit: it changes (and returns) the row only while the link is active. */
-function consumeVisitStatement(id, now) {
-  return {
-    sql: `
-      UPDATE links SET click_count = click_count + 1, updated_at = :now
-      WHERE id = :id AND destroyed_at IS NULL
-        AND (expires_at IS NULL OR expires_at > :now)
-        AND (max_clicks IS NULL OR click_count < max_clicks)
-      RETURNING *
-    `,
-    args: { id, now },
-  };
-}
-
-/**
- * Consume one visit and store its click row in one write batch: one round trip, and atomic, so a
- * visit is never counted without its click row (or the other way round), even when the request is
- * cancelled halfway. The INSERT only runs when the UPDATE just before it changed the link
- * (`changes() = 1` on the batch's connection), so a lost race stores nothing.
- * @param {object} click the click row (see insertClick), for link `id`
- * @returns {Promise<{ consumed: boolean, link: object|null, click: object|null }>} the link row right
- *   after the visit and the stored click row (both null when the visit was not consumed)
- */
-export async function consumeVisitAndRecordClick(db, id, now, click) {
-  const insert = insertClickStatement({ ...click, link_id: id });
-  const [consumed, stored] = await db.batch([
-    consumeVisitStatement(id, now),
-    { sql: INSERT_CLICK_AFTER_CONSUME_SQL, args: insert.args },
-  ], 'write');
-  const ok = consumed.rowsAffected === 1;
-  return { consumed: ok, link: ok ? consumed.rows[0] ?? null : null, click: ok ? stored.rows[0] ?? null : null };
+  const link = await db.collection('links').findOneAndUpdate(
+    {
+      id,
+      destroyed_at: null,
+      $and: [
+        { $or: [{ expires_at: null }, { expires_at: { $gt: now } }] },
+        { $or: [{ max_clicks: null }, { $expr: { $lt: ['$click_count', '$max_clicks'] } }] },
+      ],
+    },
+    { $inc: { click_count: 1 }, $set: { updated_at: now } },
+    { returnDocument: 'after', projection: NO_ID },
+  );
+  return { consumed: link !== null, link };
 }
 
 // ---------------------------------------------------------------------------
 // clicks
 // ---------------------------------------------------------------------------
-const CLICK_COLUMNS = [
-  'link_id', 'ts', 'visitor_hash', 'is_unique', 'country', 'region', 'city', 'lat', 'lon', 'device',
-  'browser', 'os', 'referrer_host', 'is_bot', 'is_synthetic', 'outcome',
-];
-const CLICK_VALUE_COLUMNS = CLICK_COLUMNS.filter((c) => c !== 'is_unique');
 
-// One statement, so it is atomic on any connection: `is_unique` is decided against the clicks already
-// stored (a counted click whose visitor has no earlier counted click on this link), and nothing is
-// inserted when the link no longer exists (whether or not foreign keys are enforced).
-const INSERT_CLICK_SQL = `
-  INSERT INTO clicks (${CLICK_COLUMNS.join(', ')})
-  SELECT :link_id, :ts, :visitor_hash,
-         CASE WHEN :check_unique = 1 AND NOT EXISTS (
-           SELECT 1 FROM clicks WHERE link_id = :link_id AND visitor_hash = :visitor_hash AND ${COUNTED_CLICK_SQL}
-         ) THEN 1 ELSE 0 END,
-         ${CLICK_VALUE_COLUMNS.slice(3).map((c) => `:${c}`).join(', ')}
-  WHERE EXISTS (SELECT 1 FROM links WHERE id = :link_id)
-  RETURNING *
-`;
-
-/** INSERT_CLICK_SQL for consumeVisitAndRecordClick: only after the guarded UPDATE before it changed the link. */
-const INSERT_CLICK_AFTER_CONSUME_SQL = INSERT_CLICK_SQL.replace('WHERE EXISTS', 'WHERE changes() = 1 AND EXISTS');
-
-/** The insert statement for one click row. */
-export function insertClickStatement(click) {
-  const args = {};
-  for (const c of CLICK_VALUE_COLUMNS) args[c] = click[c] ?? null;
-  args.is_bot = click.is_bot ? 1 : 0;
-  args.is_synthetic = click.is_synthetic ? 1 : 0;
-  args.device = click.device || 'other';
-  args.outcome = click.outcome || 'redirect';
-  const counted = (args.outcome === 'redirect' || args.outcome === 'teaser') && args.is_bot === 0;
-  args.check_unique = counted && args.visitor_hash ? 1 : 0;
-  return { sql: INSERT_CLICK_SQL, args };
+/** The stored shape of a click (everything but `id` and `is_unique`). */
+function clickFields(click) {
+  return {
+    link_id: click.link_id,
+    ts: click.ts,
+    visitor_hash: click.visitor_hash ?? null,
+    country: click.country ?? null,
+    region: click.region ?? null,
+    city: click.city ?? null,
+    lat: click.lat ?? null,
+    lon: click.lon ?? null,
+    device: click.device || 'other',
+    browser: click.browser ?? null,
+    os: click.os ?? null,
+    referrer_host: click.referrer_host ?? null,
+    is_bot: click.is_bot ? 1 : 0,
+    is_synthetic: click.is_synthetic ? 1 : 0,
+    outcome: click.outcome || 'redirect',
+  };
 }
+
+/** Does this click decide a first visit? Only a counted click with a visitor hash does. */
+const decidesFirstVisit = (row) => (row.outcome === 'redirect' || row.outcome === 'teaser') && row.is_bot === 0 && Boolean(row.visitor_hash);
+
+/**
+ * True when this is the visitor's first counted click on the link. The upsert decides: exactly one of any
+ * number of racing visits inserts the document, and a loser's duplicate-key error means "not first".
+ */
+async function recordFirstVisit(db, row) {
+  if (!decidesFirstVisit(row)) return false;
+  try {
+    const { upsertedCount } = await db.collection('visitors').updateOne(
+      { link_id: row.link_id, visitor_hash: row.visitor_hash },
+      { $setOnInsert: { is_synthetic: row.is_synthetic } },
+      { upsert: true },
+    );
+    return upsertedCount === 1;
+  } catch (err) {
+    if (isUniqueViolation(err)) return false;
+    throw err;
+  }
+}
+
+const linkExists = async (db, linkId) => Boolean(await db.collection('links').findOne({ id: linkId }, { projection: { _id: 0, id: 1 } }));
 
 const linkGone = (linkId) => Object.assign(new Error(`link ${linkId} no longer exists`), { code: 'LINK_GONE' });
 
 /**
- * Insert one click row; `is_unique` is computed by the database.
- * @returns {Promise<object>} the stored row (with id)
- * @throws when the link was deleted meanwhile (nothing is stored)
+ * Insert one click; `is_unique` is decided through the visitors collection. The link is checked after
+ * the insert: deleteLink removes the link before its rows, so a row that lands after that sweep finds the
+ * link gone here and removes itself, and a row that lands before it is swept.
+ * @returns {Promise<object>} the stored click (with id)
+ * @throws when the link was deleted meanwhile (nothing stays stored)
  */
 export async function insertClick(db, click) {
-  const row = await db.get(insertClickStatement(click));
-  if (!row) throw linkGone(click.link_id);
-  return row;
+  const row = clickFields(click);
+  const [id, first] = await Promise.all([allocateIds(db, 'clicks'), recordFirstVisit(db, row)]);
+  const doc = { id, ...row, is_unique: first ? 1 : 0 };
+  await insertNumbered(db, 'clicks', [doc], { one: true });
+  if (!(await linkExists(db, row.link_id))) {
+    await sweepLinkRows(db, row.link_id);
+    throw linkGone(row.link_id);
+  }
+  return stripId(doc);
 }
 
 /**
- * Insert many click rows in order, atomically and in one round trip (each sees the ones before it,
- * so `is_unique` works across the batch).
- * @returns {Promise<object[]>} the stored rows (none when the link is gone)
+ * The first visits among rows of one link, in row order (each row sees the ones before it).
+ * @returns {Promise<Set<number>>} indexes of the rows that are a visitor's first counted click
+ */
+async function recordFirstVisits(db, rows) {
+  const firstRowOf = new Map();
+  rows.forEach((row, i) => {
+    if (decidesFirstVisit(row) && !firstRowOf.has(row.visitor_hash)) firstRowOf.set(row.visitor_hash, i);
+  });
+  if (!firstRowOf.size) return new Set();
+  const candidates = [...firstRowOf.values()];
+  const operations = candidates.map((i) => ({
+    updateOne: {
+      filter: { link_id: rows[i].link_id, visitor_hash: rows[i].visitor_hash },
+      update: { $setOnInsert: { is_synthetic: rows[i].is_synthetic } },
+      upsert: true,
+    },
+  }));
+  let result;
+  try {
+    result = await db.collection('visitors').bulkWrite(operations, { ordered: false });
+  } catch (err) {
+    // Racing upserts lose with a duplicate key ("not first"); anything else is a real failure.
+    if (!err.result || err.writeConcernError || ![err.writeErrors ?? []].flat().every((e) => isUniqueViolation(e))) throw err;
+    ({ result } = err);
+  }
+  return new Set(Object.keys(result.upsertedIds).map((operation) => candidates[Number(operation)]));
+}
+
+/**
+ * Insert many clicks of one link in order (each sees the ones before it, so `is_unique` works across the
+ * batch): their ids and visitors first, then all rows in one insert, then the same check as insertClick.
+ * @returns {Promise<object[]>} the stored clicks (none when the link is gone)
  */
 export async function insertClicks(db, clicks) {
-  const results = await db.batch(clicks.map(insertClickStatement), 'write');
-  return results.map((r) => r.rows[0]).filter(Boolean);
+  if (!clicks.length) return [];
+  const rows = clicks.map(clickFields);
+  const linkId = rows[0].link_id;
+  const [firstId, firsts] = await Promise.all([allocateIds(db, 'clicks', rows.length), recordFirstVisits(db, rows)]);
+  const docs = rows.map((row, i) => ({ id: firstId + i, ...row, is_unique: firsts.has(i) ? 1 : 0 }));
+  await insertNumbered(db, 'clicks', docs);
+  if (!(await linkExists(db, linkId))) {
+    await sweepLinkRows(db, linkId);
+    return [];
+  }
+  return docs.map(stripId);
 }
 
 /**
- * `meta` key counting deletions of click rows from links that still exist. Live streams keep running
- * totals (server/live.js) and read this with every poll: when it moves, they recount instead of
- * advancing totals that now include deleted rows. Deleting a whole link needs no bump (its streams end).
+ * `meta` key counting deletions of clicks from links that still exist. Live streams keep running totals
+ * (server/live.js) and read this with every poll: when it moves, they recount instead of advancing
+ * totals that now include deleted rows. Deleting a whole link needs no bump (its streams end).
  */
 export const CLICKS_EPOCH_KEY = 'clicks_epoch';
 
-/** Delete a link's simulated clicks and bump CLICKS_EPOCH_KEY, atomically. @returns {Promise<number>} rows deleted */
+/**
+ * Delete a link's simulated clicks and their visitors, then bump CLICKS_EPOCH_KEY. In that order: a
+ * stream that sees the new epoch recounts rows that are already gone.
+ * @returns {Promise<number>} clicks deleted
+ */
 export async function deleteSyntheticClicks(db, linkId) {
-  const [deleted] = await db.batch([
-    { sql: 'DELETE FROM clicks WHERE link_id = :linkId AND is_synthetic = 1', args: { linkId } },
-    `INSERT INTO meta (key, value) VALUES ('${CLICKS_EPOCH_KEY}', '1')
-     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
-  ], 'write');
-  return deleted.rowsAffected;
+  const [{ deletedCount }] = await Promise.all([
+    db.collection('clicks').deleteMany({ link_id: linkId, is_synthetic: 1 }),
+    db.collection('visitors').deleteMany({ link_id: linkId, is_synthetic: 1 }),
+  ]);
+  await retryOnDuplicateKey(() => db.collection('meta').updateOne({ _id: CLICKS_EPOCH_KEY }, { $inc: { value: 1 } }, { upsert: true }));
+  return deletedCount;
 }
 
 /** Timestamp of the last real consumed visit (used for "expired at" on click-limited links). */
 export async function lastConsumedClickTs(db, linkId) {
-  return (await db.get(`SELECT MAX(ts) AS ts FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND is_synthetic = 0`, { linkId }))?.ts ?? null;
+  const row = await db.collection('clicks').findOne(
+    { link_id: linkId, ...COUNTED_CLICK_FILTER, is_synthetic: 0 },
+    { sort: { ts: -1 }, projection: { _id: 0, ts: 1 } },
+  );
+  return row?.ts ?? null;
 }

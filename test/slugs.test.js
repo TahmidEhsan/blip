@@ -5,8 +5,9 @@ import {
   validateSlug, wordSlug,
 } from '../server/slugs.js';
 import { ADJECTIVES, NOUNS } from '../server/words.js';
-import { openDatabase, insertLink } from '../server/db.js';
+import { insertLink } from '../server/db.js';
 import { LINK_DEFAULTS } from '../server/links.js';
+import { closeTestDatabase, openTestDatabase } from './helpers.js';
 
 describe('slugs', () => {
   let db;
@@ -15,9 +16,9 @@ describe('slugs', () => {
   });
 
   before(async () => {
-    db = await openDatabase(':memory:');
+    db = await openTestDatabase();
   });
-  after(() => db.close());
+  after(() => closeTestDatabase(db));
 
   it('normalizes per SPEC §4.1', () => {
     assert.equal(normalizeSlug('Summer Sale 2026!'), 'summer-sale-2026');

@@ -16,7 +16,7 @@ export const EXPIRES_IN_MIN_SECONDS = 60;
 export const EXPIRES_IN_MAX_SECONDS = 157_680_000; // 5 × 365 days
 const MAX_EXPIRY_MS = EXPIRES_IN_MAX_SECONDS * 1000;
 
-/** Column defaults for a new link (mirrors the SQL defaults). */
+/** Field defaults for a new link. */
 export const LINK_DEFAULTS = Object.freeze({
   title: null,
   redirect_mode: 'instant',

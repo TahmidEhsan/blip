@@ -11,8 +11,10 @@ export const DEFAULT_STREAM_POLL_MS = 2_000;
 /** On Vercel a live stream ends cleanly after this long (STREAM_MAX_MS), before the function's 300 s limit cuts it. */
 export const VERCEL_STREAM_MAX_MS = 250_000;
 
-/** Why a Vercel deployment has no database (logged once per instance; never contains a URL or token). */
-export const VERCEL_NO_DATABASE_PROBLEM = 'No database is configured. Add Turso from the Vercel Marketplace and connect a database to this project (it sets TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; give Preview its own database so previews never change production data), then redeploy.';
+/** Why a Vercel deployment has no database (logged once per instance; never contains a URL or password). */
+export const VERCEL_NO_DATABASE_PROBLEM = "No database is configured. Add MONGODB_URI (the cluster's connection string from MongoDB Atlas) to this project's environment variables in Vercel, then redeploy. Production uses the database blip and Preview blip_preview, so previews never change production data (MONGODB_DB overrides the name).";
+/** Why a local run has no database (`npm start` prints it and exits). */
+export const LOCAL_NO_DATABASE_PROBLEM = 'No database is configured. Put your MongoDB connection string in a file named .env in the project folder, as a line MONGODB_URI=mongodb+srv://... (or set MONGODB_URI in your shell), then run npm start again. Local runs use the database blip_dev.';
 
 const DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::\d{1,5})?$/;
 
@@ -28,11 +30,18 @@ function parseBoolean(value, fallback) {
 
 const isBlank = (value) => value === undefined || value === null || String(value).trim() === '';
 
+/**
+ * A setting's value as an error message shows it: quoted, unless it could hold a user name or password
+ * (anything with an '@', such as a connection string pasted into the wrong variable). Then the message
+ * names only the variable, as checkMongoUri does. URL credentials always end at a literal '@'.
+ */
+const shown = (value) => (String(value ?? '').includes('@') ? '' : ` "${String(value ?? '').trim()}"`);
+
 function parsePort(value, fallback) {
   if (isBlank(value)) return fallback;
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0 || n > 65535) {
-    throw new Error(`Invalid PORT "${value}": expected an integer between 0 and 65535.`);
+    throw new Error(`Invalid PORT${shown(value)}: expected an integer between 0 and 65535.`);
   }
   return n;
 }
@@ -42,7 +51,7 @@ function parseMilliseconds(value, fallback, { name, min, max }) {
   if (isBlank(value)) return fallback;
   const n = Number(value);
   if (!Number.isInteger(n) || n < min || n > max) {
-    throw new Error(`Invalid ${name} "${value}": expected a whole number of milliseconds between ${min} and ${max}.`);
+    throw new Error(`Invalid ${name}${shown(value)}: expected a whole number of milliseconds between ${min} and ${max}.`);
   }
   return n;
 }
@@ -89,13 +98,13 @@ export function normalizeBaseUrl(value) {
   try {
     url = new URL(String(value).trim());
   } catch {
-    throw new Error(`Invalid BASE_URL "${value}": expected something like http://localhost:3030`);
+    throw new Error(`Invalid BASE_URL${shown(value)}: expected something like http://localhost:3030`);
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`Invalid BASE_URL "${value}": only http and https are supported.`);
+    throw new Error(`Invalid BASE_URL${shown(value)}: only http and https are supported.`);
   }
   if (url.username || url.password || url.search || url.hash) {
-    throw new Error(`Invalid BASE_URL "${value}": it must not contain credentials, a query or a hash.`);
+    throw new Error(`Invalid BASE_URL${shown(value)}: it must not contain credentials, a query or a hash.`);
   }
   // WHATWG URL already lowercases the host and drops default ports.
   return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
@@ -120,96 +129,107 @@ export function normalizeDomainList(value, baseHost = '') {
   return out;
 }
 
-function resolveDbPath(value) {
-  const v = value === undefined || value === null || String(value).trim() === '' ? './data/blip.db' : String(value).trim();
-  if (v === ':memory:') return v;
-  return path.resolve(PROJECT_ROOT, v);
+const MONGODB_SCHEME_RE = /^mongodb(\+srv)?:\/\//i;
+
+/** True when a connection string carries a user name of its own (`scheme://user[:password]@hosts`). */
+export function uriHasCredentials(uri) {
+  return /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(String(uri ?? ''));
 }
 
 /**
- * `file:` URL for a database file, as @libsql/client expects it. Relative paths resolve against the
- * project root (like DB_PATH always has). Windows paths keep their drive letter (`C:\blip\x.db` gives
- * `file:///C:/blip/x.db`); every path segment is percent-encoded, so spaces, `#`, `?` and `%` survive.
- * @param {string} filePath
- * @param {typeof path} [pathApi] path.win32 or path.posix (defaults to this platform's)
+ * Validate a connection string: it must start with mongodb+srv:// or mongodb:// (a scheme written in
+ * capitals is lowercased, as the driver accepts only lowercase). The error messages name the variable
+ * and at most the scheme, never the string itself, which carries credentials. A scheme is only named
+ * when `://` follows it, so the user name of a string pasted without its scheme ("user:pass@host") is
+ * never mistaken for one.
  */
-export function fileUrlFromPath(filePath, pathApi = path) {
-  const absolute = pathApi.resolve(PROJECT_ROOT, String(filePath));
-  const segments = absolute.split(pathApi.sep).map((segment, i) => (
-    i === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)
-  ));
-  const urlPath = segments.join('/');
-  // POSIX "/var/x.db" → "file:///var/x.db"; Windows "C:/x.db" → "file:///C:/x.db"; UNC "//host/share" → "file:////host/share".
-  return urlPath.startsWith('/') ? `file://${urlPath}` : `file:///${urlPath}`;
-}
-
-/** DB_PATH (already resolved) → the libSQL URL for it; `:memory:` stays in memory. */
-export function databaseUrlFromPath(dbPath) {
-  return dbPath === ':memory:' ? ':memory:' : fileUrlFromPath(dbPath);
-}
-
-/** Environment variables naming a hosted libSQL database, in priority order, with their token variable. */
-export const DATABASE_URL_VARIABLES = Object.freeze([
-  ['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN'],
-  ['DATABASE_URL', 'DATABASE_AUTH_TOKEN'],
-  ['LIBSQL_URL', 'LIBSQL_AUTH_TOKEN'],
-]);
-
-const LIBSQL_SCHEMES = new Set(['libsql', 'https', 'http', 'wss', 'ws', 'file']);
-
-/**
- * Validate a database URL from the environment. Error messages name the variable and the scheme only,
- * never the URL itself (it can carry credentials). With `serverOnly` (on Vercel) a local database
- * (`file:` or `:memory:`) is refused too: the function's files are read-only, every instance would get
- * its own copy, and the native driver a local file needs is not part of the deployed function.
- */
-export function checkDatabaseUrl(value, name = 'DATABASE_URL', { serverOnly = false } = {}) {
-  const url = String(value).trim();
-  const scheme = url === ':memory:' ? 'memory' : /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
-  if (serverOnly && (scheme === 'file' || scheme === 'memory')) {
-    throw new Error(`Invalid ${name}: a local database (${scheme === 'file' ? 'a file: URL' : ':memory:'}) can't be used on Vercel. Blip needs a hosted libSQL database such as Turso (libsql:// or https://).`);
-  }
-  if (url === ':memory:') return url;
-  if (!scheme) throw new Error(`Invalid ${name}: expected a libsql://, https:// or file: URL.`);
-  if (!LIBSQL_SCHEMES.has(scheme)) {
-    throw new Error(`Invalid ${name}: "${scheme}:" URLs are not supported. Blip needs a libSQL database such as Turso (libsql://, https:// or file:).`);
-  }
-  return url;
-}
-
-/**
- * Where the data lives: TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN), then DATABASE_URL (+ DATABASE_AUTH_TOKEN),
- * then LIBSQL_URL (+ LIBSQL_AUTH_TOKEN), else the local SQLite file at DB_PATH.
- * On Vercel there is no file to fall back to (the filesystem is read-only and every instance would get
- * its own copy), a `file:` or `:memory:` URL is refused for the same reason, and a URL Blip can't use is
- * skipped rather than fatal: all of these leave `databaseUrl` null and say why in `databaseProblem`, so
- * the app still starts and answers 503 `database_not_configured`.
- * @returns {{ databaseUrl: string|null, databaseAuthToken: string|null, databaseProblem: string|null }}
- */
-function resolveDatabase(env, dbPath, onVercel) {
-  const problems = [];
-  for (const [urlName, tokenName] of DATABASE_URL_VARIABLES) {
-    const raw = env[urlName];
-    if (isBlank(raw)) continue;
-    const token = env[tokenName] && String(env[tokenName]).trim() ? String(env[tokenName]).trim() : null;
-    try {
-      return { databaseUrl: checkDatabaseUrl(raw, urlName, { serverOnly: onVercel }), databaseAuthToken: token, databaseProblem: null };
-    } catch (err) {
-      if (!onVercel) throw err;
-      problems.push(err.message); // names the variable and scheme only, never the URL
+function checkMongoUri(value, name = 'MONGODB_URI') {
+  const uri = String(value).trim();
+  if (MONGODB_SCHEME_RE.test(uri)) {
+    if (/<db_password>|<password>/i.test(uri)) {
+      throw new Error(`Invalid ${name}: it still holds the <db_password> placeholder from Atlas. Put the database user's password there (percent-encoded if it has special characters), or take the user name and password out of ${name} and set MONGODB_USERNAME and MONGODB_PASSWORD.`);
     }
+    return uri.replace(MONGODB_SCHEME_RE, (scheme) => scheme.toLowerCase());
   }
-  if (onVercel) {
-    return { databaseUrl: null, databaseAuthToken: null, databaseProblem: [...problems, VERCEL_NO_DATABASE_PROBLEM].join(' ') };
+  if (/^["']/.test(uri)) throw new Error(`Invalid ${name}: remove the quotes around the connection string.`);
+  const scheme = /^([a-z][a-z0-9+.-]{0,30}):\/\//i.exec(uri)?.[1]?.toLowerCase();
+  if (scheme) {
+    throw new Error(`Invalid ${name}: "${scheme}://" connection strings are not supported. Blip needs a MongoDB connection string, which starts with mongodb+srv:// or mongodb://.`);
   }
-  return { databaseUrl: databaseUrlFromPath(dbPath), databaseAuthToken: null, databaseProblem: null };
+  throw new Error(`Invalid ${name}: expected a MongoDB connection string, which starts with mongodb+srv:// or mongodb://.`);
+}
+
+/**
+ * The database a deployment uses when MONGODB_DB doesn't name one, so data never mixes: Vercel
+ * production gets `blip`, Vercel previews `blip_preview`, and everything else (a local run, `vercel dev`,
+ * Vercel's development environment) `blip_dev`. Only a deployment Vercel marks as production ever
+ * defaults to the production database.
+ */
+export function defaultDatabaseName(env) {
+  if (!isVercel(env)) return 'blip_dev';
+  const deployment = String(env.VERCEL_ENV ?? '').trim();
+  if (deployment === 'production') return 'blip';
+  return deployment === 'preview' ? 'blip_preview' : 'blip_dev';
+}
+
+/** MongoDB's own databases: Blip never stores links in them. */
+const SYSTEM_DATABASES = new Set(['admin', 'local', 'config']);
+
+/** MONGODB_DB (blank gives `fallback`), by MongoDB's rules for database names. */
+function parseDatabaseName(value, fallback) {
+  if (isBlank(value)) return fallback;
+  const name = String(value).trim();
+  if (MONGODB_SCHEME_RE.test(name)) {
+    throw new Error('Invalid MONGODB_DB: it holds a connection string, which belongs in MONGODB_URI. MONGODB_DB is only the name of the database, such as blip.');
+  }
+  if (!/^[^/\\. "$*<>:|?\0]{1,63}$/.test(name)) {
+    throw new Error(`Invalid MONGODB_DB${shown(name)}: a database name has 1 to 63 characters, without spaces or any of / \\ . " $ * < > : | ?`);
+  }
+  if (SYSTEM_DATABASES.has(name.toLowerCase())) {
+    throw new Error(`Invalid MONGODB_DB${shown(name)}: admin, local and config are MongoDB's own databases. Pick another name, such as blip.`);
+  }
+  return name;
+}
+
+const trimmedOrNull = (value) => (isBlank(value) ? null : String(value).trim());
+
+/**
+ * MONGODB_USERNAME and MONGODB_PASSWORD go together. They only matter for a connection string without
+ * credentials of its own (one with them wins), so a half-set pair is an error only then.
+ */
+function checkCredentialPair(uri, username, password) {
+  if (uriHasCredentials(uri) || Boolean(username) === Boolean(password)) return;
+  const [set, missing] = username ? ['MONGODB_USERNAME', 'MONGODB_PASSWORD'] : ['MONGODB_PASSWORD', 'MONGODB_USERNAME'];
+  throw new Error(`${set} is set but ${missing} is not. Set both, or put the user name and password in MONGODB_URI.`);
+}
+
+/**
+ * Where the data lives: the cluster at MONGODB_URI, in the database MONGODB_DB. MONGODB_USERNAME and
+ * MONGODB_PASSWORD are used when the URI carries no credentials of its own. With no URI, `mongodbUri` is
+ * null and `databaseProblem` says what to do, so a deployment still starts and answers 503
+ * `database_not_configured` (a local `npm start` prints it and exits). A setting Blip can't use throws,
+ * everywhere: createVercelApp turns that into 503 `misconfigured`.
+ * @returns {{ mongodbUri: string|null, mongodbDb: string, mongodbUsername: string|null, mongodbPassword: string|null, databaseProblem: string|null }}
+ */
+function resolveDatabase(env, onVercel) {
+  const settings = {
+    mongodbUri: null,
+    mongodbDb: parseDatabaseName(env.MONGODB_DB, defaultDatabaseName(env)),
+    mongodbUsername: trimmedOrNull(env.MONGODB_USERNAME),
+    mongodbPassword: trimmedOrNull(env.MONGODB_PASSWORD),
+    databaseProblem: onVercel ? VERCEL_NO_DATABASE_PROBLEM : LOCAL_NO_DATABASE_PROBLEM,
+  };
+  if (isBlank(env.MONGODB_URI)) return settings;
+  const mongodbUri = checkMongoUri(env.MONGODB_URI);
+  checkCredentialPair(mongodbUri, settings.mongodbUsername, settings.mongodbPassword);
+  return { ...settings, mongodbUri, databaseProblem: null };
 }
 
 /**
  * Read configuration from an env-like object.
  * On Vercel (VERCEL set) the defaults change: BASE_URL follows the deployment's public URL, TRUST_PROXY
  * is 1 (Vercel's edge is the one proxy in front), demo traffic is on, live streams end after
- * VERCEL_STREAM_MAX_MS, and only a database URL (never DB_PATH) is used. Explicit variables still win.
+ * VERCEL_STREAM_MAX_MS, and the default database follows the deployment. Explicit variables still win.
  * @param {Record<string, string|undefined>} env
  */
 export function loadConfig(env = process.env) {
@@ -222,7 +242,6 @@ export function loadConfig(env = process.env) {
   const baseHost = hostOfBaseUrl(baseUrl);
   const domains = normalizeDomainList(env.DOMAINS === undefined ? DEFAULT_DOMAINS : env.DOMAINS, baseHost);
   const liveDomains = normalizeDomainList(env.LIVE_DOMAINS ?? '', baseHost).filter((d) => domains.includes(d));
-  const dbPath = resolveDbPath(env.DB_PATH);
   return {
     port,
     host,
@@ -230,8 +249,7 @@ export function loadConfig(env = process.env) {
     baseHost,
     domains,
     liveDomains,
-    dbPath,
-    ...resolveDatabase(env, dbPath, onVercel),
+    ...resolveDatabase(env, onVercel),
     ipHashSalt: env.IP_HASH_SALT && String(env.IP_HASH_SALT).length ? String(env.IP_HASH_SALT) : null,
     allowDemoTraffic: parseBoolean(env.ALLOW_DEMO_TRAFFIC, onVercel || nodeEnv !== 'production'),
     trustProxy: isBlank(env.TRUST_PROXY) && onVercel ? 1 : parseTrustProxy(env.TRUST_PROXY),
@@ -258,23 +276,20 @@ export function resolveConfig(partial = {}) {
   merged.baseHost = hostOfBaseUrl(merged.baseUrl);
   merged.domains = normalizeDomainList(merged.domains, merged.baseHost);
   merged.liveDomains = normalizeDomainList(merged.liveDomains, merged.baseHost).filter((d) => merged.domains.includes(d));
-  merged.dbPath = resolveDbPath(merged.dbPath);
-  // A databaseProblem means "no database" (see resolveDatabase). Otherwise an explicit databaseUrl wins,
-  // and the URL follows dbPath, so `{ dbPath: ':memory:' }` just works.
+  merged.onVercel = Boolean(merged.onVercel);
+  merged.mongodbDb = parseDatabaseName(merged.mongodbDb, defaults.mongodbDb);
+  // A databaseProblem means "no database" (see resolveDatabase). Otherwise the URI needs to be there.
   if (partial?.databaseProblem) {
-    merged.databaseUrl = null;
-    merged.databaseAuthToken = null;
+    merged.mongodbUri = null;
     merged.databaseProblem = String(partial.databaseProblem);
-  } else if (partial?.databaseUrl !== undefined && partial.databaseUrl !== null) {
-    merged.databaseUrl = checkDatabaseUrl(partial.databaseUrl, 'databaseUrl');
-    merged.databaseAuthToken = partial.databaseAuthToken ? String(partial.databaseAuthToken) : null;
+  } else if (partial?.mongodbUri !== undefined && partial.mongodbUri !== null) {
+    merged.mongodbUri = checkMongoUri(partial.mongodbUri, 'mongodbUri');
+    checkCredentialPair(merged.mongodbUri, merged.mongodbUsername, merged.mongodbPassword);
     merged.databaseProblem = null;
   } else {
-    merged.databaseUrl = databaseUrlFromPath(merged.dbPath);
-    merged.databaseAuthToken = null;
-    merged.databaseProblem = null;
+    merged.mongodbUri = null;
+    merged.databaseProblem = merged.onVercel ? VERCEL_NO_DATABASE_PROBLEM : LOCAL_NO_DATABASE_PROBLEM;
   }
-  merged.onVercel = Boolean(merged.onVercel);
   const given = (key) => partial?.[key] !== undefined && partial[key] !== null;
   merged.allowDemoTraffic = parseBoolean(merged.allowDemoTraffic, merged.onVercel || merged.nodeEnv !== 'production');
   merged.trustProxy = !given('trustProxy') && merged.onVercel ? 1 : parseTrustProxy(merged.trustProxy);

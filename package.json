@@ -12,18 +12,19 @@
     "start": "node --env-file-if-exists=.env server/index.js",
     "dev": "node --env-file-if-exists=.env --watch server/index.js",
     "build": "node scripts/build-vendor.mjs",
-    "test": "node --test \"test/*.test.js\"",
+    "test": "node test/run.mjs",
     "audit:design": "node scripts/audit-design.mjs",
     "icons": "node scripts/build-icons.mjs"
   },
   "dependencies": {
     "@fontsource/bangers": "^5.3.0",
     "@fontsource/comic-neue": "^5.3.0",
-    "@libsql/client": "^0.18.0",
     "@phosphor-icons/core": "^2.1.1",
+    "@vercel/functions": "^3.10.6",
     "d3": "^7.9.0",
     "express": "^5.2.1",
     "i18n-iso-countries": "^7.14.0",
+    "mongodb": "^7.8.0",
     "qr-code-styling": "^1.9.2",
     "topojson-client": "^3.1.0",
     "ua-parser-js": "^1.0.41",
@@ -31,5 +32,8 @@
   },
   "optionalDependencies": {
     "fast-geoip": "^1.1.88"
+  },
+  "devDependencies": {
+    "mongodb-memory-server-core": "^11.3.0"
   }
 }

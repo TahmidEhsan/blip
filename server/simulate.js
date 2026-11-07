@@ -90,9 +90,9 @@ export function generateSyntheticClicks({ linkId, outcome, count, now, random })
 }
 
 /**
- * Insert synthetic clicks, all at once in one atomic batch (one round trip), before the response goes
- * out. Nothing is scheduled afterwards: open dashboards pick the rows up from the database and play
- * them back a little apart (server/live.js), whichever server instance they are connected to.
+ * Insert synthetic clicks, all at once in one insert, before the response goes out. Nothing is
+ * scheduled afterwards: open dashboards pick the rows up from the database and play them back a
+ * little apart (server/live.js), whichever server instance they are connected to.
  * @param {{ db: import('./db.js').Database, link: object, count: number, now: number, random: () => number }} opts
  * @returns {Promise<number>} rows inserted (0 when the link was deleted meanwhile)
  */

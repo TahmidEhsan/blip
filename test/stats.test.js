@@ -1,14 +1,10 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { insertClick } from '../server/db.js';
 import { liveTotals } from '../server/analytics.js';
 import { STREAM_STAGGER_MS } from '../server/live.js';
 import { STREAM_EVICT_AFTER_MS } from '../server/routes/api.js';
-import { fileUrlFromPath } from '../server/config.js';
-import { DAY, HOUR, MINUTE, UA, openStream, removeTempDir, startServer } from './helpers.js';
+import { DAY, HOUR, MINUTE, UA, dropTestDatabase, freshDatabaseName, openStream, startServer } from './helpers.js';
 
 function seededRandom(seed = 42) {
   let x = seed >>> 0;
@@ -16,6 +12,13 @@ function seededRandom(seed = 42) {
     x = (x * 1664525 + 1013904223) >>> 0;
     return x / 2 ** 32;
   };
+}
+
+/** The earliest and latest timestamp of all simulated clicks, and how many there are. */
+async function syntheticSpan(db) {
+  const rows = await db.collection('clicks').find({ is_synthetic: 1 }).toArray();
+  const stamps = rows.map((row) => row.ts);
+  return { lo: Math.min(...stamps), hi: Math.max(...stamps), n: rows.length };
 }
 
 const GB = { 'cf-ipcountry': 'GB', 'cf-ipcity': 'London', 'cf-iplatitude': '51.5074', 'cf-iplongitude': '-0.1278' };
@@ -52,7 +55,7 @@ describe('stats', () => {
     assert.deepEqual(Object.keys(body).sort(), ['browsers', 'countries', 'devices', 'generatedAt', 'os', 'points', 'range', 'recent', 'referrers', 'slug', 'throughClickId', 'timeseries', 'totals'].sort());
     assert.equal(body.slug, slug);
     // The highest click id stored when the snapshot was read: every click of the link up to it is included.
-    const { maxId } = await s.db.get('SELECT MAX(id) AS maxId FROM clicks');
+    const { id: maxId } = await s.db.collection('clicks').findOne({}, { sort: { id: -1 } });
     assert.equal(body.throughClickId, maxId);
     assert.ok(body.recent.every((c) => c.id <= body.throughClickId));
     assert.equal(body.range, '7d');
@@ -181,7 +184,7 @@ describe('stats', () => {
       assert.ok(Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180);
       assert.equal(p.lat, Math.round(p.lat * 10) / 10);
     }
-    const synthetic = await s.db.get('SELECT MIN(ts) AS lo, MAX(ts) AS hi, COUNT(*) AS n FROM clicks WHERE is_synthetic = 1');
+    const synthetic = await syntheticSpan(s.db);
     assert.equal(synthetic.n, 30);
     assert.ok(synthetic.lo >= start - 7 * DAY);
     assert.equal(synthetic.hi, start, 'the last few land at now()');
@@ -211,7 +214,7 @@ describe('breakdowns', () => {
 
   it('keeps the top 8 browsers, OSes and referrers and folds the rest into "Other"', async () => {
     const { link, manageToken } = await s.createLink({ targetUrl: 'https://example.com/many', slug: 'many' });
-    const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', [link.slug])).id;
+    const linkId = (await s.db.collection('links').findOne({ slug: link.slug })).id;
     // 11 distinct values with counts 12, 11, …, 2 (and a bot + a blocked row that must not count).
     for (let i = 0; i < 11; i += 1) {
       for (let n = 0; n < 12 - i; n += 1) {
@@ -260,7 +263,7 @@ describe('simulated traffic and the default 7d view', () => {
       assert.equal(json.totals.syntheticClicks, 200, `tz=${tz}`);
       assert.equal(json.timeseries.points.reduce((sum, p) => sum + p.clicks, 0), 200, `tz=${tz}`);
     }
-    const span = await s.db.get('SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM clicks WHERE is_synthetic = 1');
+    const span = await syntheticSpan(s.db);
     assert.ok(span.lo >= start - 6 * DAY);
     assert.equal(span.hi, start);
   });
@@ -279,7 +282,7 @@ describe('simulated traffic disabled', () => {
     assert.equal(res.status, 404);
     assert.equal(res.json.error.code, 'not_found');
     assert.equal((await s.request('GET', '/api/config')).json.allowDemoTraffic, false);
-    assert.equal((await s.db.get('SELECT COUNT(*) AS n FROM clicks')).n, 0);
+    assert.equal(await s.db.collection('clicks').countDocuments({}), 0);
   });
 });
 
@@ -346,8 +349,7 @@ describe('live stream (SSE)', () => {
       await stream.next((e) => e.event === 'hello');
       const res = await s.request('POST', `/api/links/${link.slug}/simulate`, { token: manageToken, body: { count: 3 } });
       assert.deepEqual(res.json, { inserted: 3 });
-      const stored = await s.db.get('SELECT COUNT(*) AS n FROM clicks c JOIN links l ON l.id = c.link_id WHERE l.slug = ?', [link.slug]);
-      assert.equal(stored.n, 3, 'every simulated click is stored before the response, in one batch');
+      assert.equal(await s.db.collection('clicks').countDocuments({ is_synthetic: 1 }), 3, 'every simulated click is stored before the response, in one insert');
       const events = [];
       const arrived = [];
       for (let i = 0; i < 3; i += 1) {
@@ -415,7 +417,7 @@ describe('live stream (SSE)', () => {
 
   it('live totals stay exact across real, repeat, bot, blocked and simulated clicks', async () => {
     const { link, manageToken: token } = await s.createLink({ targetUrl: 'https://example.com/tally', slug: 'tally', maxClicks: 4 });
-    const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', ['tally'])).id;
+    const linkId = (await s.db.collection('links').findOne({ slug: 'tally' })).id;
     await s.visit('tally', { ua: UA.macFirefox });
 
     const stream = await openStream(s.base, link.slug, token);
@@ -463,7 +465,7 @@ describe('live stream (SSE)', () => {
     const { link, manageToken } = await s.createLink({ targetUrl: 'https://example.com/bye', slug: 'bye' });
     const first = await openStream(s.base, link.slug, manageToken);
     await first.next((e) => e.event === 'hello');
-    const byeId = async () => (await s.db.get('SELECT id FROM links WHERE slug = ?', ['bye'])).id;
+    const byeId = async () => (await s.db.collection('links').findOne({ slug: 'bye' })).id;
     const listenersBefore = s.bus.listenerCount('link:' + (await byeId()));
     assert.equal(listenersBefore, 1);
     first.close();
@@ -481,21 +483,20 @@ describe('live stream (SSE)', () => {
 });
 
 describe('live stream across instances (polling)', () => {
-  // Two apps on one database file, like two Vercel instances on one Turso database: a visit handled
-  // by one never touches the other's in-process bus, so the other's dashboard only sees it by polling.
-  let dir;
+  // Two apps on one database, like two Vercel instances: a visit handled by one never touches the
+  // other's in-process bus, so the other's dashboard only sees it by polling.
+  const dbName = freshDatabaseName();
   let a;
   let b;
   before(async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blip-instances-'));
-    const config = { databaseUrl: fileUrlFromPath(path.join(dir, 'shared.db')), streamPollMs: 100 };
-    a = await startServer({ config });
-    b = await startServer({ config });
+    const config = { streamPollMs: 100 };
+    a = await startServer({ config, dbName });
+    b = await startServer({ config, dbName });
   });
   after(async () => {
     await a?.stop();
     await b?.stop();
-    await removeTempDir(dir);
+    await dropTestDatabase(dbName);
   });
 
   it('delivers clicks, totals and status changes stored by another instance', async () => {

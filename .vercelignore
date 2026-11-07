@@ -1,0 +1,4 @@
+# Local settings and secrets (MONGODB_URI, MONGODB_USERNAME, MONGODB_PASSWORD) stay on this machine
+.env*
+# The database file of earlier builds, unused and never deployed
+/data

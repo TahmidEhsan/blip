@@ -1,10 +1,12 @@
-// Shared test helpers: boot an isolated Blip app on an ephemeral port with a mutable clock.
+// Shared test helpers: boot an isolated Blip app on an ephemeral port with a mutable clock, each in a
+// database of its own on the one in-process MongoDB of this test run (see test/run.mjs).
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import fs from 'node:fs';
-import v8 from 'node:v8';
-import vm from 'node:vm';
+import { after } from 'node:test';
+import { MongoClient } from 'mongodb';
 import { createApp } from '../server/app.js';
+import { createDatabase, prepareDatabase } from '../server/db.js';
+import { startMongoServer } from './mongo-server.js';
 
 export const START_TIME = Date.parse('2026-10-07T12:00:00.000Z');
 export const MINUTE = 60_000;
@@ -20,16 +22,97 @@ export const UA = {
   googlebot: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
 };
 
+let ownServer = null; // when a suite runs on its own, without test/run.mjs
+let adminClient = null;
+
 /**
- * Start an app + server. Rate limits are raised by default so tests can create many links;
- * pass `rateLimits: null` to keep the production limits.
+ * True for a connection string that can only reach this machine: the plain `mongodb://` scheme (a
+ * `mongodb+srv://` name resolves to a remote cluster), no user name or password, and every host of its
+ * seed list on the loopback address. A prefix check is not enough: in `mongodb://localhost:x@cluster0...`
+ * "localhost" is a user name, and `mongodb://127.0.0.1:27017,cluster0...` lists a remote member too.
+ */
+export function isLocalMongoUri(uri) {
+  const hosts = /^mongodb:\/\/([^/?#]*)(?:[/?#]|$)/.exec(String(uri ?? ''))?.[1];
+  if (!hosts || hosts.includes('@')) return false;
+  return hosts.split(',').every((host) => /^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/i.test(host));
+}
+
+/**
+ * The connection string of this run's MongoDB. It is always on this machine: a suite that is handed
+ * anything else stops here, so tests can never reach a real cluster.
+ */
+export async function testMongoUri() {
+  const shared = process.env.BLIP_TEST_MONGODB_URI;
+  if (shared) {
+    assert.ok(isLocalMongoUri(shared), 'tests only run against a local MongoDB');
+    return shared;
+  }
+  ownServer ??= startMongoServer();
+  return (await ownServer).uri;
+}
+
+after(async () => {
+  await adminClient?.close();
+  if (ownServer) await (await ownServer).stop();
+});
+
+/** A client for test set-up and clean-up (users, dropping databases), apart from any app's client. */
+export async function testAdminClient() {
+  adminClient ??= new MongoClient(await testMongoUri());
+  return adminClient;
+}
+
+let databaseCount = 0;
+/** A name nobody uses yet: this process's id keeps the suites of one run apart. */
+export function freshDatabaseName() {
+  databaseCount += 1;
+  return `blip_test_${process.pid}_${databaseCount}`;
+}
+
+export async function dropTestDatabase(name) {
+  await (await testAdminClient()).db(name).dropDatabase();
+}
+
+/**
+ * A prepared database handle on a fresh database, for tests that don't need the whole app. A handle whose
+ * preparation fails is closed before the error goes on, so its client can't keep the suite's process alive.
+ */
+export async function openTestDatabase(options = {}) {
+  const db = createDatabase({ uri: await testMongoUri(), dbName: freshDatabaseName(), ...options });
+  try {
+    await prepareDatabase(db);
+  } catch (err) {
+    await db.close();
+    throw err;
+  }
+  return db;
+}
+
+/** Close a handle from openTestDatabase and drop its database. */
+export async function closeTestDatabase(db) {
+  await db.close();
+  await dropTestDatabase(db.name);
+}
+
+/** A link's clicks in id order, without `_id`. */
+export async function clickRowsOf(db, slug) {
+  const link = await db.collection('links').findOne({ slug });
+  return db.collection('clicks').find({ link_id: link.id }, { projection: { _id: 0 } }).sort({ id: 1 }).toArray();
+}
+
+/**
+ * Start an app + server, in a fresh database that is dropped by stop(). Pass `dbName` to choose the
+ * database (two apps on one database act like two instances); dropping that one is up to the caller.
+ * Rate limits are raised by default so tests can create many links; pass `rateLimits: null` to keep the
+ * production limits.
  */
 export async function startServer({
-  config = {}, geoLookup, random, rateLimits, streamLimits, databaseTimeoutMs, startupTimeoutMs, startTime = START_TIME,
+  config = {}, dbName, geoLookup, random, rateLimits, streamLimits, databaseTimeoutMs, startupTimeoutMs, mongoClientOptions, onDatabaseClient, waitUntil, deferClickWrites, startTime = START_TIME,
 } = {}) {
   const clock = { t: startTime };
+  const mongodbDb = dbName ?? freshDatabaseName();
   const instance = createApp({
-    config: { dbPath: ':memory:', baseUrl: 'http://localhost:3030', allowDemoTraffic: true, ...config },
+    config: { mongodbUri: await testMongoUri(), mongodbDb, baseUrl: 'http://localhost:3030', allowDemoTraffic: true, ...config },
     now: () => clock.t,
     geoLookup,
     random,
@@ -37,8 +120,19 @@ export async function startServer({
     streamLimits,
     databaseTimeoutMs,
     startupTimeoutMs,
+    mongoClientOptions,
+    onDatabaseClient,
+    waitUntil,
+    deferClickWrites,
   });
-  await instance.ready; // migrations done, so tests can query `db` straight away
+  try {
+    await instance.ready; // indexes and salt are done, so tests can query `db` straight away
+  } catch (err) {
+    // A start-up that failed (or missed its deadline while connecting) would otherwise leave its client
+    // open, and an open client keeps the suite's process from exiting.
+    await instance.close();
+    throw err;
+  }
   const server = instance.app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -74,6 +168,7 @@ export async function startServer({
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
     await instance.close();
+    if (!dbName) await dropTestDatabase(mongodbDb);
   }
 
   return {
@@ -94,12 +189,13 @@ export async function startServer({
 /**
  * Open the SSE stream for a link and expose a promise-based event reader.
  * `ended` resolves when the server ends the stream (or close() aborts it).
+ * @param {{ headers?: Record<string, string> }} [options] more request headers
  * @returns {Promise<{ status: number, headers: Headers, ended: Promise<void>, next: (pred?: (e) => boolean, timeoutMs?: number) => Promise<{event: string, data: any}>, close: () => void }>}
  */
-export async function openStream(base, slug, token) {
+export async function openStream(base, slug, token, { headers = {} } = {}) {
   const controller = new AbortController();
   const res = await fetch(`${base}/api/links/${slug}/stream`, {
-    headers: { 'X-Manage-Token': token, Accept: 'text/event-stream' },
+    headers: { ...headers, 'X-Manage-Token': token, Accept: 'text/event-stream' },
     signal: controller.signal,
   });
   const events = [];
@@ -173,38 +269,6 @@ export async function openStream(base, slug, token) {
       controller.abort();
     },
   };
-}
-
-let collectGarbage = null;
-
-/**
- * Remove a temp folder that held database files. On Windows a closed libSQL database keeps its file
- * open until its prepared statements are garbage collected, so when the first attempt fails this
- * forces a collection, lets the finalizers run, and tries again. A folder that still can't be removed
- * is left for the OS to clean up rather than failing the suite.
- */
-export async function removeTempDir(dir) {
-  const attempt = () => fs.rmSync(dir, { recursive: true, force: true });
-  try {
-    attempt();
-    return;
-  } catch {
-    // locked: fall through
-  }
-  for (let i = 0; i < 5; i += 1) {
-    if (!collectGarbage) {
-      v8.setFlagsFromString('--expose-gc');
-      collectGarbage = vm.runInNewContext('gc');
-    }
-    collectGarbage();
-    await new Promise((resolve) => setTimeout(resolve, 20 * (i + 1)));
-    try {
-      attempt();
-      return;
-    } catch {
-      // still locked
-    }
-  }
 }
 
 /** Extract and parse the `<script type="application/json" id="blip-data">` payload of a view. */

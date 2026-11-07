@@ -1,6 +1,6 @@
 // Blip: GET /:slug visits (redirects, teasers, bot previews and self-destructed pages, SPEC §4.4).
 import express from 'express';
-import { consumeVisitAndRecordClick, findLinkById, findLinkBySlug, insertClick, lastConsumedClickTs } from '../db.js';
+import { consumeVisit, findLinkById, findLinkBySlug, insertClick, lastConsumedClickTs } from '../db.js';
 import { isBotUA, parseUserAgent, referrerHost, visitorHash } from '../analytics.js';
 import { linkStatus } from '../links.js';
 import { SLUG_RE, normalizeSlug } from '../slugs.js';
@@ -12,9 +12,9 @@ import { teaserThemeId } from '../themes.js';
 const PREVIEW_TITLE = 'Open this Blip link in your browser';
 const EXPIRED_TITLE = 'This Blip has self-destructed';
 /**
- * How long a visit that consumes nothing (a blocked attempt, a bot) waits for its click row before it
- * answers anyway. A round trip normally takes milliseconds; when the database stalls, the visitor still
- * gets their page and the row is stored late or, at worst, lost (it is analytics only).
+ * How long a visit waits for its click row before it answers anyway. The row normally takes milliseconds;
+ * when the database stalls, the visitor still gets their page and the row is stored late or, at worst,
+ * lost (it is analytics only).
  */
 export const CLICK_WRITE_BUDGET_MS = 1500;
 
@@ -46,7 +46,7 @@ export async function sendNotFound(ctx, res, requested) {
 }
 
 export function createRedirectRouter(ctx) {
-  const { db, bus } = ctx;
+  const { answerInTime, db, bus } = ctx;
   const router = express.Router();
 
   /**
@@ -54,7 +54,7 @@ export function createRedirectRouter(ctx) {
    * runs alongside the "expired at" lookup, and the page is sent once both are done.
    */
   async function sendExpired(res, link, reason, recording = null) {
-    const expiredAtLookup = reason === 'clicks' ? lastConsumedClickTs(db, link.id) : null;
+    const expiredAtLookup = reason === 'clicks' ? answerInTime(lastConsumedClickTs(db, link.id)) : null;
     const [lastClick] = await Promise.all([expiredAtLookup, recording]);
     let expiredAt = null;
     if (reason === 'time') expiredAt = link.expires_at;
@@ -131,11 +131,17 @@ export function createRedirectRouter(ctx) {
   }
 
   /**
-   * Store a click row for a visit that consumed nothing (a blocked attempt or a bot), then wake this
-   * instance's live dashboards for the link: they read the row from the database (dashboards on other
-   * instances see it at their next poll). Analytics never blocks or breaks the visit: a failure (the link
-   * deleted meanwhile, a database error) is logged and swallowed, and a write still pending after
-   * CLICK_WRITE_BUDGET_MS is left to finish on its own. Never rejects.
+   * Store a click row, then wake this instance's live dashboards for the link: they read the row from the
+   * database (dashboards on other instances see it at their next poll). Analytics never blocks or breaks
+   * the visit, which by now is decided (and may have used up a click): a failure (the link deleted
+   * meanwhile, a database error) is logged and swallowed. Never rejects.
+   *
+   * The write starts at once and is handed to `ctx.waitUntil`, and it is never tied to the request, so it
+   * finishes even when the visitor is long gone. How long the visit waits for it:
+   *  - by default (a server, the tests), until it is stored, but no longer than CLICK_WRITE_BUDGET_MS: a
+   *    slower write is logged and left to finish on its own. So stats read after a visit include it;
+   *  - with `ctx.deferClickWrites` (Vercel), not at all: waitUntil keeps the function running until the row
+   *    is stored, and the redirect skips the row's three round trips.
    * @param {Promise<object>|object} row the click row, or a promise of it (from clickRow)
    */
   async function storeClick(link, row) {
@@ -148,20 +154,28 @@ export function createRedirectRouter(ctx) {
     write.then(() => {
       if (!ctx.isClosed()) wake(bus, link.id);
     });
-    if ((await settleWithin(write, CLICK_WRITE_BUDGET_MS)) === null) {
-      console.error(`[blip] recording a visit to /${link.slug} is slow; answering without waiting for it`);
+    ctx.waitUntil(write);
+    const slow = () => console.error(`[blip] recording a visit to /${link.slug} is slow (over ${CLICK_WRITE_BUDGET_MS} ms); ${ctx.deferClickWrites ? 'still waiting for it after the response' : 'answering without waiting for it'}`);
+    if (ctx.deferClickWrites) {
+      settleWithin(write, CLICK_WRITE_BUDGET_MS).then((settled) => {
+        if (settled === null && !ctx.isClosed()) slow();
+      });
+      return;
     }
+    if ((await settleWithin(write, CLICK_WRITE_BUDGET_MS)) === null) slow();
   }
 
-  // A visit makes at most two database round trips: look the link up, then consume the visit and
-  // store its click row in one write batch. Losing the race for the last click adds a read and the
-  // blocked attempt's row; a visit that consumes nothing (expired, bot) stores its row in one INSERT.
+  // A visit makes at most five database round trips: look the link up, consume the visit, then store its
+  // click row (reserve its id and record the visitor together, insert it, check the link still exists).
+  // Losing the race for the last click adds a read and the blocked attempt's row; a visit that consumes
+  // nothing (expired, bot) only stores its row. On Vercel (ctx.deferClickWrites) the answer goes out after
+  // the first two, and the row is stored after it (see storeClick). The consume is always awaited.
   router.get('/:slug', async (req, res) => {
     const now = ctx.now();
     setVisitHeaders(res);
     const requested = String(req.params.slug ?? '');
     const slug = requested.toLowerCase();
-    const link = SLUG_RE.test(slug) ? await findLinkBySlug(db, slug) : null;
+    const link = SLUG_RE.test(slug) ? await answerInTime(findLinkBySlug(db, slug)) : null;
     if (!link) {
       await sendNotFound(ctx, res, requested);
       return;
@@ -204,13 +218,13 @@ export function createRedirectRouter(ctx) {
       return;
     }
 
-    // 6 + 7. Consume atomically and store the click in the same write batch (one round trip, and a
-    //        cancelled request can never split them), then wake live dashboards and respond.
+    // 6 + 7. Consume atomically, store the click, wake live dashboards and respond. Only a failure to
+    //        consume can fail the visit: once a click is used up, the visitor gets through.
     const row = await clickRow(req, link, { outcome, isBot, now });
-    const result = await consumeVisitAndRecordClick(db, link.id, now, row);
+    const result = await answerInTime(consumeVisit(db, link.id, now));
     if (!result.consumed) {
       // Lost the race (another visitor took the last click, or the link was stopped or deleted meanwhile).
-      const fresh = await findLinkById(db, link.id);
+      const fresh = await answerInTime(findLinkById(db, link.id));
       if (!fresh) {
         await sendNotFound(ctx, res, requested);
         return;
@@ -219,8 +233,8 @@ export function createRedirectRouter(ctx) {
       await sendExpired(res, fresh, lost.expiredReason ?? 'clicks', storeClick(fresh, { ...row, outcome: 'expired' }));
       return;
     }
-    // Also covers a visit that used up the last click: the stream sends the status change too.
-    if (!ctx.isClosed()) wake(bus, link.id);
+    // The wake also covers a visit that used up the last click: the stream sends the status change too.
+    await storeClick(link, row);
     await sendActive(res, link);
   });
 

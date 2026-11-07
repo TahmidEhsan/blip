@@ -1,7 +1,7 @@
 // Blip: teaser theme and QR preset ids (SPEC §6, §8), plus the ids used by the first release.
 // The first release had gradient themes (aurora, sunset, ...). The comic redesign renamed them;
-// requests that still send an old id are accepted and mapped, and stored values are migrated
-// (see migrateLegacyThemeIds in db.js) and mapped again on the way out as a safety net.
+// requests that still send an old id are accepted and stored under the new name, and a stored old id
+// (say, from imported data) is mapped on the way out.
 
 // QR preset looks live in the browser module shared with the pages, so the ids, the legacy map and
 // the flat colours have one source of truth for the server and the client.

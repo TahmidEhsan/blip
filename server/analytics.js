@@ -5,7 +5,7 @@ import uaParser from 'ua-parser-js';
 // so it loads the core and the English names alone (a faster cold start and a smaller function).
 import countries from 'i18n-iso-countries/index.js';
 import englishCountryNames from 'i18n-iso-countries/langs/en.json' with { type: 'json' };
-import { CLICKS_EPOCH_KEY, COUNTED_CLICK_SQL } from './db.js';
+import { AGGREGATION_TIME_LIMIT_MS, CLICKS_EPOCH_KEY, COUNTED_CLICK_FILTER } from './db.js';
 
 countries.registerLocale(englishCountryNames);
 
@@ -115,77 +115,80 @@ export function clickEventFromRow(row) {
 // Totals
 // ---------------------------------------------------------------------------
 
-/** The two statements behind computeTotals (so buildStats can batch them with its other reads). */
-function totalsStatements(linkId, { start = 0, end = Number.MAX_SAFE_INTEGER, now }) {
-  return [
-    {
-      sql: `
-        SELECT
-          COALESCE(SUM(CASE WHEN ${COUNTED_CLICK_SQL} THEN 1 ELSE 0 END), 0) AS clicks,
-          COUNT(DISTINCT CASE WHEN ${COUNTED_CLICK_SQL} THEN visitor_hash END) AS uniqueVisitors,
-          COALESCE(SUM(CASE WHEN is_bot = 1 THEN 1 ELSE 0 END), 0) AS botClicks,
-          COALESCE(SUM(CASE WHEN outcome = 'expired' THEN 1 ELSE 0 END), 0) AS blockedAfterExpiry,
-          COALESCE(SUM(CASE WHEN is_bot = 1 AND outcome = 'expired' THEN 1 ELSE 0 END), 0) AS expiredBotClicks,
-          COALESCE(SUM(CASE WHEN ${COUNTED_CLICK_SQL} AND is_synthetic = 1 THEN 1 ELSE 0 END), 0) AS syntheticClicks
-        FROM clicks WHERE link_id = :linkId AND ts >= :start AND ts < :end
-      `,
-      args: { linkId, start, end },
-    },
-    {
-      sql: `SELECT COUNT(*) AS n FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts > :since AND ts <= :now`,
-      args: { linkId, since: now - DAY, now },
-    },
-  ];
-}
+/** COUNTED_CLICK_FILTER as an aggregation expression. */
+const COUNTED_EXPR = { $and: [{ $in: ['$outcome', COUNTED_CLICK_FILTER.outcome.$in] }, { $eq: ['$is_bot', COUNTED_CLICK_FILTER.is_bot] }] };
+const IS_BOT_EXPR = { $eq: ['$is_bot', 1] };
+const IS_BLOCKED_EXPR = { $eq: ['$outcome', 'expired'] };
+const countIf = (expr) => ({ $sum: { $cond: [expr, 1, 0] } });
 
-function totalsFromResults(main, last24h) {
-  const row = main.rows[0];
-  return {
-    clicks: row.clicks,
-    uniqueVisitors: row.uniqueVisitors,
-    botClicks: row.botClicks,
-    blockedAfterExpiry: row.blockedAfterExpiry,
-    expiredBotClicks: row.expiredBotClicks,
-    last24h: last24h.rows[0].n,
-    syntheticClicks: row.syntheticClicks,
-  };
-}
+/** The $facet members behind the totals: every total of the clicks flowing into the $facet except `last24h`. */
+const TOTALS_FACETS = Object.freeze({
+  counters: [{
+    $group: {
+      _id: null,
+      clicks: countIf(COUNTED_EXPR),
+      botClicks: countIf(IS_BOT_EXPR),
+      blockedAfterExpiry: countIf(IS_BLOCKED_EXPR),
+      expiredBotClicks: countIf({ $and: [IS_BOT_EXPR, IS_BLOCKED_EXPR] }),
+      syntheticClicks: countIf({ $and: [COUNTED_EXPR, { $eq: ['$is_synthetic', 1] }] }),
+    },
+  }],
+  visitors: [{ $match: { ...COUNTED_CLICK_FILTER, visitor_hash: { $ne: null } } }, { $group: { _id: '$visitor_hash' } }, { $count: 'n' }],
+});
+
+/** After the $facet: the rolling `last24h`, which no window covers exactly, read through the index on its own. */
+const last24hLookup = (linkId, now) => ({
+  $lookup: {
+    from: 'clicks',
+    pipeline: [{ $match: { link_id: linkId, ...COUNTED_CLICK_FILTER, ts: { $gt: now - DAY, $lte: now } } }, { $count: 'n' }],
+    as: 'last24h',
+  },
+});
 
 /**
- * Totals for clicks with `start <= ts < end` (SPEC §5.4) plus a rolling `last24h`, in one round trip.
+ * Totals (SPEC §5.4) from one aggregation's result, see TOTALS_FACETS and last24hLookup.
  * `botClicks` and `blockedAfterExpiry` overlap (a bot hitting an expired link is both);
  * `expiredBotClicks` is that overlap, so "bots & blocked" = botClicks + blockedAfterExpiry − expiredBotClicks.
- * @returns {Promise<{ clicks: number, uniqueVisitors: number, botClicks: number, blockedAfterExpiry: number, expiredBotClicks: number, last24h: number, syntheticClicks: number }>}
+ * @returns {{ clicks: number, uniqueVisitors: number, botClicks: number, blockedAfterExpiry: number, expiredBotClicks: number, last24h: number, syntheticClicks: number }}
  */
-export async function computeTotals(db, linkId, { start = 0, end = Number.MAX_SAFE_INTEGER, now }) {
-  const [main, last24h] = await db.batch(totalsStatements(linkId, { start, end, now }), 'read');
-  return totalsFromResults(main, last24h);
+function totalsFromResult(result) {
+  const counters = result.counters[0];
+  return {
+    clicks: counters?.clicks ?? 0,
+    uniqueVisitors: result.visitors[0]?.n ?? 0,
+    botClicks: counters?.botClicks ?? 0,
+    blockedAfterExpiry: counters?.blockedAfterExpiry ?? 0,
+    expiredBotClicks: counters?.expiredBotClicks ?? 0,
+    last24h: result.last24h[0]?.n ?? 0,
+    syntheticClicks: counters?.syntheticClicks ?? 0,
+  };
 }
 
-/** The live `{ clicks, uniqueVisitors }` of a link: every counted click, or only those up to `throughId`. */
-function liveTotalsStatement(linkId, throughId = null) {
-  return {
-    sql: `
-      SELECT COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniqueVisitors
-      FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL}${throughId === null ? '' : ' AND id <= :throughId'}
-    `,
-    args: throughId === null ? { linkId } : { linkId, throughId },
-  };
+/** The live `{ clicks, uniqueVisitors }` of the counted clicks matching `filter`, in one pass. */
+async function countLiveTotals(db, filter) {
+  const [row] = await db.collection('clicks').aggregate([
+    { $match: { ...filter, ...COUNTED_CLICK_FILTER } },
+    { $group: { _id: '$visitor_hash', clicks: { $sum: 1 } } },
+    { $group: { _id: null, clicks: { $sum: '$clicks' }, uniqueVisitors: { $sum: { $cond: [{ $eq: ['$_id', null] }, 0, 1] } } } },
+  ], { maxTimeMS: AGGREGATION_TIME_LIMIT_MS }).toArray();
+  return { clicks: row?.clicks ?? 0, uniqueVisitors: row?.uniqueVisitors ?? 0 };
 }
 
 /** All-time `{ clicks, uniqueVisitors }` attached to live `click` events (a full recount). */
-export async function liveTotals(db, linkId) {
-  const row = await db.get(liveTotalsStatement(linkId));
-  return { clicks: row.clicks, uniqueVisitors: row.uniqueVisitors };
+export function liveTotals(db, linkId) {
+  return countLiveTotals(db, { link_id: linkId });
 }
 
-/** `{ clicks, uniqueVisitors }` counting only clicks with `id <= throughId` (a live stream's recount). */
-export async function liveTotalsThrough(db, linkId, throughId) {
-  const row = await db.get(liveTotalsStatement(linkId, throughId));
-  return { clicks: row.clicks, uniqueVisitors: row.uniqueVisitors };
+/**
+ * `{ clicks, uniqueVisitors }` counting only the clicks a live stream has accounted for: everything at or
+ * below `floor`, and the ids in `seen` above it (a stream's recount, server/live.js). A click still on its
+ * way, or stored but not read yet, is in neither, so it is counted once, when the stream reads it.
+ */
+export function liveTotalsThrough(db, linkId, { floor, seen }) {
+  return countLiveTotals(db, { link_id: linkId, $or: [{ id: { $lte: floor } }, { id: { $in: seen } }] });
 }
 
-/** Mirrors COUNTED_CLICK_SQL for a stored row. */
+/** Mirrors COUNTED_CLICK_FILTER for a stored row. */
 export function isCountedClick(row) {
   return (row.outcome === 'redirect' || row.outcome === 'teaser') && !row.is_bot;
 }
@@ -279,22 +282,18 @@ function bucketIndex(starts, ts) {
  * made of), numbered from `origin`, which is a local hour or midnight at or before every timestamp
  * it covers. Weeks and months start at local midnight, so each day folds into exactly one bucket.
  */
-function timeseriesStatement(linkId, { origin, end, unit }) {
-  return {
-    sql: `
-      SELECT CAST((ts - :origin) / :unit AS INTEGER) AS idx, COUNT(*) AS clicks
-      FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :origin AND ts < :end
-      GROUP BY idx
-    `,
-    args: { linkId, origin, end, unit },
-  };
+function timeseriesFacet({ origin, unit }) {
+  return [
+    { $match: COUNTED_CLICK_FILTER },
+    { $group: { _id: { $floor: { $divide: [{ $subtract: ['$ts', origin] }, unit] } }, clicks: { $sum: 1 } } },
+  ];
 }
 
-/** Fold `{ idx, clicks }` rows (see timeseriesStatement) into the window's buckets. */
+/** Fold `{ _id: index, clicks }` rows (see timeseriesFacet) into the window's buckets. */
 function foldTimeseries(rows, win, { origin, unit }) {
   const counts = new Array(win.count).fill(0);
   for (const r of rows) {
-    const t = origin + r.idx * unit;
+    const t = origin + r._id * unit;
     if (t < win.start || t >= win.end) continue;
     const i = win.size === unit ? Math.round((t - win.start) / unit) : bucketIndex(win.starts, t);
     if (i >= 0 && i < win.count) counts[i] += r.clicks;
@@ -302,37 +301,70 @@ function foldTimeseries(rows, win, { origin, unit }) {
   return counts;
 }
 
-function topWithOther(rows, n = TOP_N) {
-  if (rows.length <= n) return rows;
-  const head = rows.slice(0, n);
-  const other = rows.slice(n).reduce((sum, r) => sum + r.count, 0);
-  const existing = head.find((r) => r.name === 'Other');
+/** Counted clicks per value of `field` (`fallback` when it has none). */
+const breakdownGroup = (field, fallback) => [
+  { $match: COUNTED_CLICK_FILTER },
+  { $group: { _id: { $ifNull: [`$${field}`, fallback] }, count: { $sum: 1 } } },
+];
+
+/** Every value of `field`, most clicks first (ties by name). */
+const fullBreakdownFacet = (field, fallback) => [
+  ...breakdownGroup(field, fallback),
+  { $sort: { count: -1, _id: 1 } },
+];
+
+/**
+ * The top values of `field` and the sum and number of all of them. Only those leave the database: a link
+ * can have any number of referrer hosts, and a $facet's whole result has to fit in one 16 MB document.
+ */
+const topBreakdownFacet = (field, fallback) => [
+  ...breakdownGroup(field, fallback),
+  {
+    $group: {
+      _id: null,
+      rows: { $topN: { n: TOP_N, sortBy: { count: -1, _id: 1 }, output: { name: '$_id', count: '$count' } } },
+      total: { $sum: '$count' },
+      distinct: { $sum: 1 },
+    },
+  },
+];
+
+/** The top values (see topBreakdownFacet), with the rest folded into "Other". */
+function topWithOther(result) {
+  const [{ rows, total, distinct } = { rows: [], total: 0, distinct: 0 }] = result;
+  if (distinct <= TOP_N) return rows;
+  const other = total - rows.reduce((sum, r) => sum + r.count, 0);
+  const existing = rows.find((r) => r.name === 'Other');
   if (existing) existing.count += other;
-  else head.push({ name: 'Other', count: other });
-  return head;
+  else rows.push({ name: 'Other', count: other });
+  return rows;
 }
-
-function breakdownStatement(linkId, column, scope, fallback) {
-  return {
-    sql: `
-      SELECT COALESCE(${column}, :fallback) AS name, COUNT(*) AS count
-      FROM clicks WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end
-      GROUP BY 1 ORDER BY count DESC, name ASC
-    `,
-    args: { linkId, start: scope.start, end: scope.end, fallback },
-  };
-}
-
-const breakdownRows = (result) => result.rows.map((r) => ({ name: r.name, count: r.count }));
 
 /** Every click a link has ever had: range `all` counts with this, never with its (bucketed) window. */
 const ALL_TIME = Object.freeze({ start: 0, end: Number.MAX_SAFE_INTEGER });
 
+/** The fields of a click the stats need: everything flowing through a $facet counts toward its size limits. */
+const STATS_FIELDS = Object.freeze({
+  _id: 0, ts: 1, visitor_hash: 1, outcome: 1, is_bot: 1, is_synthetic: 1, device: 1, browser: 1, os: 1, referrer_host: 1, country: 1, city: 1, lat: 1, lon: 1,
+});
+
+// ---------------------------------------------------------------------------
+// Lookups shared by the aggregations below
+// ---------------------------------------------------------------------------
+
+/** The highest click id of any link (the descending end of its index), into `mark`. */
+const MAX_CLICK_ID_LOOKUP = Object.freeze({
+  $lookup: { from: 'clicks', pipeline: [{ $sort: { id: -1 } }, { $limit: 1 }, { $project: { _id: 0, id: 1 } }], as: 'mark' },
+});
+const CLICKS_EPOCH_LOOKUP = Object.freeze({ $lookup: { from: 'meta', pipeline: [{ $match: { _id: CLICKS_EPOCH_KEY } }], as: 'epoch' } });
+
 /**
- * Build the StatsDTO for one link. Every query is independent of the others, so they all run in one
- * read batch: one round trip (and one consistent snapshot) even on a remote database.
+ * Build the StatsDTO for one link in one aggregation, so one round trip: a $facet computes everything about
+ * the range's window from one pass over its clicks (the $match uses the index, and only the needed fields
+ * flow on), and the lookups after it read what lies outside the window through their own indexes. The
+ * highest click id is read last, so it is never below a click these results include.
  * @param {import('./db.js').Database} db
- * @param {object} link links row
+ * @param {object} link the link
  * @param {{ range?: string, tz?: number, now: number }} opts
  */
 export async function buildStats(db, link, { range = '7d', tz = 0, now }) {
@@ -343,119 +375,148 @@ export async function buildStats(db, link, { range = '7d', tz = 0, now }) {
   // midnight before any timestamp (shift − 1 day is at most 0) and folded in once that is known.
   const fixed = isAll ? null : rangeWindow(range, now, tz);
   const scope = isAll ? ALL_TIME : { start: fixed.start, end: fixed.end };
-  const series = isAll ? { origin: shift - DAY, end: Number.MAX_SAFE_INTEGER, unit } : { origin: fixed.start, end: fixed.end, unit };
-  const params = { linkId: link.id, start: scope.start, end: scope.end };
+  const series = isAll ? { origin: shift - DAY, unit } : { origin: fixed.start, unit };
+  const linkClicks = { $match: { link_id: link.id } };
 
-  const results = await db.batch([
-    ...totalsStatements(link.id, { ...scope, now }),
-    timeseriesStatement(link.id, series),
-    breakdownStatement(link.id, 'device', scope, 'other'),
-    breakdownStatement(link.id, 'browser', scope, 'Unknown'),
-    breakdownStatement(link.id, 'os', scope, 'Unknown'),
-    breakdownStatement(link.id, 'referrer_host', scope, 'direct'),
+  const [result] = await db.collection('clicks').aggregate([
+    { $match: { link_id: link.id, ts: { $gte: scope.start, $lt: scope.end } } },
+    { $project: STATS_FIELDS },
     {
-      sql: `
-        SELECT country, COUNT(*) AS count FROM clicks
-        WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end AND country IS NOT NULL
-        GROUP BY country ORDER BY count DESC, country ASC
-      `,
-      args: params,
+      $facet: {
+        ...TOTALS_FACETS,
+        timeseries: timeseriesFacet(series),
+        devices: fullBreakdownFacet('device', 'other'),
+        browsers: topBreakdownFacet('browser', 'Unknown'),
+        os: topBreakdownFacet('os', 'Unknown'),
+        referrers: topBreakdownFacet('referrer_host', 'direct'),
+        countries: [
+          { $match: { ...COUNTED_CLICK_FILTER, country: { $ne: null } } },
+          { $group: { _id: '$country', count: { $sum: 1 } } },
+          { $sort: { count: -1, _id: 1 } },
+        ],
+        points: [
+          { $match: { ...COUNTED_CLICK_FILTER, lat: { $ne: null }, lon: { $ne: null } } },
+          {
+            $group: {
+              _id: { lat: { $round: ['$lat', 1] }, lon: { $round: ['$lon', 1] } },
+              city: { $max: '$city' },
+              country: { $max: '$country' },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { count: -1, '_id.lat': 1, '_id.lon': 1 } },
+          { $limit: MAX_POINTS },
+        ],
+      },
     },
-    {
-      sql: `
-        SELECT ROUND(lat, 1) AS lat, ROUND(lon, 1) AS lon, MAX(city) AS city, MAX(country) AS country, COUNT(*) AS count
-        FROM clicks
-        WHERE link_id = :linkId AND ${COUNTED_CLICK_SQL} AND ts >= :start AND ts < :end AND lat IS NOT NULL AND lon IS NOT NULL
-        GROUP BY ROUND(lat, 1), ROUND(lon, 1) ORDER BY count DESC LIMIT ${MAX_POINTS}
-      `,
-      args: params,
-    },
-    { sql: `SELECT * FROM clicks WHERE link_id = :linkId ORDER BY ts DESC, id DESC LIMIT ${RECENT_MAX}`, args: { linkId: link.id } },
-    MAX_CLICK_ID_SQL,
-    ...(isAll ? [{ sql: 'SELECT MIN(ts) AS ts FROM clicks WHERE link_id = :linkId', args: { linkId: link.id } }] : []),
-  ], 'read');
-  const [main, last24h, timeseries, devices, browsers, os, referrers, countryRows, pointRows, recentRows, mark, firstRow] = results;
+    last24hLookup(link.id, now),
+    { $lookup: { from: 'clicks', pipeline: [linkClicks, { $sort: { ts: 1 } }, { $limit: 1 }, { $project: { _id: 0, ts: 1 } }], as: 'first' } },
+    { $lookup: { from: 'clicks', pipeline: [linkClicks, { $sort: { ts: -1, id: -1 } }, { $limit: RECENT_MAX }, { $project: { _id: 0 } }], as: 'recent' } },
+    MAX_CLICK_ID_LOOKUP,
+  ], { maxTimeMS: AGGREGATION_TIME_LIMIT_MS }).toArray();
 
   let win = fixed;
   if (isAll) {
     // Simulated clicks can predate the link (they are spread over the past week), so the chart
     // starts at whichever came first.
-    const first = firstRow.rows[0]?.ts ?? null;
+    const first = result.first[0]?.ts ?? null;
     win = rangeWindow(range, now, tz, first !== null && first < link.created_at ? first : link.created_at);
   }
-  const counts = foldTimeseries(timeseries.rows, win, series);
+  const counts = foldTimeseries(result.timeseries, win, series);
 
   return {
     slug: link.slug,
     range,
     generatedAt: new Date(now).toISOString(),
-    // The highest click id stored when this snapshot was read: every click with an id up to it (and in
-    // range) is counted here, so a live `click` event with a larger id is the only kind still to add.
-    throughClickId: mark.rows[0].throughId,
-    totals: totalsFromResults(main, last24h),
+    // The highest click id stored when this snapshot was read: a live `click` event with a larger id is
+    // not in it. One that was on its way at that moment can land below this id, and the dashboard's
+    // refetch after every `click` event then counts it.
+    throughClickId: result.mark[0]?.id ?? 0,
+    totals: totalsFromResult(result),
     timeseries: { bucket: win.bucket, points: counts.map((clicks, i) => ({ t: new Date(win.starts[i]).toISOString(), clicks })) },
-    devices: breakdownRows(devices),
-    browsers: topWithOther(breakdownRows(browsers)),
-    os: topWithOther(breakdownRows(os)),
-    referrers: topWithOther(breakdownRows(referrers)),
-    countries: countryRows.rows.map((r) => {
-      const info = countryInfo(r.country);
-      return { code: info.code ?? r.country, numeric: info.numeric, name: info.name ?? r.country, count: r.count };
+    devices: result.devices.map((r) => ({ name: r._id, count: r.count })),
+    browsers: topWithOther(result.browsers),
+    os: topWithOther(result.os),
+    referrers: topWithOther(result.referrers),
+    countries: result.countries.map((r) => {
+      const info = countryInfo(r._id);
+      return { code: info.code ?? r._id, numeric: info.numeric, name: info.name ?? r._id, count: r.count };
     }),
-    points: pointRows.rows.map((r) => ({ lat: r.lat, lon: r.lon, city: r.city ?? null, country: r.country ?? null, count: r.count })),
-    recent: recentRows.rows.map(clickEventFromRow),
+    points: result.points.map((r) => ({ lat: r._id.lat, lon: r._id.lon, city: r.city ?? null, country: r.country ?? null, count: r.count })),
+    recent: result.recent.map(clickEventFromRow),
   };
-}
-
-/** Totals for range `all`, as carried by the SSE `hello` event. */
-export async function allTimeTotals(db, link, now) {
-  return computeTotals(db, link.id, { ...ALL_TIME, now });
 }
 
 // ---------------------------------------------------------------------------
 // Live streams (server/live.js): one snapshot on connect, then cheap polls
 // ---------------------------------------------------------------------------
-const MAX_CLICK_ID_SQL = 'SELECT COALESCE(MAX(id), 0) AS throughId FROM clicks';
-const CLICKS_EPOCH_SQL = `SELECT value FROM meta WHERE key = '${CLICKS_EPOCH_KEY}'`;
-const linkRowStatement = (linkId) => ({ sql: 'SELECT * FROM links WHERE id = :linkId', args: { linkId } });
+
+// Both read the clicks epoch BEFORE the clicks. An aggregation without snapshot read concern reads each
+// stage as the data is when that stage runs, and Clear simulated deletes the rows first and moves the epoch
+// second (deleteSyntheticClicks). Read in this order, a clear that lands mid-read leaves the older epoch
+// beside rows that may still include the deleted clicks, so the stream's next poll sees the epoch move and
+// recounts; the other order could pair the new epoch with the old rows, and nothing would ever recount them.
 
 /**
- * What a live stream starts from, read in one snapshot: the `hello` totals (range `all`), `throughId`
- * (the highest click id stored, which those totals include), the link row (or null once it is deleted)
- * and the clicks epoch (CLICKS_EPOCH_KEY). Click ids only grow, so every later click has a larger id.
- * @returns {Promise<{ totals: ReturnType<typeof totalsFromResults>, throughId: number, link: object|null, epoch: string|null }>}
+ * What a live stream starts from, in one aggregation (one round trip): the link (or null once it is
+ * deleted), the clicks epoch, the `hello` totals (range `all`) and the ids of the link's clicks those
+ * totals include (the highest ones, at most `overlap`). Totals and ids come from one pass over the same
+ * rows, so they agree whatever is being written meanwhile.
+ * @returns {Promise<{ totals: ReturnType<typeof totalsFromResult>, ids: number[], link: object|null, epoch: number|null }>} `ids` newest first
  */
-export async function liveStreamSnapshot(db, linkId, now) {
-  const [main, last24h, mark, link, epoch] = await db.batch([
-    ...totalsStatements(linkId, { ...ALL_TIME, now }),
-    MAX_CLICK_ID_SQL,
-    linkRowStatement(linkId),
-    CLICKS_EPOCH_SQL,
-  ], 'read');
+export async function liveStreamSnapshot(db, linkId, now, overlap) {
+  const [result] = await db.collection('links').aggregate([
+    { $match: { id: linkId } },
+    { $project: { _id: 0 } },
+    CLICKS_EPOCH_LOOKUP,
+    {
+      $lookup: {
+        from: 'clicks',
+        pipeline: [
+          { $match: { link_id: linkId } },
+          { $project: { _id: 0, id: 1, visitor_hash: 1, outcome: 1, is_bot: 1, is_synthetic: 1 } },
+          { $facet: { ...TOTALS_FACETS, ids: [{ $sort: { id: -1 } }, { $limit: overlap }, { $project: { id: 1 } }] } },
+        ],
+        as: 'snapshot',
+      },
+    },
+    last24hLookup(linkId, now),
+  ], { maxTimeMS: AGGREGATION_TIME_LIMIT_MS }).toArray();
+  if (!result) return { totals: totalsFromResult({ counters: [], visitors: [], last24h: [] }), ids: [], link: null, epoch: null };
+  const { epoch, snapshot: [facets], last24h, ...link } = result;
   return {
-    totals: totalsFromResults(main, last24h),
-    throughId: mark.rows[0].throughId,
-    link: link.rows[0] ?? null,
-    epoch: epoch.rows[0]?.value ?? null,
+    totals: totalsFromResult({ ...facets, last24h }),
+    ids: facets.ids.map((row) => row.id),
+    link,
+    epoch: epoch[0]?.value ?? null,
   };
 }
 
 /**
- * One live-stream poll, in one snapshot (one round trip): the link's clicks stored after `afterId`, in id
- * order (at most `limit`), the highest click id stored now, the link row (null once deleted) and the
- * clicks epoch. `+link_id` keeps SQLite on the primary key, so a poll reads only the rows stored since
- * the last one (from every link) and never the link's whole history.
- * @returns {Promise<{ rows: object[], throughId: number, link: object|null, epoch: string|null }>}
+ * One live-stream poll, in one aggregation (one round trip): the link (null once deleted), the clicks epoch
+ * and the link's clicks with an id above `afterId` that are not in `exclude`, in id order, at most `limit`.
+ * The ids in `exclude` are skipped on the index, so re-reading the ones a stream has seen fetches no documents.
+ * @returns {Promise<{ rows: object[], link: object|null, epoch: number|null }>}
  */
-export async function liveStreamPoll(db, linkId, afterId, limit) {
-  const [mark, clicks, link, epoch] = await db.batch([
-    MAX_CLICK_ID_SQL,
+export async function liveStreamPoll(db, linkId, { afterId, exclude, limit }) {
+  const [result] = await db.collection('links').aggregate([
+    { $match: { id: linkId } },
+    { $project: { _id: 0 } },
+    CLICKS_EPOCH_LOOKUP,
     {
-      sql: `SELECT * FROM clicks WHERE id > :afterId AND +link_id = :linkId ORDER BY id LIMIT ${Number(limit)}`,
-      args: { afterId, linkId },
+      $lookup: {
+        from: 'clicks',
+        pipeline: [
+          { $match: { link_id: linkId, id: { $gt: afterId, $nin: exclude } } },
+          { $sort: { id: 1 } },
+          { $limit: limit },
+          { $project: { _id: 0 } },
+        ],
+        as: 'rows',
+      },
     },
-    linkRowStatement(linkId),
-    CLICKS_EPOCH_SQL,
-  ], 'read');
-  return { rows: clicks.rows, throughId: mark.rows[0].throughId, link: link.rows[0] ?? null, epoch: epoch.rows[0]?.value ?? null };
+  ], { maxTimeMS: AGGREGATION_TIME_LIMIT_MS }).toArray();
+  if (!result) return { rows: [], link: null, epoch: null };
+  const { rows, epoch, ...link } = result;
+  return { rows, link, epoch: epoch[0]?.value ?? null };
 }

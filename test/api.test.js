@@ -141,7 +141,7 @@ describe('API', () => {
       assert.equal(link.createdAt, new Date(s.clock.t).toISOString());
       assert.equal(link.updatedAt, link.createdAt);
       // The token is never stored in plain text.
-      const row = await s.db.get('SELECT manage_token_hash FROM links WHERE slug = ?', ['back-to-school']);
+      const row = await s.db.collection('links').findOne({ slug: 'back-to-school' });
       assert.notEqual(row.manage_token_hash, manageToken);
       assert.match(row.manage_token_hash, /^[0-9a-f]{64}$/);
     });
@@ -311,7 +311,7 @@ describe('API', () => {
     });
 
     it('maps first-release theme and preset ids to their comic replacements before storing them', async () => {
-      const storedRow = (slug) => s.db.get('SELECT teaser_theme, qr_style FROM links WHERE slug = ?', [slug]);
+      const storedRow = (slug) => s.db.collection('links').findOne({ slug });
       const themes = { aurora: 'hero', sunset: 'caption', ocean: 'sky', neon: 'noir', candy: 'paper' };
       for (const [legacy, current] of Object.entries(themes)) {
         const { link } = await s.createLink({ targetUrl: 'https://example.com', redirectMode: 'teaser', teaser: { theme: legacy } });
@@ -399,8 +399,8 @@ describe('API', () => {
 
     it('serves links stored with first-release ids under the new ids', async () => {
       const { link: stored, manageToken } = await s.createLink({ targetUrl: 'https://example.com/stored', slug: 'stored-legacy' });
-      const write = (theme, qrStyle) => s.db.run('UPDATE links SET teaser_theme = ?, qr_style = ? WHERE slug = ?', [theme, qrStyle, stored.slug]);
-      // As if written by the first release after the migration ran (or by hand).
+      const write = (theme, qrStyle) => s.db.collection('links').updateOne({ slug: stored.slug }, { $set: { teaser_theme: theme, qr_style: qrStyle } });
+      // As if imported from the first release (or written by hand).
       await write('neon', JSON.stringify({ preset: 'mono', dotColor: '#111111', dotColor2: null }));
       const one = await s.request('GET', `/api/links/${stored.slug}`, { token: manageToken });
       assert.equal(one.json.link.teaser.theme, 'noir');
@@ -414,7 +414,7 @@ describe('API', () => {
       const odd = await s.request('GET', `/api/links/${stored.slug}`, { token: manageToken });
       assert.equal(odd.json.link.teaser.theme, 'hero');
       assert.deepEqual(odd.json.link.qrStyle, { preset: 'custom', margin: 4 });
-      write('hero', JSON.stringify([1, 2]));
+      await write('hero', JSON.stringify([1, 2]));
       assert.equal((await s.request('GET', `/api/links/${stored.slug}`, { token: manageToken })).json.link.qrStyle, null);
     });
 
@@ -481,14 +481,17 @@ describe('API', () => {
     it('DELETE removes the link and its clicks', async () => {
       const temp = await s.createLink({ targetUrl: 'https://example.com/temp', slug: 'delete-me' });
       await s.visit('delete-me');
-      const linkId = (await s.db.get('SELECT id FROM links WHERE slug = ?', ['delete-me'])).id;
-      const clickCount = async () => (await s.db.get('SELECT COUNT(*) AS n FROM clicks WHERE link_id = ?', [linkId])).n;
+      const linkId = (await s.db.collection('links').findOne({ slug: 'delete-me' })).id;
+      const clickCount = () => s.db.collection('clicks').countDocuments({ link_id: linkId });
+      const visitorCount = () => s.db.collection('visitors').countDocuments({ link_id: linkId });
       assert.equal(await clickCount(), 1);
+      assert.equal(await visitorCount(), 1);
       const res = await s.request('DELETE', '/api/links/delete-me', { token: temp.manageToken });
       assert.equal(res.status, 204);
       assert.equal(res.text, '');
       assert.equal((await s.request('GET', '/api/links/delete-me', { token: temp.manageToken })).status, 404);
       assert.equal(await clickCount(), 0);
+      assert.equal(await visitorCount(), 0);
       assert.equal((await s.visit('delete-me')).status, 404);
     });
   });
@@ -576,7 +579,7 @@ describe('API rate limiting', () => {
     assert.equal(limited.status, 429);
     assert.equal(limited.json.error.code, 'rate_limited');
     assert.ok(Number(limited.headers.get('retry-after')) >= 1);
-    assert.equal((await s.db.get('SELECT COUNT(*) AS n FROM clicks WHERE is_synthetic = 1')).n, 30);
+    assert.equal(await s.db.collection('clicks').countDocuments({ is_synthetic: 1 }), 30);
   });
 });
 

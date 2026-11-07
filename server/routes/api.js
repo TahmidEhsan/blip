@@ -52,7 +52,7 @@ export function tokenMatches(token, storedHash) {
  * @param {object} ctx shared app context (db, config, now, random, bus, streams, rateLimits, streamLimits, redact)
  */
 export function createApiRouter(ctx) {
-  const { db, config, bus } = ctx;
+  const { answerInTime, db, config, bus } = ctx;
   const router = express.Router();
 
   const limiter = (max) => createRateLimiter({ max, windowMs: 60_000, now: ctx.now });
@@ -74,7 +74,7 @@ export function createApiRouter(ctx) {
       return;
     }
     const slug = String(req.params.slug ?? '').toLowerCase();
-    const link = SLUG_RE.test(slug) ? await findLinkBySlug(db, slug) : null;
+    const link = SLUG_RE.test(slug) ? await answerInTime(findLinkBySlug(db, slug)) : null;
     if (!link) {
       sendError(res, 404, 'not_found', 'There’s no Blip link with that slug.');
       return;
@@ -109,8 +109,11 @@ export function createApiRouter(ctx) {
   });
 
   // ---- slugs & domains -----------------------------------------------------
+  // Every database call a request waits for goes through answerInTime: one attempt waits at most
+  // QUERY_TIMEOUT_MS on its socket and the driver retries a timed-out read or write once, so without its own
+  // deadline a stalled cluster would hold the request about twice as long.
   router.get('/slugs/check', lookupLimiter, async (req, res) => {
-    res.json(await checkSlug(db, queryString(req, 'slug') ?? ''));
+    res.json(await answerInTime(checkSlug(db, queryString(req, 'slug') ?? '')));
   });
 
   router.get('/slugs/suggest', lookupLimiter, async (req, res) => {
@@ -122,7 +125,7 @@ export function createApiRouter(ctx) {
       count = Number(rawCount);
       if (!Number.isInteger(count) || count < 1 || count > 12) throw validationError('count', 'count must be between 1 and 12.');
     }
-    res.json({ suggestions: await suggestSlugs(db, phrase, count, { random: ctx.random, now: ctx.now }) });
+    res.json({ suggestions: await answerInTime(suggestSlugs(db, phrase, count, { random: ctx.random, now: ctx.now })) });
   });
 
   router.get('/domains/ideas', lookupLimiter, (req, res) => {
@@ -142,7 +145,7 @@ export function createApiRouter(ctx) {
     const now = ctx.now();
     const fields = validateLinkBody(body, { mode: 'create', config, now, current: LINK_DEFAULTS });
 
-    const isTaken = (s) => slugTaken(db, s);
+    const isTaken = (s) => answerInTime(slugTaken(db, s));
     let slug;
     const rawSlug = body.slug;
     if (rawSlug !== undefined && rawSlug !== null && String(rawSlug).trim() !== '') {
@@ -173,10 +176,11 @@ export function createApiRouter(ctx) {
     };
     let stored;
     try {
-      stored = await insertLink(db, row);
+      stored = await answerInTime(insertLink(db, row));
     } catch (err) {
-      // Someone else took the slug between the check above and this insert.
-      if (isUniqueViolation(err)) throw new HttpError(409, 'slug_taken', `“${slug}” is already taken. Try a suggestion.`, 'slug');
+      // Someone else took the slug between the check above and this insert. Only a duplicate slug says so:
+      // insertLink handles an id that was already stored itself.
+      if (isUniqueViolation(err, 'slug')) throw new HttpError(409, 'slug_taken', `“${slug}” is already taken. Try a suggestion.`, 'slug');
       throw err;
     }
     res.status(201).json({ link: dto(stored, now), manageToken });
@@ -189,7 +193,7 @@ export function createApiRouter(ctx) {
     }
     const now = ctx.now();
     const slugOf = (item) => (typeof item?.slug === 'string' ? item.slug : '').toLowerCase();
-    const found = await findLinksBySlugs(db, items.map(slugOf).filter((slug) => SLUG_RE.test(slug))); // one round trip
+    const found = await answerInTime(findLinksBySlugs(db, items.map(slugOf).filter((slug) => SLUG_RE.test(slug)))); // one round trip
     const results = items.map((item) => {
       const inputSlug = typeof item?.slug === 'string' ? item.slug : '';
       const slug = inputSlug.toLowerCase();
@@ -209,7 +213,7 @@ export function createApiRouter(ctx) {
     const link = res.locals.link;
     const now = ctx.now();
     const fields = validateLinkBody(req.body ?? {}, { mode: 'update', config, now, current: link });
-    const updated = Object.keys(fields).length ? await updateLink(db, link.id, { ...fields, updated_at: now }) : link;
+    const updated = Object.keys(fields).length ? await answerInTime(updateLink(db, link.id, { ...fields, updated_at: now })) : link;
     if (!updated) throw linkGone();
     // A stream sends `status` only when the status, reason or click numbers actually changed.
     if (Object.keys(fields).length) notify(updated);
@@ -218,7 +222,7 @@ export function createApiRouter(ctx) {
 
   router.delete('/links/:slug', requireManage, async (req, res) => {
     const link = res.locals.link;
-    await deleteLink(db, link.id);
+    await answerInTime(deleteLink(db, link.id));
     notify(link); // its streams end
     res.status(204).end();
   });
@@ -226,7 +230,7 @@ export function createApiRouter(ctx) {
   router.post('/links/:slug/destroy', requireManage, async (req, res) => {
     const link = res.locals.link;
     const now = ctx.now();
-    const updated = link.destroyed_at === null ? await updateLink(db, link.id, { destroyed_at: now, updated_at: now }) : link;
+    const updated = link.destroyed_at === null ? await answerInTime(updateLink(db, link.id, { destroyed_at: now, updated_at: now })) : link;
     if (!updated) throw linkGone();
     notify(updated);
     res.json({ link: dto(updated, now) });
@@ -235,7 +239,7 @@ export function createApiRouter(ctx) {
   router.post('/links/:slug/revive', requireManage, async (req, res) => {
     const link = res.locals.link;
     const now = ctx.now();
-    const updated = link.destroyed_at !== null ? await updateLink(db, link.id, { destroyed_at: null, updated_at: now }) : link;
+    const updated = link.destroyed_at !== null ? await answerInTime(updateLink(db, link.id, { destroyed_at: null, updated_at: now })) : link;
     if (!updated) throw linkGone();
     notify(updated);
     res.json({ link: dto(updated, now) });
@@ -246,7 +250,7 @@ export function createApiRouter(ctx) {
     if (!STATS_RANGES.includes(range)) throw validationError('range', `range must be one of: ${STATS_RANGES.join(', ')}.`);
     const tz = parseTzOffset(queryString(req, 'tz'));
     if (tz === null) throw validationError('tz', 'tz must be a whole number of minutes between -840 and 840.');
-    res.json(await buildStats(db, res.locals.link, { range, tz, now: ctx.now() }));
+    res.json(await answerInTime(buildStats(db, res.locals.link, { range, tz, now: ctx.now() })));
   });
 
   // Open live streams per link id and per client key, so one client (or a leaked token) can't pin an
@@ -321,7 +325,7 @@ export function createApiRouter(ctx) {
         if (!Number.isInteger(count) || count < 1 || count > 50) throw validationError('count', 'count must be between 1 and 50.');
       }
       const link = res.locals.link;
-      const inserted = await simulateTraffic({ db, link, count, now: ctx.now(), random: ctx.random });
+      const inserted = await answerInTime(simulateTraffic({ db, link, count, now: ctx.now(), random: ctx.random }));
       notify(link);
       res.json({ inserted });
     },
@@ -330,7 +334,7 @@ export function createApiRouter(ctx) {
   router.delete('/links/:slug/simulated', requireManage, async (req, res) => {
     const link = res.locals.link;
     // Also bumps the clicks epoch, so every open dashboard (on any instance) recounts its live totals.
-    const deleted = await deleteSyntheticClicks(db, link.id);
+    const deleted = await answerInTime(deleteSyntheticClicks(db, link.id));
     notify(link);
     res.json({ deleted });
   });
